@@ -347,3 +347,34 @@ class PromptExpansionTests(unittest.TestCase):
                                                                   'prompt_delivery': 'arg'}})
         argv = td.build_argv(policy, 'echoer', Path('/tmp'), prompt='keep {cwd} and {repo} literal')
         self.assertEqual(argv[-1], 'keep {cwd} and {repo} literal')
+
+
+class StackwichWorkerTests(unittest.TestCase):
+    setUp = WorkerTests.setUp
+    policy = WorkerTests.policy
+    run_worker = WorkerTests.run_worker
+
+    def test_unsupported_worker_runs_without_protocol(self):
+        seen = []
+        def runner(argv, cwd, *args, **kwargs):
+            seen.append(kwargs['input_text'])
+            return {'returncode': 0, 'timed_out': False, 'elapsed_seconds': 0,
+                    'stdout': '', 'stderr': ''}
+        result = self.run_worker(self.policy({'stackwich': {'enabled': True}}), runner)
+        self.assertEqual(result['stackwich']['status'], 'unsupported')
+        self.assertTrue(any('unsupported' in warning for warning in result['warnings']))
+        self.assertNotIn('Stackwich verification required', seen[0])
+
+    def test_supported_failure_does_not_fail_over(self):
+        seen = []
+        def runner(argv, cwd, *args, **kwargs):
+            seen.append(kwargs['input_text'])
+            return {'returncode': 1, 'timed_out': False, 'elapsed_seconds': 0,
+                    'stdout': '', 'stderr': ''}
+        policy = self.policy({'stackwich': {'enabled': True, 'supported': True}})
+        result = td.run_task(self.task, self.repo, policy=policy, runner=runner,
+                            select=lambda *a, **k: {'eligible': ['sample', 'codex']},
+                            output_root=self.base / 'out', stackwich_cycle=2)
+        self.assertEqual(len(result['attempts']), 1)
+        self.assertIn('"cycles": 2', seen[0])
+        self.assertEqual(result['stackwich']['status'], 'required')

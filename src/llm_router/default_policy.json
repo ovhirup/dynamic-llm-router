@@ -75,6 +75,7 @@
     "_why": "Optional OpenAI-compatible chat endpoint (e.g. a local LiteLLM/Ollama proxy) for short draft text only. Disabled unless enabled=true and endpoint is set; the key is read only from the env var named in api_key_env."
   },
   "run_task": {
+    "stackwich": {},
     "timeouts_seconds": {
       "codex": 900,
       "grok-build": 900,

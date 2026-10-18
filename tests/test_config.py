@@ -195,3 +195,27 @@ class LiveReadClockTests(unittest.TestCase):
         result = selection.select(10_000, policy=load_policy(worker_order=['codex']), io=io)
         self.assertEqual(result['reasons']['codex'], 'quota_available')
         self.assertEqual(result['worker'], 'codex')
+
+
+class StackwichConfigTests(unittest.TestCase):
+    def test_defaults_and_custom_opt_in(self):
+        policy = load_policy()
+        self.assertTrue(all(v == {'enabled': False, 'supported': False}
+                            for v in policy['run_task']['stackwich'].values()))
+        policy = load_policy(workers={'sample': {'command': ['sample'],
+                              'stackwich': {'enabled': True, 'supported': True}}})
+        self.assertEqual(policy['run_task']['stackwich']['sample'], {'enabled': True, 'supported': True})
+        self.assertEqual(policy['worker_order'], load_policy()['worker_order'])
+        self.assertNotIn('claude', policy['worker_order'])
+
+    def test_invalid_options(self):
+        for value in (True, [], {'enabled': 1}, {'supported': 'yes'}, {'extra': False}):
+            with self.subTest(value=value), self.assertRaises(config.ConfigError):
+                load_policy(workers={'sample': {'command': ['sample'], 'stackwich': value}})
+        for value in ([], {'unknown': {}}, {'codex': {'enabled': None}}):
+            with self.subTest(value=value), self.assertRaises(config.ConfigError):
+                load_policy(run_task={'stackwich': value})
+
+    def test_invalid_internal_map_with_custom_worker(self):
+        with self.assertRaises(config.ConfigError):
+            load_policy(workers={'sample': {'command': ['sample']}}, run_task={'stackwich': []})

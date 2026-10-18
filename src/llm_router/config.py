@@ -111,6 +111,8 @@ def blocked_worker(policy, name):
 def materialise_workers(policy):
     from . import security
     run = policy['run_task']
+    if not isinstance(run.get('stackwich', {}), dict):
+        raise ConfigError('run_task.stackwich must be an object')
     definitions = policy.get('workers', {})
     if not isinstance(definitions, dict):
         raise ConfigError('workers must be an object')
@@ -127,7 +129,7 @@ def materialise_workers(policy):
                                         ('cwd', 'cwd', '.'), ('env', 'env', {}),
                                         ('timeout_seconds', 'timeouts_seconds', 900),
                                         ('stall_seconds', 'stall_seconds', 300),
-                                        ('success', 'success', {})]:
+                                        ('success', 'success', {}), ('stackwich', 'stackwich', {})]:
             run.setdefault(internal, {})[name] = opts.get(field, run.get(internal, {}).get(name, default))
         if 'quota' in opts:
             if not isinstance(opts['quota'], dict):
@@ -137,6 +139,18 @@ def materialise_workers(policy):
                                 'hard_timeout_seconds': 40, 'freshness_seconds': 1800,
                                 'usage_threshold_percent': 85}, opts['quota'])
             policy.setdefault('quota', {})[name] = quota
+    stackwich = run.setdefault('stackwich', {})
+    if not isinstance(stackwich, dict):
+        raise ConfigError('run_task.stackwich must be an object')
+    for name, options in stackwich.items():
+        if name not in run['commands'] and name != 'developer':
+            raise ConfigError('run_task.stackwich names unknown worker')
+        if not isinstance(options, dict) or set(options) - {'enabled', 'supported'} or any(
+                type(value) is not bool for value in options.values()):
+            raise ConfigError('stackwich requires only boolean enabled and supported options')
+    for name in list(run['commands']) + ['developer']:
+        if not name.startswith('_'):
+            stackwich[name] = dict({'enabled': False, 'supported': False}, **stackwich.get(name, {}))
     for name in run['commands']:
         if name.startswith('_'):
             continue
