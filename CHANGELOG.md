@@ -3,6 +3,14 @@
 All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/);
 versions follow [SemVer](https://semver.org/) (0.x: minor versions may break config).
 
+## [0.4.0] - 2026-10-19
+
+- Add optional worker-neutral Stackwich plan, execute, verify and review evidence.
+- Gate commits on strict report validation, exact scope, passing tests and unchanged evidence/content.
+- Bound correction to two cycles pinned to the same worker; retain reports outside commits.
+- Preserve default-off configuration and ordinary execution for unsupported workers.
+- Cover adversarial reports, scope, opt-in configuration, retries and commit gates.
+
 ## [0.3.0] - 2026-10-18
 
 - Bring any worker: config-defined CLI adapters, prompt delivery, safe environment allowlists,

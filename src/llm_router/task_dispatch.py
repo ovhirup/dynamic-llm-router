@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.request
 
-from . import config, security
+from . import config, security, stackwich
 
 
 def coding_workers(policy):
@@ -276,7 +276,7 @@ def pacing(policy, meters, worker, size):
 
 def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select=None,
              runner=run_bounded, draft=developer_draft, policy=None, output_root=None,
-             extra_prompt=None, stamp=None, meter=None):
+             extra_prompt=None, stamp=None, meter=None, stackwich_cycle=1):
     from . import selection as selection_module
     policy = policy or config.load_policy()
     injected_select = select is not None
@@ -355,11 +355,26 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
             if warning not in summary['warnings']:
                 summary['warnings'].append(warning)
         env, _ = worker_environment(policy, name)
-        record = {'worker': name}
+        protocol = stackwich.status(policy, name)
+        record = {'worker': name, 'stackwich': {'status': protocol, 'cycle': stackwich_cycle}}
+        invocation_prompt = prompt
+        if protocol == 'unsupported':
+            summary['warnings'].append(f'{name}: Stackwich unsupported; ordinary execution')
+        if protocol == 'required':
+            try:
+                stackwich.prepare(cwd, _git(cwd, 'ls-files', '--error-unmatch', '--',
+                                            stackwich.REPORT_PATH).returncode == 0)
+            except ValueError as error:
+                record.update(ok=False, error=str(error))
+                summary['attempts'].append(record)
+                summary.update(worker=name, ok=False, stackwich=record['stackwich'])
+                summary['warnings'].append(str(error))
+                break
+            invocation_prompt += '\n\n' + stackwich.prompt(stackwich_cycle)
         if name == 'developer':
             path = out_dir / f'{stamp}-developer.md'
             try:
-                path.write_text(security.redact(draft(policy, prompt)))
+                path.write_text(security.redact(draft(policy, invocation_prompt)))
                 record.update(ok=True)
             except Exception:
                 record.update(ok=False, error='developer draft failed')
@@ -377,11 +392,11 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
                 summary['warnings'].append('prompt passed in argv: visible to other local users in the process list')
             try:
                 if mode in ('file', 'pointer'):
-                    prompt_file = write_prompt_file(cwd, stamp, name, prompt)
-                result = runner(build_argv(policy, name, run_cwd, prompt_file, prompt=prompt, repo=cwd, env=env), run_cwd,
+                    prompt_file = write_prompt_file(cwd, stamp, name, invocation_prompt)
+                result = runner(build_argv(policy, name, run_cwd, prompt_file, prompt=invocation_prompt, repo=cwd, env=env), run_cwd,
                                 policy['run_task']['timeouts_seconds'][name],
                                 policy['run_task']['kill_grace_seconds'],
-                                input_text=prompt if mode == 'stdin' else None, env=env,
+                                input_text=invocation_prompt if mode == 'stdin' else None, env=env,
                                 stall_seconds=policy['run_task'].get('stall_seconds', {}).get(name))
             finally:
                 if prompt_file is not None:
@@ -403,8 +418,8 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
                           stalled=result.get('stalled', False))
         record['output_path'] = str(path)
         summary['attempts'].append(record)
-        summary.update(worker=name, ok=record['ok'], output_path=str(path))
-        if record['ok']:
+        summary.update(worker=name, ok=record['ok'], output_path=str(path), stackwich=record['stackwich'])
+        if record['ok'] or protocol == 'required':
             break
     head_after = _git(cwd, 'rev-parse', '--verify', '-q', 'HEAD').stdout.strip() or None
     if head_after != head_before:

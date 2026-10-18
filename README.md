@@ -12,7 +12,7 @@ exact commit.
 It is built for people who pay for several AI coding subscriptions and want to spend each pool evenly
 without babysitting terminals, and without ever leaking a private repo name or key into a public PR.
 
-> Status: alpha (0.3). macOS and Linux. Python 3.10+, no third-party dependencies.
+> Status: alpha (0.4). macOS and Linux. Python 3.10+, no third-party dependencies.
 > Works with Codex, Grok, Cursor and Claude Code CLIs; not affiliated with or endorsed by any of them.
 
 ![Architecture](docs/architecture.png)
@@ -217,3 +217,34 @@ or the network. See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGE
 ## License
 
 MIT, see [LICENSE](LICENSE). Vendor CLIs are not bundled or redistributed.
+
+### Optional Stackwich verification
+
+Any CLI worker can opt into the same in-session plan → execute → verify → review contract:
+
+```json
+{"workers": {"sample": {"command": ["sample-worker"], "stackwich": {"enabled": true, "supported": true}}}}
+```
+
+Both booleans default to false. Declare `supported` only for an adapter that can follow the
+protocol. Enabled unsupported workers are marked `unsupported`, warn, and run normally.
+Disabled workers receive no protocol prompt. Worker order and Claude Code enrollment remain opt-in.
+
+A supported worker writes `.router-stackwich/report.json` with this structure:
+
+```json
+{"plan":{"files":["out.txt"],"steps":["Create out.txt"],"verification":[{"command":"test -f out.txt","expected":"exit 0"}]},"execute":{"changed_files":["out.txt"]},"verify":{"commands_run":[{"command":"test -f out.txt","exit_code":0}],"scope_check":"PASS","gate":"PASS"},"review":{"verdict":"APPROVE","items":[]},"cycles":1}
+```
+
+`run-job` requires PASS, APPROVE, exact planned/observed product paths, successful command evidence,
+and a real configured router test command that passes. The router never executes report-provided
+commands. Correction stays pinned to the same worker, with a maximum of two cycles regardless of
+ordinary retry settings; `cycles` must match the current attempt. Unresolved failures become
+`blocked_by_stackwich` and keep the worktree by default. Reports are excluded from commits and
+retained in kept worktrees; other files in that directory remain subject to scope checks.
+
+The final gate rejects changes to report evidence or product contents during router tests,
+unexpected worker commits, and staged scope mismatches. Verified commits include
+`Stackwich: verified`; summaries retain sanitized evidence and validation errors. These stages run
+within the worker session, with independent router tests and scope checks; this is not independent
+model review. Existing publication approvals still apply.

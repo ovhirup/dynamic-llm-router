@@ -317,3 +317,150 @@ class LedgerLockTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class StackwichJobTests(unittest.TestCase):
+    setUp = JobTests.setUp
+    tearDown = JobTests.tearDown
+    select = JobTests.select
+    worker = JobTests.worker
+    job = JobTests.job
+
+    def supported(self, prefix='', suffix='', name='codex'):
+        from llm_router import stackwich
+        self.policy['run_task'].setdefault('stackwich', {})[name] = {'enabled': True, 'supported': True}
+        code = ("import json,re,sys,pathlib; p=sys.stdin.read(); "
+                "cycle=int(re.search(r'cycles equal to (\\d+)',p).group(1)); "
+                + prefix + "open('out.txt','w').write('hi\\n'); "
+                "pathlib.Path('.router-stackwich').mkdir(exist_ok=True); "
+                f"r={stackwich.SCHEMA!r}; r['cycles']=cycle; " + suffix +
+                "pathlib.Path('.router-stackwich/report.json').write_text(json.dumps(r))")
+        self.worker(code, name)
+
+    def test_verified_commit_excludes_report_and_has_trailer(self):
+        self.supported()
+        result = self.job(test_cmd='test -f out.txt')
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['stackwich']['status'], 'verified')
+        self.assertEqual(git(self.repo, 'show', '--name-only', '--format=', result['commit']), 'out.txt')
+        self.assertIn('Stackwich: verified', git(self.repo, 'log', '-1', '--format=%B', result['commit']))
+        self.assertTrue((Path(result['worktree']) / '.router-stackwich/report.json').is_file())
+
+    def test_corrected_second_cycle_is_pinned(self):
+        self.supported(suffix="r['verify']['gate']='FAIL' if cycle==1 else 'PASS'; ")
+        result = self.job(test_cmd='true')
+        self.assertTrue(result['ok'], result)
+        self.assertEqual([a['stackwich']['status'] for a in result['attempts']], ['blocked', 'verified'])
+        self.assertEqual([a['worker'] for a in result['attempts']], ['codex', 'codex'])
+        self.assertEqual(result['stackwich']['cycle'], 2)
+
+    def test_two_failures_block_even_with_large_retry_setting(self):
+        self.policy['run_job']['max_retries'] = 8
+        self.supported(suffix="r['review']['verdict']='REVISE'; ")
+        result = self.job(test_cmd='true')
+        self.assertEqual(result['status'], 'blocked_by_stackwich', result)
+        self.assertEqual(len(result['attempts']), 2)
+        self.assertIsNone(result['commit'])
+        self.assertEqual(result['worktree_state'], 'kept')
+
+    def test_missing_or_failing_tests_block(self):
+        for command in (None, 'false'):
+            with self.subTest(command=command):
+                self.supported()
+                result = self.job(test_cmd=command)
+                self.assertEqual(result['status'], 'blocked_by_stackwich', result)
+                self.assertIsNone(result['commit'])
+
+    def test_unsupported_fallback_has_no_trailer(self):
+        self.policy['run_task'].setdefault('stackwich', {})['codex'] = {'enabled': True, 'supported': False}
+        self.worker("open('out.txt','w').write('hi')")
+        result = self.job(test_cmd='true')
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['stackwich']['status'], 'unsupported')
+        self.assertNotIn('Stackwich: verified', git(self.repo, 'log', '-1', '--format=%B', result['commit']))
+
+    def test_custom_worker_is_neutral(self):
+        self.policy['run_task']['commands']['sample'] = ['fake']
+        self.policy['run_task']['timeouts_seconds']['sample'] = 60
+        self.policy['unmetered_workers'].append('sample')
+        self.supported(name='sample')
+        result = self.job(test_cmd='true', worker='sample')
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['workers'], ['sample'])
+
+    def test_extra_report_directory_file_blocks_scope(self):
+        self.supported(suffix="open('.router-stackwich/extra.txt','w').write('extra'); ")
+        result = self.job(test_cmd='true')
+        self.assertEqual(result['status'], 'blocked_by_stackwich', result)
+
+    def test_report_or_product_mutated_by_tests_blocks(self):
+        for command in ("echo changed > out.txt", "echo '{}' > .router-stackwich/report.json"):
+            with self.subTest(command=command):
+                self.supported()
+                result = self.job(test_cmd=command)
+                self.assertEqual(result['status'], 'blocked_by_stackwich', result)
+                self.assertIsNone(result['commit'])
+
+    def test_report_only_blocks(self):
+        self.supported(suffix="pathlib.Path('out.txt').unlink(); ")
+        result = self.job(test_cmd='true')
+        self.assertEqual(result['status'], 'blocked_by_stackwich', result)
+        self.assertIsNone(result['commit'])
+
+    def test_worker_commit_blocks(self):
+        self.supported(suffix="import subprocess; subprocess.run(['git','add','out.txt']); "
+                       "subprocess.run(['git','-c','user.name=Worker','-c','user.email=worker@localhost',"
+                       "'commit','-qm','worker commit']); ")
+        result = self.job(test_cmd='true')
+        self.assertEqual(result['status'], 'blocked_by_stackwich', result)
+        self.assertIsNone(result['commit'])
+
+    def test_required_worker_failure_does_not_use_unsupported_failover(self):
+        self.supported(prefix='sys.exit(3); ')
+        self.worker("open('bypass.txt','w').write('bypass')", 'grok-build')
+        result = self.job(test_cmd='true')
+        self.assertEqual(result['status'], 'blocked_by_stackwich', result)
+        self.assertEqual(len(result['attempts']), 2)
+        self.assertFalse((Path(result['worktree']) / 'bypass.txt').exists())
+
+    def test_leak_blocks_immediately(self):
+        self.supported(suffix="open('out.txt','w').write('Zephyrquill'); ")
+        result = self.job(test_cmd='true')
+        self.assertEqual(result['status'], 'blocked_by_leak_check', result)
+        self.assertEqual(len(result['attempts']), 1)
+
+    def test_report_leak_created_by_tests_stops_before_reading(self):
+        self.supported()
+        result = self.job(test_cmd="echo Zephyrquill > .router-stackwich/report.json")
+        self.assertEqual(result['status'], 'blocked_by_leak_check', result)
+        self.assertEqual(len(result['attempts']), 1)
+
+    def test_rename_scope_includes_source_and_destination(self):
+        (self.repo / 'old.txt').write_text('old')
+        git(self.repo, 'add', 'old.txt')
+        git(self.repo, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@localhost',
+            'commit', '-qm', 'fixture')
+        self.supported(suffix="pathlib.Path('old.txt').rename('new.txt') if cycle==1 else None; ")
+        result = self.job(test_cmd='true')
+        self.assertEqual(result['status'], 'blocked_by_stackwich', result)
+        self.assertIn('old.txt', jd.changed_paths(Path(result['worktree'])))
+        self.assertIn('new.txt', jd.changed_paths(Path(result['worktree'])))
+
+    def test_missing_metadata_cannot_downgrade_latched_gate(self):
+        self.supported(suffix="r['verify']['gate']='FAIL'; ")
+        calls = []
+        def run_task(*args, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return td.run_task(*args, **kwargs)
+            return {'ok': True, 'worker': 'grok-build', 'leak_check': {'status': 'clean'}}
+        result = self.job(test_cmd='true', run_task=run_task)
+        self.assertEqual(result['status'], 'blocked_by_stackwich', result)
+        self.assertEqual(calls[1]['worker'], 'codex')
+        self.assertIsNone(result['commit'])
+
+    def test_ignored_report_leak_is_still_blocked(self):
+        self.supported(suffix="open('.gitignore','w').write('.router-stackwich/\\n'); r['plan']['steps']=['Zephyrquill']; ")
+        result = self.job(test_cmd='true')
+        self.assertEqual(result['status'], 'blocked_by_leak_check', result)
+        self.assertEqual(len(result['attempts']), 1)

@@ -13,7 +13,7 @@ import re
 import shutil
 import subprocess
 
-from . import alerts, config, security
+from . import alerts, config, security, stackwich
 from . import task_dispatch as td
 
 Refused = td.Refused
@@ -102,6 +102,7 @@ def changed_paths(cwd):
     for entry in entries:
         if skip:
             skip = False
+            paths.add(entry)
             continue
         if len(entry) < 4:
             continue
@@ -113,6 +114,16 @@ def changed_paths(cwd):
 
 def _has_changes(cwd):
     return bool(_git(cwd, 'status', '--porcelain', '--untracked-files=all').stdout.strip())
+
+
+def _report_leak_check(policy, worktree, base_sha):
+    # Include even ignored reports, but never follow an unsafe report path.
+    try:
+        stackwich._safe_path(worktree)
+    except ValueError:
+        return {'status': 'clean', 'findings': []}  # evidence validation rejects unsafe paths
+    return security.leak_check(worktree, base_sha, [stackwich.REPORT_PATH], td.private_terms(policy),
+                               **td.leak_options(policy))
 
 
 def _retry_note(attempt, tests):
@@ -127,11 +138,12 @@ def _retry_note(attempt, tests):
     return '\n'.join(lines)
 
 
-def _commit_message(task_text, job_id, workers, tests):
+def _commit_message(task_text, job_id, workers, tests, verified=False):
     title = next((line.strip('# ').strip() for line in task_text.splitlines() if line.strip()), 'task')
     title = security.redact(title)[:60]
     return (f'router: {title}\n\nRouter-Job: {job_id}\nWorkers: {", ".join(workers) or "none"}\n'
-            f'Tests: {tests.get("status")}\nCommitted by run-job in a worktree branch; not pushed.')
+            f'Tests: {tests.get("status")}\nCommitted by run-job in a worktree branch; not pushed.' +
+            ('\n\nStackwich: verified' if verified else ''))
 
 
 def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full', worker=None,
@@ -254,68 +266,146 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
               stamp, out_dir, run_task, select, test_runner):
     extra = None
     test_artifacts, worker_paths = set(), set()
+    required, pinned, evidence = False, None, None
     retries = policy['run_job'].get('max_retries', 1)
-    for attempt_number in range(retries + 1):
-        kwargs = {'size': size, 'worker': worker, 'allow_dirty': attempt_number > 0, 'policy': policy,
-                  'extra_prompt': extra, 'stamp': f'{stamp}-a{attempt_number + 1}'}
+    attempt_number = 0
+    while attempt_number <= (1 if required else retries):
+        cycle = attempt_number + 1
+        kwargs = {'size': size, 'worker': pinned or worker, 'allow_dirty': attempt_number > 0,
+                  'policy': policy, 'extra_prompt': extra, 'stamp': f'{stamp}-a{cycle}',
+                  'stackwich_cycle': cycle}
         if select is not None:
             kwargs['select'] = select
         try:
             result = run_task(task_path, worktree, **kwargs)
         except Refused as refusal:
-            summary['attempts'].append({'attempt': attempt_number + 1, 'refused': str(refusal)})
+            summary['attempts'].append({'attempt': cycle, 'refused': str(refusal)})
+            if required:
+                summary['status'] = 'blocked_by_stackwich'
+                summary['stackwich'] = {'status': 'blocked', 'cycle': cycle,
+                                         'errors': ['correction invocation refused']}
+                return
             if attempt_number == 0:
                 raise
             break
+        invoked = [r.get('worker') for r in result.get('attempts', [])
+                   if (r.get('stackwich') or {}).get('status') == 'required']
+        selected = result.get('worker')
+        active = (bool(invoked) or (result.get('stackwich') or {}).get('status') == 'required' or
+                  (selected is not None and stackwich.status(policy, selected) == 'required'))
+        if active and not required:
+            required, pinned = True, (invoked[0] if invoked else selected)
+        summary['stackwich'] = result.get('stackwich', {'status': 'disabled'})
+        summary['leak_check'] = result.get('leak_check')
+        summary['blocked_by_leak_check'] = result.get('blocked_by_leak_check', False)
+        if summary['blocked_by_leak_check'] or (required and (result.get('leak_check') or {}).get('status') != 'clean'):
+            summary['blocked_by_leak_check'] = True
+            summary['status'] = 'blocked_by_leak_check'
+            summary['attempts'].append({'attempt': cycle, 'worker': selected, 'ok': False,
+                                        'leak_check': (result.get('leak_check') or {}).get('status')})
+            return
         worker_paths = changed_paths(worktree) - test_artifacts
+        if required:
+            worker_paths.discard(stackwich.REPORT_PATH)
         changed = bool(worker_paths)
+        if required:
+            scan = _report_leak_check(policy, worktree, summary['base_sha'])
+            if scan['status'] != 'clean':
+                summary.update(status='blocked_by_leak_check', blocked_by_leak_check=True,
+                               leak_check=scan)
+                summary['attempts'].append({'attempt': cycle, 'worker': selected,
+                                            'ok': False, 'leak_check': scan['status']})
+                return
+        evidence = stackwich.evidence(worktree, worker_paths, cycle) if required else None
+        before = stackwich.fingerprints(worktree, worker_paths) if required else None
         tests = {'status': 'not_run'}
         if result['ok'] and changed:
             tests = run_tests(policy, worktree, test_cmd, test_timeout,
-                              out_dir / f'{stamp}-a{attempt_number + 1}-tests.log', test_runner)
-            # Files the test command created or changed are build artifacts, never committed.
-            test_artifacts |= changed_paths(worktree) - worker_paths
+                              out_dir / f'{stamp}-a{cycle}-tests.log', test_runner)
+            test_artifacts |= changed_paths(worktree) - worker_paths - {stackwich.REPORT_PATH}
+        if required:
+            scan = _report_leak_check(policy, worktree, summary['base_sha'])
+            if scan['status'] != 'clean':
+                summary.update(status='blocked_by_leak_check', blocked_by_leak_check=True,
+                               leak_check=scan)
+                summary['attempts'].append({'attempt': cycle, 'worker': selected, 'ok': False,
+                                            'tests': tests['status'], 'leak_check': scan['status']})
+                return
+            final_evidence = stackwich.evidence(worktree, changed_paths(worktree) - test_artifacts -
+                                                {stackwich.REPORT_PATH}, cycle)
+            errors = list(evidence['errors']) + final_evidence['errors']
+            if evidence.get('digest') != final_evidence.get('digest'):
+                errors.append('report changed during router tests')
+            if before != stackwich.fingerprints(worktree, worker_paths):
+                errors.append('product contents changed during router tests')
+            if tests['status'] != 'passed':
+                errors.append('router tests must pass (a real test command is required)')
+            if not result.get('ok'):
+                errors.append('worker invocation did not succeed')
+            if not pinned or selected != pinned or (result.get('stackwich') or {}).get('status') != 'required':
+                errors.append('required invocation metadata missing or worker changed')
+            if _git(worktree, 'rev-parse', 'HEAD').stdout.strip() != summary['base_sha']:
+                errors.append('worker changed HEAD')
+            evidence['errors'] = sorted(set(errors))
+            evidence['status'] = 'blocked' if errors else 'verified'
+            summary['stackwich'] = evidence
         summary['tests'].append(tests)
         summary['tests_status'] = tests['status']
-        summary['leak_check'] = result.get('leak_check')
-        summary['blocked_by_leak_check'] = result.get('blocked_by_leak_check', False)
-        summary['attempts'].append({'attempt': attempt_number + 1, 'worker': result.get('worker'),
-                                    'ok': result.get('ok'), 'changed': changed,
-                                    'runs': result.get('attempts'), 'tests': tests['status'],
+        summary['attempts'].append({'attempt': cycle, 'worker': selected, 'ok': result.get('ok'),
+                                    'changed': changed, 'runs': result.get('attempts'),
+                                    'tests': tests['status'], 'stackwich': evidence,
                                     'leak_check': (result.get('leak_check') or {}).get('status'),
                                     'warnings': result.get('warnings')})
-        if result.get('worker') and result['worker'] not in summary['workers']:
-            summary['workers'].append(result['worker'])
-        if summary['blocked_by_leak_check']:
-            summary['status'] = 'blocked_by_leak_check'
-            return  # never retry or commit over a leak hit
-        if result['ok'] and changed and tests['status'] in ('passed', 'skipped'):
+        if selected and selected not in summary['workers']:
+            summary['workers'].append(selected)
+        if result['ok'] and changed and tests['status'] in ('passed', 'skipped') and (
+                not required or evidence['status'] == 'verified'):
             break
-        if not changed and result['ok']:
-            result['ok'] = False
-        extra = _retry_note(result, tests)
+        extra = _retry_note(result, tests) or ''
+        if required:
+            extra += '\nStackwich errors: ' + '; '.join(evidence['errors'])
+        attempt_number += 1
     else:
-        summary['status'] = 'failed'
+        summary['status'] = 'blocked_by_stackwich' if required else 'failed'
         return
     last = summary['attempts'][-1]
     if not (last.get('ok') and last.get('changed') and last.get('tests') in ('passed', 'skipped')):
-        summary['status'] = 'failed'
+        summary['status'] = 'blocked_by_stackwich' if required else 'failed'
         return
-    # Stage only the worker's paths, then re-scan exactly what would be committed.
+    if required:
+        final_evidence = stackwich.evidence(worktree, changed_paths(worktree) - test_artifacts -
+                                            {stackwich.REPORT_PATH}, cycle)
+        if final_evidence['errors'] or final_evidence.get('digest') != evidence.get('digest') or (
+                before != stackwich.fingerprints(worktree, worker_paths)):
+            summary['status'] = 'blocked_by_stackwich'
+            summary['stackwich'] = dict(final_evidence, status='blocked',
+                                         errors=final_evidence['errors'] + ['final commit evidence changed'])
+            return
+    if _git(worktree, 'rev-parse', 'HEAD').stdout.strip() != summary['base_sha']:
+        summary['status'] = 'blocked_by_stackwich' if required else 'failed'
+        return
     _git(worktree, 'add', '-A', '--', *sorted(worker_paths), check=True)
+    if required:
+        staged = set(filter(None, _git(worktree, 'diff', '--cached', '--name-only', '--no-renames', '-z').stdout.split('\0')))
+        if staged != worker_paths:
+            _git(worktree, 'reset', '-q')
+            summary['status'] = 'blocked_by_stackwich'
+            summary['stackwich']['errors'].append('staged paths differ from validated scope')
+            summary['stackwich']['status'] = 'blocked'
+            return
     summary['excluded_test_artifacts'] = sorted(test_artifacts)
     final = security.leak_check(worktree, summary['base_sha'], [], td.private_terms(policy), cached=True,
                                 **td.leak_options(policy))
     summary['leak_check'] = final
     if final['status'] != 'clean':
-        _git(worktree, 'reset', '-q')  # unstage; files stay in the worktree for review
+        _git(worktree, 'reset', '-q')
         summary['blocked_by_leak_check'] = True
         summary['status'] = 'blocked_by_leak_check'
         return
     identity = policy['run_job']['commit_identity']
     commit = _git(worktree, '-c', f'user.name={identity["name"]}', '-c', f'user.email={identity["email"]}',
                   'commit', '-q', '-m', _commit_message(task_text, summary['job_id'], summary['workers'],
-                                                       {'status': summary['tests_status']}))
+                                                       {'status': summary['tests_status']}, verified=required))
     if commit.returncode != 0:
         summary['status'] = 'commit_failed'
         summary['warnings'].append('git commit failed: ' + security.redact(commit.stderr.strip() or commit.stdout.strip())[:300])
@@ -334,7 +424,10 @@ def _finish(policy, summary, repo, worktree, branch, base_sha, keep):
         summary['status'] = 'failed'
     success = summary['ok']
     leak = summary['blocked_by_leak_check']
-    prune = keep is False or (keep is None and not success and not leak)
+    blocked = summary['status'] == 'blocked_by_stackwich'
+    prune = keep is False or (keep is None and not success and not leak and not blocked)
+    if blocked and keep is None:
+        summary['warnings'].append('Stackwich blocked: worktree kept for review')
     if leak and keep is None:
         summary['warnings'].append('leak check hit: worktree kept for review (nothing deleted)')
     if prune:
