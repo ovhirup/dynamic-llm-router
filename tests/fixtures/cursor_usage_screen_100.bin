@@ -1,0 +1,59 @@
+[>1u]11;?[2K[G
+
+  Cursor Agent
+  v2026.10.01-e373342
+  Tip: Use /mcp to connect Cursor to your tools and data sources.
+
+
+
+
+  → Plan, search, build anything
+
+
+  Ask (shift+tab to cycle)
+  Grok 4.7 256K High
+  /private/tmp/cursor-probe
+[?25l[?2004h]0;Cursor Agent[?2031h[?1004h[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[G  → /usage
+
+
+  Ask (shift+tab to cycle)
+  Grok 4.7 256K High
+  /private/tmp/cursor-probe
+[2K[1A[2K[1A[2K[1A[2K[G   → /usage                    Show plan and on-demand usage
+     /context                  Show context usage breakdown
+     /create-subagent          Create custom subagents for specialized AI tasks. Use when you want to create a new type of subagent, set up task-specific…
+     /subagent-agent-sdk-ver…  Use this agent to verify that a Python Agent SDK application is properly configured, follows SDK best practices and…
+     /subagent-agent-sdk-ver…  Use this agent to verify that a TypeScript Agent SDK application is properly configured, follows SDK best practices and…
+     /brand-guidelines         Applies Anthropic's official brand colors and typography to any sort of artifact that may benefit from having Anthropic's…
+[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[G  → Plan, search, build anything
+
+
+   → /usage                    Show plan and on-demand usage
+     /context                  Show context usage breakdown
+     /create-subagent          Create custom subagents for specialized AI tasks. Use when you want to create a new type of subagent, set up task-specific…
+     /subagent-agent-sdk-ver…  Use this agent to verify that a Python Agent SDK application is properly configured, follows SDK best practices and…
+     /subagent-agent-sdk-ver…  Use this agent to verify that a TypeScript Agent SDK application is properly configured, follows SDK best practices and…
+     /brand-guidelines         Applies Anthropic's official brand colors and typography to any sort of artifact that may benefit from having Anthropic's…
+
+  Loading usage data...
+[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[G  Ask (shift+tab to cycle)
+  Grok 4.7 256K High
+  /private/tmp/cursor-probe
+
+  Loading usage data...
+[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[G────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Usage • Pro                                                                                                                                     Resets Nov 3
+ Monthly plan and on-demand usage
+
+ Category        Current             Usage
+ Included        100% used           ████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████
+   Auto          100% used           ████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████
+   API           100% used           ████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████
+ On-Demand       Disabled            ————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+ On-demand usage is off
+
+ View in dashboard: ]8;;https://cursor.com/dashboard?tab=usagecursor.com/dashboard?tab=usage]8;;
+
+ Esc to close
+[?2004l

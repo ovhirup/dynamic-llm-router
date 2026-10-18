@@ -1,0 +1,145 @@
+{
+  "version": 2,
+  "timezone": "local",
+  "worker_order": ["codex", "grok-build", "cursor", "developer"],
+  "never": [],
+  "ineligible": {},
+  "binaries": {
+    "codex": null,
+    "grok": null,
+    "cursor": null,
+    "claude": null,
+    "_why": "null = resolve with shutil.which (codex, grok, cursor-agent, claude); set an absolute path to pin a binary"
+  },
+  "quota": {
+    "codex": {
+      "observer": "llm_router.observers.codex:observe",
+      "enabled": true,
+      "experimental": false,
+      "freshness_seconds": 660,
+      "usage_threshold_percent": 85,
+      "required_windows": ["primary", "weekly"],
+      "app_server_timeout_seconds": 15,
+      "hard_timeout_seconds": 30,
+      "consult": "always",
+      "meter": "codex-peak"
+    },
+    "grok-build": {
+      "observer": "llm_router.observers.grok_build:observe",
+      "enabled": false,
+      "experimental": true,
+      "freshness_seconds": 1260,
+      "usage_threshold_percent": 85,
+      "expected_cli_version": null,
+      "capture_timeout_seconds": 25,
+      "hard_timeout_seconds": 45,
+      "consult": "always",
+      "meter": "grok-weekly",
+      "_why": "Reads the interactive `grok dashboard` -> /usage screen in a pty (no official usage API yet). Opt-in; unknown on any parse doubt."
+    },
+    "cursor": {
+      "observer": "llm_router.observers.cursor:observe",
+      "enabled": false,
+      "experimental": true,
+      "freshness_seconds": 3960,
+      "usage_threshold_percent": 85,
+      "expected_cli_version": null,
+      "capture_timeout_seconds": 40,
+      "hard_timeout_seconds": 60,
+      "consult": "fallback",
+      "meter": "cursor-monthly",
+      "_why": "Reads the interactive cursor-agent /usage screen in a pty. Opt-in; consulted only when earlier workers are unavailable."
+    }
+  },
+  "unmetered_workers": [],
+  "developer": {
+    "enabled": false,
+    "model": "developer",
+    "endpoint": null,
+    "api_key_env": null,
+    "draft_max_chars": 4000,
+    "max_tokens": 256,
+    "timeout_seconds": 120,
+    "_why": "Optional OpenAI-compatible chat endpoint (e.g. a local LiteLLM/Ollama proxy) for short draft text only. Disabled unless enabled=true and endpoint is set; the key is read only from the env var named in api_key_env."
+  },
+  "run_task": {
+    "timeouts_seconds": {"codex": 900, "grok-build": 900, "cursor": 900, "claude": 900, "developer": 180},
+    "kill_grace_seconds": 5,
+    "pacing": {"warn_percent": 70, "refuse_full_percent": 85},
+    "ledger": "logs/ledger.csv",
+    "extra_ledgers": [],
+    "output_dir": "logs/task-output",
+    "prompt_prefix": "You are working in a git checkout. Make the requested change in this directory only. Do not run git commit, git push or any remote operation.",
+    "quota_error_pattern": "(?i)(usage limit|rate limit|quota|out of credits|limit reached|exhausted)",
+    "commands": {
+      "codex": ["{codex}", "exec", "-C", "{cwd}", "-s", "workspace-write", "-c", "approval_policy=never",
+                "-c", "features.multi_agent=false", "-c", "notify=[]", "-"],
+      "grok-build": ["{grok}", "--no-auto-update", "--prompt-file", "{prompt_file}", "--cwd", "{cwd}",
+                     "--output-format", "streaming-json", "--always-approve", "--no-subagents"],
+      "cursor": ["{cursor}", "-p", "--force", "--output-format", "stream-json", "--trust",
+                 "--workspace", "{cwd}", "{prompt_pointer}"],
+      "claude": ["{claude}", "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits"]
+    },
+    "prompt_delivery": {
+      "codex": "stdin",
+      "grok-build": "file",
+      "cursor": "pointer",
+      "claude": "stdin",
+      "_why": "codex exec reads the prompt from stdin when PROMPT is '-'; grok has --prompt-file; cursor-agent documents only a positional prompt, so argv carries a short pointer to a 0600 file in the checkout's git dir; claude -p reads stdin. codex runs with -c notify=[] because Codex passes the turn JSON (incl. the prompt) as argv to its notify program."
+    },
+    "protect_paths": {"grok-build": ["HANDOFF.md"]},
+    "private_terms_file": "private_terms.txt",
+    "shim_dir": "state/shims",
+    "block_log": "logs/blocked-workers.log",
+    "strip_env_prefixes": ["ANTHROPIC_", "CLAUDE_", "LITELLM_"],
+    "stall_seconds": {"codex": 300, "grok-build": 300, "cursor": 300, "claude": 300,
+                      "_why": "kill a worker that prints nothing on stdout/stderr for this long"}
+  },
+  "leak_check": {
+    "skip_untracked_dirs": ["node_modules", ".venv", "venv", "__pycache__", ".git", "dist", "build", ".next",
+                            ".nuxt", ".turbo", ".cache", "coverage", "Pods", "DerivedData", ".build", "target",
+                            ".gradle", ".pytest_cache", ".mypy_cache"],
+    "allow_regexes": [],
+    "max_file_bytes": 1000000
+  },
+  "run_job": {
+    "worktree_root": "worktrees",
+    "branch_prefix": "router/",
+    "lock_dir": "logs/locks",
+    "jobs_dir": "logs/jobs",
+    "repo_config": "repos.json",
+    "test_timeout_seconds": 600,
+    "test_stall_seconds": 300,
+    "test_output_tail_chars": 4000,
+    "max_retries": 1,
+    "commit_identity": {"name": "Dynamic LLM Router", "email": "router@localhost"},
+    "caffeinate": true
+  },
+  "quota_refresh": {
+    "interval_seconds": {"codex": 300, "grok-build": 900, "cursor": 3600},
+    "agent_period_seconds": 300,
+    "backoff": {"base_seconds": 300, "max_seconds": 3600},
+    "stale_alert_minutes": 30,
+    "state_file": "state/quota_refresh.json",
+    "lock_file": "state/quota_refresh.lock",
+    "_why": "freshness_seconds per meter must be >= interval + agent_period so cached readings stay usable between refreshes; a pool at 100% is skipped until its reset"
+  },
+  "alerts": {
+    "file": "logs/alerts.jsonl",
+    "summary": "logs/ALERTS.md",
+    "macos_notification": false
+  },
+  "launch_agent": {
+    "label": "dev.llm-router.quota",
+    "target_dir": "~/Library/LaunchAgents"
+  },
+  "pr_gate": {
+    "approvals_file": "state/approvals.jsonl",
+    "gate_dir": "state/gate",
+    "reviews_dir": "logs/reviews",
+    "gh_bin": "gh",
+    "approval_ttl_hours": 24,
+    "ci": {"initial_poll_seconds": 30, "max_poll_seconds": 300, "timeout_minutes": 60, "missing_grace_minutes": 10},
+    "_why": "A human approves every push and merge: approvals bind job+action+exact head SHA, expire, are single use; a new commit needs a new review+approval. Never force/--admin/--auto/delete."
+  }
+}

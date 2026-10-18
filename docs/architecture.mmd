@@ -1,0 +1,55 @@
+flowchart TB
+    subgraph Intake["1 Intake"]
+        T["task.md<br/>(written by you or an orchestrator agent)"]
+    end
+    subgraph Router["2 llm-router (your machine)"]
+        CFG[["config.json + defaults<br/>worker_order, never, thresholds,<br/>timeouts, pacing 70/85%"]]
+        RJ["run-job<br/>repo lock, git worktree + router/* branch,<br/>tests, one retry, local commit"]
+        RT["run-task<br/>select, pace, run headless,<br/>one failover, redact, leak check"]
+        SEL["selection<br/>first eligible in worker_order"]
+        subgraph Obs["Quota observers (isolated, hard timeout, cached)"]
+            QC["codex: app-server rateLimits/read<br/>(official)"]
+            QG["grok-build: /usage screen<br/>(experimental, opt-in)"]
+            QU["cursor: /usage screen<br/>(experimental, opt-in)"]
+            QX["your plugin: module:function"]
+        end
+        QS["quota refresh + alerts<br/>LaunchAgent / systemd / cron"]
+    end
+    subgraph Workers["3 Workers (headless, in the worktree)"]
+        W1["codex exec<br/>prompt on stdin"]
+        W2["grok<br/>--prompt-file 0600"]
+        W3["cursor-agent -p<br/>pointer to 0600 file"]
+        W4["claude -p (off by default)"]
+        W5["developer: OpenAI-compatible<br/>endpoint, drafts only (off)"]
+        SH["PATH shims refuse any CLI<br/>listed in never"]
+    end
+    subgraph Gate["4 PR gate (human approval)"]
+        RV["review bundle<br/>diff, tests, leak check, screenshots"]
+        AP{{"approve push / merge<br/>bound to exact head SHA"}}
+        PR["push router/* branch<br/>gh pr create --draft"]
+        CI["ci --watch"]
+        MG["merge: green required checks,<br/>--match-head-commit"]
+    end
+    subgraph Out["5 State (~/.local/state/llm-router)"]
+        L1[("ledger.csv, task logs,<br/>jobs, reviews")]
+        L2[("alerts.jsonl + ALERTS.md")]
+    end
+    T --> RJ --> RT
+    CFG --> RT
+    RT --> SEL
+    QC --> SEL
+    QG --> SEL
+    QU --> SEL
+    QX --> SEL
+    QS --> Obs
+    RT --> W1 & W2 & W3 & W4 & W5
+    SH -.-> Workers
+    RJ --> RV --> AP --> PR --> CI --> AP
+    AP --> MG
+    RT --> L1
+    QS --> L2
+    RJ --> L2
+    classDef optional stroke-dasharray: 5 5,fill:#f4f4f4;
+    class QG,QU,QX,W4,W5 optional;
+    classDef human fill:#fff4d6,stroke:#c90;
+    class AP human;

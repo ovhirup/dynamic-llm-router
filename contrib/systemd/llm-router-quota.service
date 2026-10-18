@@ -1,0 +1,11 @@
+[Unit]
+Description=Dynamic LLM Router: refresh quota meters once
+
+[Service]
+Type=oneshot
+# Adjust if llm-router is not on the user PATH (e.g. %h/.local/bin/llm-router for pipx).
+ExecStart=%h/.local/bin/llm-router quota refresh --once
+# Worker CLIs (codex, grok, cursor-agent) must be findable:
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Nice=10
+TimeoutStartSec=300

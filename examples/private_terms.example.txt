@@ -1,0 +1,5 @@
+# Private terms: one per line, case-insensitive substring match. '#' lines are comments.
+# The leak check blocks any commit, push or PR that adds one of these. Keep this file out of git.
+# Typical entries: private repo names, internal hostnames, bundle/team IDs, device IDs, your own name.
+example-internal-codename
+internal.example.com

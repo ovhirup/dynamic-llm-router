@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Rendered by llm-router install-agent; loaded only on explicit confirmation. Runs every StartInterval seconds while awake. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>__PROGRAM_ARGUMENTS__
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__STATE_DIR__</string>
+  <key>StartInterval</key>
+  <integer>__INTERVAL__</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>EnvironmentVariables</key>
+  <dict>__ENVIRONMENT__
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/quota-agent.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/quota-agent.err.log</string>
+</dict>
+</plist>

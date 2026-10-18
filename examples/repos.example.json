@@ -1,0 +1,14 @@
+{
+  "_doc": "Per-repo settings for run-job and the PR gate, keyed by absolute repo path or by repo directory name. Copy to ~/.config/llm-router/repos.json.",
+  "my-app": {
+    "test_cmd": "npm test --silent",
+    "test_timeout_seconds": 600,
+    "screenshot_cmd": "TODO: a headless command that writes PNGs into $SCREENSHOT_DIR",
+    "remote": "origin",
+    "base": "main",
+    "github_repo": "your-org/my-app",
+    "visibility": "public",
+    "merge_method": "squash",
+    "required_checks": ["build", "test"]
+  }
+}

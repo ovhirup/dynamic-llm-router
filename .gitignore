@@ -1,0 +1,22 @@
+# personal config and state never belong in the repo
+*.local.json
+*.local.*
+.env
+.env.*
+config.json
+private_terms.txt
+repos.json
+state/
+logs/
+worktrees/
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.DS_Store

@@ -1,0 +1,32 @@
+{
+  "_comment": "Copy to ~/.config/llm-router/config.json (or run `llm-router init`). Only keys you set override the packaged defaults; see `llm-router paths` and docs/configuration.md.",
+  "timezone": "local",
+  "worker_order": ["codex", "grok-build", "cursor"],
+  "never": [],
+  "binaries": {
+    "codex": null,
+    "grok": null,
+    "cursor": null
+  },
+  "quota": {
+    "grok-build": {"enabled": false, "expected_cli_version": null},
+    "cursor": {"enabled": false, "expected_cli_version": null}
+  },
+  "run_task": {
+    "pacing": {"warn_percent": 70, "refuse_full_percent": 85},
+    "extra_ledgers": []
+  },
+  "run_job": {
+    "worktree_root": "worktrees",
+    "commit_identity": {"name": "Dynamic LLM Router", "email": "router@localhost"}
+  },
+  "leak_check": {
+    "allow_regexes": []
+  },
+  "developer": {
+    "enabled": false,
+    "endpoint": "http://127.0.0.1:4000/v1/chat/completions",
+    "model": "developer",
+    "api_key_env": "LLM_ROUTER_DEVELOPER_KEY"
+  }
+}

@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dynamic-llm-router"
+version = "0.2.0"
+description = "Quota-aware router that dispatches coding tasks to headless agent CLIs (Codex, Grok Build, Cursor) with pacing, worktrees, leak checks and a human-approved PR gate."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Dynamic LLM Router contributors" }]
+keywords = ["llm", "agents", "codex", "grok", "cursor", "router", "quota", "automation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Build Tools",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/ovhirup/dynamic-llm-router"
+Repository = "https://github.com/ovhirup/dynamic-llm-router"
+Issues = "https://github.com/ovhirup/dynamic-llm-router/issues"
+Changelog = "https://github.com/ovhirup/dynamic-llm-router/blob/main/CHANGELOG.md"
+
+[project.scripts]
+llm-router = "llm_router.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+llm_router = ["default_policy.json", "templates/*", "examples/*"]

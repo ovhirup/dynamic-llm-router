@@ -1,0 +1,31 @@
+sequenceDiagram
+    autonumber
+    actor U as You (or an orchestrator agent)
+    participant RJ as run-job
+    participant RT as run-task
+    participant Q as Quota observers
+    participant W as Worker CLI
+    participant G as Git / GitHub
+    participant L as Ledger + alerts
+    U->>RJ: run-job --repo R --task-file task.md
+    RJ->>G: lock repo, git worktree add -b router/<slug>-<stamp>
+    RJ->>RT: run-task in the worktree
+    RT->>Q: fresh cache, else one isolated live read (hard timeout)
+    Q-->>RT: meters (unknown / stale = ineligible)
+    alt no eligible worker or meter >= 85% (full size)
+        RT-->>U: refused, nothing run
+    end
+    RT->>W: headless run, prompt via stdin or 0600 file, block shims on PATH
+    alt failed, quota error, timeout or stall
+        RT->>W: kill process group, fail over once
+    end
+    RT->>RT: restore protected files, redact logs, leak check
+    RT->>L: ledger row
+    RJ->>RJ: run tests, retry once with the failure tail
+    RJ->>G: re-scan staged files, commit on the router branch only
+    RJ->>L: job record + alert if failed or leak-blocked
+    U->>RJ: review <job>  (diff, tests, leak check, screenshots)
+    U->>G: approve --action push --sha <head>
+    RJ->>G: push (never force) + draft PR, ci --watch
+    U->>G: approve --action merge --sha <head>
+    RJ->>G: merge only if PR head == approved SHA and required checks are green

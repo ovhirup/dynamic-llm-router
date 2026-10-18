@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install .
+      - name: Unit tests (fake workers only)
+        working-directory: tests
+        run: python -m unittest discover -t . -s . -v
+      - name: CLI smoke
+        env:
+          LLM_ROUTER_CONFIG_DIR: ${{ runner.temp }}/cfg
+          LLM_ROUTER_STATE_DIR: ${{ runner.temp }}/state
+        run: |
+          llm-router --version
+          llm-router init
+          llm-router paths
+
+  leak-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install .
+      - name: Secret shapes in tree and history
+        run: |
+          : > "$RUNNER_TEMP/terms.txt"
+          llm-router scan . --history --terms "$RUNNER_TEMP/terms.txt"
+      - name: No home-directory paths
+        run: |
+          if git grep -nE '/(Users|home)/[A-Za-z0-9._-]+/' -- . ':!tests/' ':!.github/' ; then
+            echo "::error::absolute home-directory path committed"; exit 1
+          fi
