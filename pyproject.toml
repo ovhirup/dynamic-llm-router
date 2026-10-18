@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dynamic-llm-router"
-version = "0.2.0"
+version = "0.3.0"
 description = "Quota-aware router that dispatches coding tasks to headless agent CLIs (Codex, Grok Build, Cursor) with pacing, worktrees, leak checks and a human-approved PR gate."
 readme = "README.md"
 license = "MIT"
@@ -36,4 +36,4 @@ llm-router = "llm_router.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-llm_router = ["default_policy.json", "templates/*", "examples/*"]
+llm_router = ["default_policy.json", "templates/*", "examples/*", "examples/workers/*"]

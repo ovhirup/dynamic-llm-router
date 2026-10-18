@@ -116,6 +116,7 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
            consult_cursor=False, threshold_overrides=None):
     """Return {'worker', 'reason', 'eligible', 'meters', 'reasons', 'sources', 'versions', ...}."""
     policy = policy or config.load_policy()
+    clock_injected = now is not None
     now = now or datetime.now(timezone.utc)
     io = io if io is not None else quota_service.default_io(policy)
     never = set(policy.get('never') or [])
@@ -123,8 +124,11 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
     overrides = threshold_overrides or {}
     eligible, meters, reasons, sources, versions, warnings = [], {}, {}, {}, {}, {}
     for worker in policy['worker_order']:
-        if worker in never:
+        if config.blocked_worker(policy, worker):
             reasons[worker] = 'never'
+            continue
+        if worker in (policy.get('ineligible') or {}):
+            reasons[worker] = 'ineligible'
             continue
         if worker == 'developer':
             ok = developer_ready(policy, task_chars)
@@ -142,6 +146,8 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
             reasons[worker] = 'not_consulted'
             continue
         observation, sources[worker] = _observation(policy, worker, io, now, cached_only)
+        if sources[worker] == 'live' and not clock_injected:
+            now = datetime.now(timezone.utc)  # a live read is stamped after `now`; don't call it future-dated
         evidence = quota_service.evidence_of(observation)
         reason = evidence_reason(worker, evidence, now)
         meters[worker] = peak(evidence) if reason in ('quota_available', 'quota_exhausted') else None
@@ -157,7 +163,8 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
         if reason == 'quota_available':
             eligible.append(worker)
     worker = eligible[0] if eligible else None
-    return {'worker': worker, 'reason': 'preferred_eligible_worker' if worker else 'no_eligible_worker',
+    return {'worker': worker, 'reason': 'preferred_eligible_worker' if worker else 'no_eligible_worker' if policy['worker_order'] else 'no_workers_configured',
+            'hint': None if policy['worker_order'] else 'run llm-router init',
             'eligible': eligible, 'meters': meters, 'reasons': reasons, 'sources': sources,
             'cli_versions': versions, 'version_warnings': warnings,
             'never': sorted(never), 'ineligible': policy.get('ineligible') or {}}

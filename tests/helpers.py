@@ -6,6 +6,8 @@ so no test can read or write the real user config, caches or ledger, and no real
 import atexit
 import copy
 import os
+import json
+from pathlib import Path
 import shutil
 import tempfile
 
@@ -14,6 +16,9 @@ atexit.register(shutil.rmtree, _ROOT, True)
 os.environ['LLM_ROUTER_CONFIG_DIR'] = os.path.join(_ROOT, 'config')
 os.environ['LLM_ROUTER_STATE_DIR'] = os.path.join(_ROOT, 'state')
 os.environ.pop('LLM_ROUTER_CONFIG', None)
+
+Path(os.environ['LLM_ROUTER_CONFIG_DIR']).mkdir(parents=True)
+Path(os.environ['LLM_ROUTER_CONFIG_DIR'], 'config.json').write_text(json.dumps({'worker_order': ['codex', 'grok-build', 'cursor', 'developer']}))
 
 from llm_router import config  # noqa: E402
 

@@ -6,6 +6,9 @@ are refused and shadowed on PATH by a refusing shim.
 """
 import csv
 import fcntl
+import fnmatch
+import hashlib
+import shutil
 import json
 import os
 from pathlib import Path
@@ -25,7 +28,7 @@ def coding_workers(policy):
 
 def forceable(policy):
     never = set(policy.get('never') or [])
-    return tuple(w for w in coding_workers(policy) + ('developer',) if w not in never)
+    return tuple(w for w in coding_workers(policy) + ('developer',) if not config.blocked_worker(policy, w))
 
 
 def meter_name(policy, worker):
@@ -174,17 +177,29 @@ def handoff_restore(cwd, snapshot):
     return {'before': state, 'action': 'restored'}
 
 
-def build_argv(policy, worker, cwd, prompt_file=None):
-    """Expand a linted template. The prompt itself is never an argv value."""
+def build_argv(policy, worker, cwd, prompt_file=None, prompt=None, repo=None, env=None):
+    """Expand a linted template; task text enters argv only for explicit arg delivery."""
     template = policy['run_task']['commands'][worker]
-    values = {'{cwd}': str(cwd)}
+    values = {'{cwd}': str(cwd), '{repo}': str(repo or cwd)}
     if prompt_file is not None:
         values['{prompt_file}'] = str(prompt_file)
         values['{prompt_pointer}'] = (f'Your full task is in the file {prompt_file}. Read that file and follow '
                                       'it exactly; do not copy it into the repository.')
     values.update({'{' + name + '}': config.binary(policy, name) for name in config.BINARY_DEFAULTS
                    if '{' + name + '}' in template})
-    argv = [values.get(arg, arg) for arg in template]
+    argv = []
+    for arg in template:
+        for key, value in values.items():
+            arg = arg.replace(key, value)
+        if delivery(policy, worker) == 'arg':
+            arg = arg.replace('{prompt}', prompt or '')  # last, so task text is never re-expanded
+        argv.append(arg)
+    if not Path(argv[0]).is_absolute():
+        argv[0] = (shutil.which(argv[0], path=env.get('PATH')) if env is not None else shutil.which(argv[0])) or argv[0]
+    if worker == 'claude' and delivery(policy, worker) == 'pointer' and not any('{prompt_pointer}' in a for a in template):
+        if prompt_file is None:
+            raise Refused(f'{worker}: template needs a prompt file')
+        argv.append(values['{prompt_pointer}'])
     if any(arg in ('{prompt_file}', '{prompt_pointer}') for arg in argv):
         raise Refused(f'{worker}: template needs a prompt file')
     return argv
@@ -192,7 +207,7 @@ def build_argv(policy, worker, cwd, prompt_file=None):
 
 def delivery(policy, worker):
     mode = policy['run_task'].get('prompt_delivery', {}).get(worker, 'stdin')
-    if mode not in ('stdin', 'file', 'pointer'):
+    if mode not in ('stdin', 'file', 'pointer', 'arg'):
         raise Refused(f'{worker}: unknown prompt delivery {mode}')
     return mode
 
@@ -268,6 +283,9 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
     select = select or (lambda chars, **kw: selection_module.select(chars, policy=policy, **kw))
     coding = coding_workers(policy)
     metered = set(config.metered_workers(policy))
+    forced_quota = config.quota_cfg(policy, worker)
+    if worker is not None and forced_quota and forced_quota.get('enabled', True):
+        metered.add(worker)
     cwd = Path(cwd).expanduser().resolve()
     task_path = Path(task_file).expanduser().resolve()
     task = task_path.read_text()
@@ -278,6 +296,8 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
                'diff_stat': '', 'untracked': [], 'output_path': None,
                'handoff_cleanup': 'not_applicable', 'leak_check': None,
                'blocked_by_leak_check': False, 'blocked_worker_attempts': 0}
+    if worker is not None and config.blocked_worker(policy, worker):
+        raise Refused(f'{worker} is in never; remove it from never to use it')
     if worker is not None and worker not in forceable(policy):
         raise Refused('worker must be one of ' + ', '.join(forceable(policy)) + ' (workers in `never` are refused)')
     if size not in ('draft', 'full'):
@@ -285,6 +305,8 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
     if worker == 'developer' and size != 'draft':
         raise Refused('developer only produces draft text (use --size draft)')
     head_before = check_repo(cwd, allow_dirty)
+    cwd = Path(_git(cwd, 'rev-parse', '--show-toplevel').stdout.strip()).resolve()
+    summary['cwd'] = str(cwd)
     chars = 0 if size == 'draft' else policy['developer']['draft_max_chars'] + 1
     # A forced cursor still gets its own meter read (it is otherwise consulted only as a fallback).
     if worker is not None and (meter is not None or not injected_select):
@@ -318,7 +340,7 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
     if extra_prompt:
         prompt += '\n\n' + extra_prompt
     quota_error = re.compile(policy['run_task']['quota_error_pattern'])
-    env, block_log = worker_environment(policy)
+    _, block_log = worker_environment(policy)
     blocks_before = security.count_lines(block_log)
     for attempt, name in enumerate(order[:2]):  # the chosen worker plus one failover
         if attempt and name in coding:
@@ -328,6 +350,11 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
                 break
             if warning:
                 summary['warnings'].append(warning)
+        if name in coding and name in unmetered:
+            warning = f'{name} is unmetered: run not paced'
+            if warning not in summary['warnings']:
+                summary['warnings'].append(warning)
+        env, _ = worker_environment(policy, name)
         record = {'worker': name}
         if name == 'developer':
             path = out_dir / f'{stamp}-developer.md'
@@ -342,10 +369,16 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
             snapshots = [handoff_snapshot(cwd, item) for item in protected]
             mode = delivery(policy, name)
             prompt_file = None
+            run_cwd = (cwd / policy['run_task'].get('cwd', {}).get(name, '.')).resolve()
+            if not run_cwd.is_relative_to(cwd) or not run_cwd.is_dir():
+                raise Refused(f'{name}: cwd must stay inside the checkout and be a directory')
+            before_tree = tree_fingerprint(cwd)
+            if mode == 'arg':
+                summary['warnings'].append('prompt passed in argv: visible to other local users in the process list')
             try:
-                if mode != 'stdin':
+                if mode in ('file', 'pointer'):
                     prompt_file = write_prompt_file(cwd, stamp, name, prompt)
-                result = runner(build_argv(policy, name, cwd, prompt_file), cwd,
+                result = runner(build_argv(policy, name, run_cwd, prompt_file, prompt=prompt, repo=cwd, env=env), run_cwd,
                                 policy['run_task']['timeouts_seconds'][name],
                                 policy['run_task']['kill_grace_seconds'],
                                 input_text=prompt if mode == 'stdin' else None, env=env,
@@ -362,7 +395,9 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
                 result['returncode'], result['timed_out'], result['elapsed_seconds'],
                 result['stdout'], result['stderr'])))
             quota = bool(quota_error.search(result['stderr'] + result['stdout'][-4000:])) and result['returncode'] != 0
-            record.update(ok=result['returncode'] == 0 and not result['timed_out'],
+            success_check = check_success(policy, name, result, before_tree != tree_fingerprint(cwd))
+            record.update(ok=success_check is None and not result['timed_out'],
+                          success_check=success_check,
                           timed_out=result['timed_out'], returncode=result['returncode'],
                           quota_error=quota, elapsed_seconds=result['elapsed_seconds'],
                           stalled=result.get('stalled', False))
@@ -417,11 +452,51 @@ def leak_options(policy):
             'max_bytes': options.get('max_file_bytes', 1_000_000)}
 
 
-def worker_environment(policy):
+def tree_fingerprint(cwd):
+    """Content snapshot, including dirty and untracked files, for per-attempt change detection."""
+    names = _git(cwd, 'ls-files', '-z', '--cached', '--others', '--exclude-standard').stdout.split('\0')
+    digest = hashlib.sha256()
+    for name in sorted(set(n for n in names if n)):
+        path = Path(cwd) / name
+        digest.update(name.encode())
+        if path.is_symlink():
+            digest.update(os.readlink(path).encode())
+        elif path.is_file():
+            digest.update(path.read_bytes())
+            digest.update(str(path.stat().st_mode).encode())
+        else:
+            digest.update(b'missing')
+    return digest.digest()
+
+
+def check_success(policy, worker, result, changed):
+    opts = policy['run_task'].get('success', {}).get(worker, {})
+    text = result['stdout'] + result['stderr']
+    if result['returncode'] not in opts.get('exit_codes', [0]):
+        return 'exit_code'
+    if opts.get('fail_regex') and re.search(opts['fail_regex'], text):
+        return 'fail_regex'
+    if opts.get('require_regex') and not re.search(opts['require_regex'], text):
+        return 'require_regex_missing'
+    if opts.get('require_changes') and not changed:
+        return 'no_changes'
+    return None
+
+
+def worker_environment(policy, worker=None):
     """(env, block_log): PATH shims for every `never` CLI, configured env prefixes stripped."""
     block_log = _router_path(policy, 'block_log', 'logs/blocked-workers.log')
     shim_dir = security.ensure_block_shims(_router_path(policy, 'shim_dir', 'state/shims'), block_log,
                                            policy.get('never') or [])
-    env = security.worker_env(shim_dir, strip_prefixes=policy['run_task'].get('strip_env_prefixes',
-                                                                              security.STRIP_PREFIXES))
+    run = policy['run_task']
+    keep = tuple(run.get('env_keep_prefixes', {}).get(worker, []))
+    prefixes = [p for p in run.get('strip_env_prefixes', security.STRIP_PREFIXES) if p not in keep]
+    opts = run.get('env', {}).get(worker, {})
+    base = dict(os.environ)
+    if 'allow' in opts:
+        essentials = ('PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_*', 'TERM', 'TMPDIR')
+        patterns = list(essentials) + opts['allow']
+        base = {k: v for k, v in base.items() if any(fnmatch.fnmatchcase(k, p) for p in patterns)}
+    base.update(opts.get('set', {}))
+    env = security.worker_env(shim_dir, base=base, strip_prefixes=prefixes)
     return env, block_log

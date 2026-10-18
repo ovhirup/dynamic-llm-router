@@ -37,15 +37,16 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             os.environ['LLM_ROUTER_CONFIG_DIR'] = tmp
             try:
-                code, out = run(['init'])
+                code, out = run(['init', '--workers', 'codex', '--non-interactive'])
                 first = json.loads(out)
-                code, out = run(['init'])
+                code, out = run(['init', '--workers', 'codex', '--non-interactive'])
                 second = json.loads(out)
                 self.assertEqual(json.loads((Path(tmp) / 'config.json').read_text())['worker_order'][0], 'codex')
             finally:
                 os.environ['LLM_ROUTER_CONFIG_DIR'] = saved
         self.assertEqual(len(first['written']), 3)
-        self.assertEqual(second['written'], [])
+        self.assertEqual(code, 2)
+        self.assertIn('already exists', second['config_error'])
 
     def test_scan_and_bad_config(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as other:

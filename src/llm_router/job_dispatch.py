@@ -139,6 +139,8 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             popen=subprocess.Popen, notifier=None):
     """keep: True (--keep), False (--prune) or None (keep on success, prune on failure)."""
     policy = policy or config.load_policy()
+    if worker is not None and config.blocked_worker(policy, worker):
+        raise Refused(f'{worker} is in never; remove it from never to use it')
     started = now or td.now_local(policy)
     stamp = started.strftime('%Y%m%d-%H%M%S')
     top = _git(Path(repo).expanduser(), 'rev-parse', '--show-toplevel')

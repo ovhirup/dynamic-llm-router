@@ -50,3 +50,21 @@ when one exists. The plugin hook is there for exactly that.
 
 `tests/fixtures/*.bin` are scrubbed raw pty captures used by the parser tests. When a CLI changes its screen,
 add a new scrubbed capture and a test, and keep the old one if the old format can still appear.
+
+## Claude Code (experimental, disabled)
+
+`llm_router.observers.claude:observe` opens interactive `claude` on a pty and types `/usage` under a hard
+deadline. Both named rows are required: `Current session ... NN% used` (`session`) and
+`Current week (all models) ... NN% used` (`weekly`). Exactly one of each, 0–100, is accepted.
+The screen layout is **unverified**. If it differs, the observer returns `unknown(parse_failed)`.
+Tests use synthetic fixture text and a fake TUI only. Claude is never automatically ranked by init.
+
+## Configured command observer
+
+`llm_router.observers.command:observe` uses bounded `common.run_capture` with the configured timeout,
+inside the normal isolated hard deadline. `workers.<name>.quota` registers it automatically.
+The regex must match exactly once and contain `(?P<percent>...)`; values must be 0–100.
+`percent_is: remaining` converts to used. A named `(?P<reset>...)` must be an ISO timestamp with timezone
+in the future; expiry is capped at reset. Evidence uses the normal required_windows/windows shape.
+Timeouts, command failure, no match, multiple matches, bad resets or out-of-range values return unknown
+with a reason. See [worker examples](workers.md).

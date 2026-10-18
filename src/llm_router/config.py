@@ -11,6 +11,7 @@ from datetime import datetime, tzinfo
 from importlib import resources
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 from zoneinfo import ZoneInfo
@@ -94,22 +95,133 @@ def known_workers(policy):
     return set(k for k in policy['run_task']['commands'] if not k.startswith('_')) | {'developer'}
 
 
+def blocked_worker(policy, name):
+    from . import security
+    if name in (policy.get('never') or []):
+        return True
+    argv = policy['run_task']['commands'].get(name, [])
+    if not isinstance(argv, list) or not argv or not isinstance(argv[0], str):
+        return False
+    executable = argv[0]
+    for key in BINARY_DEFAULTS:
+        executable = executable.replace('{' + key + '}', binary(policy, key))
+    return Path(executable).name in security.shim_names(policy.get('never') or [])
+
+
+def materialise_workers(policy):
+    from . import security
+    run = policy['run_task']
+    definitions = policy.get('workers', {})
+    if not isinstance(definitions, dict):
+        raise ConfigError('workers must be an object')
+    for name, opts in definitions.items():
+        if name.startswith('_'):
+            continue
+        if not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', name) or not isinstance(opts, dict):
+            raise ConfigError('workers names must match [a-z][a-z0-9_-]{0,31}')
+        if 'command' in opts:
+            run['commands'][name] = opts['command']
+        if name not in run['commands']:
+            raise ConfigError(f'{name}: command required')
+        for field, internal, default in [('prompt_delivery', 'prompt_delivery', 'stdin'),
+                                        ('cwd', 'cwd', '.'), ('env', 'env', {}),
+                                        ('timeout_seconds', 'timeouts_seconds', 900),
+                                        ('stall_seconds', 'stall_seconds', 300),
+                                        ('success', 'success', {})]:
+            run.setdefault(internal, {})[name] = opts.get(field, run.get(internal, {}).get(name, default))
+        if 'quota' in opts:
+            if not isinstance(opts['quota'], dict):
+                raise ConfigError(f'{name}: quota must be an object')
+            quota = deep_merge({'observer': 'llm_router.observers.command:observe', 'enabled': True,
+                                'window': 'monthly', 'percent_is': 'used', 'timeout_seconds': 20,
+                                'hard_timeout_seconds': 40, 'freshness_seconds': 1800,
+                                'usage_threshold_percent': 85}, opts['quota'])
+            policy.setdefault('quota', {})[name] = quota
+    for name in run['commands']:
+        if name.startswith('_'):
+            continue
+        mode = run.get('prompt_delivery', {}).get(name, 'stdin')
+        if mode not in ('stdin', 'file', 'pointer', 'arg'):
+            raise ConfigError(f'{name}: invalid prompt_delivery')
+        cwd = run.get('cwd', {}).get(name, '.')
+        if not isinstance(cwd, str) or Path(cwd).is_absolute() or '..' in Path(cwd).parts:
+            raise ConfigError(f'{name}: cwd must stay inside the checkout')
+        env = run.get('env', {}).get(name, {})
+        if not isinstance(env, dict) or ('allow' in env and (not isinstance(env['allow'], list) or
+                not all(isinstance(v, str) for v in env['allow']))):
+            raise ConfigError(f'{name}: invalid env allowlist')
+        setting = env.get('set', {})
+        if not isinstance(setting, dict):
+            raise ConfigError(f'{name}: env.set must be an object')
+        for key, value in setting.items():
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key) or not isinstance(value, str):
+                raise ConfigError(f'{name}: invalid env.set entry')
+            if re.search(r'KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|PRIVATE', key, re.I) or list(security.find_secrets(value)):
+                raise ConfigError(f'{name}: env.set secrets forbidden; pass secrets through env.allow')
+        raw_success = run.get('success', {}).get(name, {})
+        if not isinstance(raw_success, dict):
+            raise ConfigError(f'{name}: success must be an object')
+        success = deep_merge({'exit_codes': [0], 'require_regex': None, 'fail_regex': None,
+                              'require_changes': False}, raw_success)
+        if not isinstance(success['exit_codes'], list) or not success['exit_codes'] or not all(type(v) is int for v in success['exit_codes']):
+            raise ConfigError(f'{name}: invalid success.exit_codes')
+        for field in ('require_regex', 'fail_regex'):
+            try:
+                if success[field] is not None:
+                    re.compile(success[field])
+            except (TypeError, re.error):
+                raise ConfigError(f'{name}: invalid success.{field}') from None
+        if type(success['require_changes']) is not bool:
+            raise ConfigError(f'{name}: success.require_changes must be boolean')
+        run.setdefault('success', {})[name] = success
+        for field in ('timeouts_seconds', 'stall_seconds'):
+            value = run.setdefault(field, {}).setdefault(name, 900 if field == 'timeouts_seconds' else 300)
+            if type(value) not in (int, float) or not 0 < value < float('inf'):
+                raise ConfigError(f'{name}: invalid {field}')
+    for name, opts in (policy.get('quota') or {}).items():
+        if not isinstance(opts, dict) or opts.get('observer') != 'llm_router.observers.command:observe':
+            continue
+        try:
+            security.lint_commands({name: opts.get('command')}, allowed=set())
+            regex = re.compile(opts['regex'])
+            if 'percent' not in regex.groupindex:
+                raise ValueError('regex needs named percent group')
+            if not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', opts.get('window', 'monthly')):
+                raise ValueError('invalid window')
+            if opts.get('percent_is', 'used') not in ('used', 'remaining'):
+                raise ValueError('invalid percent_is')
+            for field in ('timeout_seconds', 'hard_timeout_seconds', 'freshness_seconds'):
+                value = opts[field]
+                if type(value) not in (int, float) or not 0 < value < float('inf'):
+                    raise ValueError('invalid ' + field)
+        except (ValueError, TypeError, KeyError, re.error) as error:
+            raise ConfigError(f'{name}: invalid quota command: {error}') from None
+    return policy
+
+
 def validate(policy):
     from . import quota_service, security
     order = policy.get('worker_order')
-    if not isinstance(order, list) or not order or len(set(order)) != len(order):
-        raise ConfigError('worker_order must be a non-empty list of unique worker names')
+    materialise_workers(policy)
+    if not isinstance(order, list) or not all(isinstance(n, str) for n in order) or len(set(order)) != len(order):
+        raise ConfigError('worker_order must be a list of unique worker names')
     unknown = [name for name in order if name not in known_workers(policy)]
     if unknown:
         raise ConfigError(f'worker_order names unknown workers: {unknown} (add run_task.commands entries)')
     never = policy.get('never') or []
     if not isinstance(never, list) or not all(isinstance(n, str) for n in never):
         raise ConfigError('never must be a list of worker names')
-    banned = [name for name in order if name in never]
+    banned = [name for name in order if blocked_worker(policy, name)]
     if banned:
         raise ConfigError(f'worker_order contains workers listed in never: {banned}')
     commands = {k: v for k, v in policy['run_task']['commands'].items() if not k.startswith('_')}
-    security.lint_commands(commands)
+    try:
+        security.lint_commands(commands, prompt_delivery=policy['run_task'].get('prompt_delivery', {}))
+    except security.LintError as error:
+        raise ConfigError(str(error)) from None
+    for name, argv in commands.items():
+        if not argv[0] or (not Path(argv[0]).is_absolute() and ('/' in argv[0] or '\\' in argv[0])):
+            raise ConfigError(f'{name}: executable must be a bare name or absolute path')
     for name in order:
         if name == 'developer':
             continue
@@ -160,5 +272,5 @@ def quota_cfg(policy, worker):
 def metered_workers(policy):
     """Workers with an enabled quota observer, in worker_order first."""
     quota = policy.get('quota') or {}
-    names = [w for w in policy['worker_order'] if w in quota] + [w for w in quota if w not in policy['worker_order']]
+    names = [w for w in policy['worker_order'] if w in quota]
     return [w for w in names if not w.startswith('_') and quota[w].get('enabled', True)]

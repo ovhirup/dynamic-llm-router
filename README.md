@@ -2,7 +2,8 @@
 
 [![CI](https://github.com/ovhirup/dynamic-llm-router/actions/workflows/ci.yml/badge.svg)](https://github.com/ovhirup/dynamic-llm-router/actions/workflows/ci.yml)
 
-**Quota-aware dispatch of coding tasks to headless agent CLIs.**
+**Bring any worker. You choose and rank your coding workers; there is no default order.**
+Built-in adapters and config-defined adapters let you use any CLI.
 `llm-router` picks a worker (Codex, Grok Build, Cursor, optionally Claude Code or a local model) based on
 each tool's *live* usage meter, runs the task headless in a throwaway git worktree, tests it, leak-checks it,
 commits it on a `router/*` branch and then stops. Nothing is pushed or merged until a human approves the
@@ -11,7 +12,7 @@ exact commit.
 It is built for people who pay for several AI coding subscriptions and want to spend each pool evenly
 without babysitting terminals, and without ever leaking a private repo name or key into a public PR.
 
-> Status: alpha (0.2). macOS and Linux. Python 3.10+, no third-party dependencies.
+> Status: alpha (0.3). macOS and Linux. Python 3.10+, no third-party dependencies.
 > Works with Codex, Grok, Cursor and Claude Code CLIs; not affiliated with or endorsed by any of them.
 
 ![Architecture](docs/architecture.png)
@@ -34,12 +35,14 @@ without babysitting terminals, and without ever leaking a private repo name or k
 - **Unknown means no.** A meter that is missing, stale, malformed, future-dated or unparseable makes that
   worker ineligible; the router never guesses a number. A worker with no observer is ineligible unless you
   list it in `unmetered_workers` (it then runs unpaced, with a warning).
-- **Prompts never in argv.** Task text goes to the worker on stdin (`codex exec -`), via a 0600 `--prompt-file`
+- **Private prompt delivery by default.** Task text goes to the worker on stdin (`codex exec -`), via a 0600 `--prompt-file`
   (grok) or as a short pointer to a 0600 file inside the checkout's `.git` dir (cursor-agent). Command templates
-  are linted at load: `{prompt}` in argv, credential flags and inline secrets are rejected.
+  are linted at load: `{prompt}` requires explicit `arg` delivery; credential flags and inline secrets are rejected. Arg delivery warns that the process list exposes task text.
 - **Denylist with teeth.** Any CLI listed in `never` is refused as a worker *and* shadowed on the worker's PATH by
   a shim that logs and refuses the call, so a worker cannot spawn it either. Configured env prefixes
-  (default `ANTHROPIC_`, `CLAUDE_`, `LITELLM_`) are stripped from worker environments.
+  (default `ANTHROPIC_`, `CLAUDE_`, `LITELLM_`) are stripped from worker environments; a worker can keep its
+  own with `run_task.env_keep_prefixes` (default: `claude` keeps `ANTHROPIC_`/`CLAUDE_`), and
+  `workers.<name>.env.allow` restricts a worker to an explicit allowlist.
 - **Leak gate.** Every run, commit and push is scanned: vendor key shapes (OpenAI, Anthropic, xAI, GitHub,
   Slack, AWS, Google, JWT, PEM, bearer), `.env`-style secret assignments, quoted secret literals, and your
   private terms file. A hit blocks the commit/push and keeps the files for review; nothing is deleted.
@@ -61,7 +64,7 @@ See [SECURITY.md](SECURITY.md) for the threat model and how to report issues.
 
 ```bash
 pipx install git+https://github.com/ovhirup/dynamic-llm-router   # or: pip install -e . in a venv
-llm-router init       # writes example config files to ~/.config/llm-router (never overwrites)
+llm-router init       # interactive detection and worker ordering; Claude opt-in defaults No
 llm-router doctor     # validates config, finds binaries and observers; runs no worker
 llm-router paths      # where config and state live
 ```
@@ -105,15 +108,16 @@ Examples: [`examples/config.example.json`](examples/config.example.json),
 
 | Worker | Runs | Prompt delivery | Quota meter | Default |
 |--------|------|-----------------|-------------|---------|
-| `codex` | `codex exec -C <cwd> -s workspace-write -c approval_policy=never -c notify=[] -` | stdin | `codex app-server` `account/rateLimits/read` (official) | on |
-| `grok-build` | `grok --prompt-file <0600 file> --cwd <cwd> --always-approve --no-subagents` | file | `/usage` screen of `grok dashboard` (experimental) | in order, meter off until enabled |
-| `cursor` | `cursor-agent -p --force --trust --workspace <cwd> <pointer>` | pointer | `/usage` screen of `cursor-agent` (experimental, consulted only as fallback) | in order, meter off until enabled |
-| `claude` | `claude -p --permission-mode acceptEdits` | stdin | none (unmetered) | **off**: add to `worker_order` *and* `unmetered_workers` |
+| `codex` | `codex exec -C <cwd> -s workspace-write -c approval_policy=never -c notify=[] -` | stdin | `codex app-server` `account/rateLimits/read` (official) | no default order; meter enabled |
+| `grok-build` | `grok --prompt-file <0600 file> --cwd <cwd> --always-approve --no-subagents` | file | `/usage` screen of `grok dashboard` (experimental) | not ranked; meter off until enabled |
+| `cursor` | `cursor-agent -p --force --trust --workspace <cwd> <pointer>` | pointer | `/usage` screen of `cursor-agent` (experimental, consulted only as fallback) | not ranked; meter off until enabled |
+| `claude` | `claude -p --permission-mode acceptEdits` | stdin or pointer | `/usage` screen (experimental, unverified layout) | built-in, **off**, never auto-ranked; explicitly opt in |
 | `developer` | POST to an OpenAI-compatible endpoint (e.g. local LiteLLM/Ollama) | request body | none | **off**: drafts only, `developer.enabled` + `endpoint` |
 
 These flags give the worker autonomous write access inside the worktree. Review them in the config before
 first use. Templates are plain argv lists in `run_task.commands`; placeholders are `{codex}`, `{grok}`,
-`{cursor}`, `{claude}`, `{cwd}`, `{prompt_file}`, `{prompt_pointer}`.
+`{cursor}`, `{claude}`, `{cwd}`, `{repo}`, `{prompt_file}`, `{prompt_pointer}`.
+Block Claude with `"never": ["claude"]`: this refuses `claude`, `claude-code` and custom workers whose executable basename is either, and shadows both on worker PATHs.
 
 ### Quota observers
 
@@ -124,6 +128,46 @@ in a pseudo-terminal (no prompt is sent, no model is called) and parse it strict
 labelled experimental: a UI change makes them return `unknown` (the worker becomes ineligible) rather than a wrong
 number, and you are responsible for complying with each vendor's terms. Details:
 [docs/observers.md](docs/observers.md).
+
+
+## Bring your own worker
+
+Add a CLI using `workers.<name>`; explicitly list unmetered workers when there is no usage reader:
+
+```json
+{
+  "worker_order": ["aider"],
+  "workers": {"aider": {
+    "command": ["aider", "--yes-always", "--no-auto-commits", "--no-gitignore", "--message-file", "{prompt_file}"],
+    "prompt_delivery": "file"
+  }},
+  "unmetered_workers": ["aider"]
+}
+```
+
+Check flags against your installed CLI version. See [worker examples](docs/workers.md) for aider,
+aider with Ollama, opencode (argv privacy warning), and a custom quota command.
+
+`llm-router init` detects binaries using PATH lookup only; it never runs them. In a terminal it asks for
+preference order, explicit Claude opt-in (default No), and experimental meter opt-in (default No).
+For scripts use `llm-router init --non-interactive --workers codex,aider --never claude --meters codex`.
+Without `--workers`, non-interactive init fails and lists detected CLIs. `--dry-run` prints configuration
+without writes; `--force` backs up config.json to `config.json.bak-<timestamp>` before replacement.
+Existing repos.json and private_terms.txt are always preserved. Workers without enabled meters are marked
+unmetered and are not paced. Empty `worker_order` returns `worker: null`, `no_workers_configured`, with an init hint.
+
+### `--worker` overrides
+
+Applies equally to `run-task` and `run-job`; a forced worker has no failover.
+
+| Rule | Forced `--worker X` behavior |
+|------|-----------------------------|
+| `worker_order`, `ineligible`, `consult: fallback` | Ignored; any defined worker can be forced, including outside the order. |
+| `never`, including executable aliases | Refused, exit 3: `X is in never; remove it from never to use it`. |
+| Full-size meter at `refuse_full_percent` | Refused; pacing cannot be overridden. |
+| Unknown meter for full-size work | Refused unless X is in `unmetered_workers`. |
+| Draft-size unknown meter | Allowed with an unpaced warning. |
+| Forced worker fails | No failover to another worker. |
 
 ## Job flow
 

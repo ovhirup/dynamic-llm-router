@@ -45,7 +45,7 @@ class LintTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'config.json'
             path.write_text(json.dumps({'run_task': {'commands': {'codex': ['{codex}', 'exec', '{prompt}']}}}))
-            with self.assertRaises(security.LintError):
+            with self.assertRaises(config.ConfigError):
                 config.load_policy(path)
 
 

@@ -63,16 +63,16 @@ class MergeAndValidateTests(unittest.TestCase):
         emails = re.findall(r'[\w.+-]+@[\w.-]+', text)
         self.assertEqual(emails, ['router@localhost'])
         self.assertEqual(config.defaults()['never'], [])
+        self.assertEqual(config.defaults()['worker_order'], [])
         self.assertNotIn('claude', config.defaults()['worker_order'])  # Claude adapter is off by default
 
     def test_validation_errors(self):
-        bad = [({'worker_order': []}, 'non-empty'),
+        bad = [
                ({'worker_order': ['codex', 'codex']}, 'unique'),
                ({'worker_order': ['nope']}, 'unknown workers'),
                ({'worker_order': ['codex', 'claude'], 'never': ['claude']}, 'never'),
-               ({'worker_order': ['claude']}, 'no quota observer'),
                ({'timezone': 'Mars/Olympus'}, 'timezone'),
-               ({'quota': {'codex': {'freshness_seconds': 10}}}, 'freshness')]
+               ({'worker_order': ['codex'], 'quota': {'codex': {'freshness_seconds': 10}}}, 'freshness')]
         for data, message in bad:
             with self.subTest(data=data):
                 with self.assertRaisesRegex(ValueError, message):
@@ -177,3 +177,21 @@ class DeveloperTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LiveReadClockTests(unittest.TestCase):
+    def test_live_read_stamped_after_select_start_is_not_future(self):
+        import time as _time
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+        def observe(_policy):
+            _time.sleep(0.05)
+            stamp = _dt.now(_tz.utc)
+            window = {'percent_used': 10, 'observed_at': stamp.isoformat(),
+                      'expires_at': (stamp + _td(minutes=10)).isoformat()}
+            return {'evidence': {'source_worker': 'codex', 'required_windows': ['primary'],
+                                 'windows': {'primary': window}}, 'status': 'ok'}
+        io = {'codex': {'observe': observe, 'load': lambda: None, 'save': lambda obs: None}}
+        result = selection.select(10_000, policy=load_policy(worker_order=['codex']), io=io)
+        self.assertEqual(result['reasons']['codex'], 'quota_available')
+        self.assertEqual(result['worker'], 'codex')

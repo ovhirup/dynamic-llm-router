@@ -1,0 +1,16 @@
+{
+  "_why": "Check flags against your CLI version before use. Warning: prompt passed in argv: visible to other local users in the process list.",
+  "workers": {
+    "opencode": {
+      "command": [
+        "opencode",
+        "run",
+        "{prompt}"
+      ],
+      "prompt_delivery": "arg"
+    }
+  },
+  "unmetered_workers": [
+    "opencode"
+  ]
+}

@@ -1,6 +1,8 @@
 """llm-router command line."""
 import argparse
 import json
+import os
+from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 import sys
@@ -21,7 +23,12 @@ def build_parser():
 
     commands.add_parser('paths', help='Show config/state locations and which binaries resolve')
     init = commands.add_parser('init', help='Write example config files into the config dir (never overwrites)')
-    init.add_argument('--force', action='store_true', help='overwrite existing example files')
+    init.add_argument('--force', action='store_true', help='back up and overwrite config.json')
+    init.add_argument('--workers')
+    init.add_argument('--never', default='')
+    init.add_argument('--meters', default='')
+    init.add_argument('--non-interactive', action='store_true')
+    init.add_argument('--dry-run', action='store_true')
     commands.add_parser('doctor', help='Validate config, binaries and observers (no worker is run)')
 
     selection = commands.add_parser('select', help='Show which worker would be picked (reads meters)')
@@ -102,33 +109,110 @@ def paths_report(policy):
             'metered_workers': config.metered_workers(policy), 'binaries': binaries}
 
 
-def init_config(force=False):
+def init_config(force=False, workers=None, never='', meters='', non_interactive=False,
+                dry_run=False, input_fn=input, output_fn=print, which=shutil.which, is_tty=None):
     from importlib import resources
-    target = config.config_dir()
-    target.mkdir(parents=True, exist_ok=True)
-    written, skipped = [], []
+    known = {'codex': 'codex', 'grok-build': 'grok', 'cursor': 'cursor-agent',
+             'claude': 'claude', 'aider': 'aider', 'opencode': 'opencode', 'aider-ollama': 'ollama'}
+    detected = [name for name, binary in known.items() if which(binary)]
+    interactive = (sys.stdin.isatty() if is_tty is None else is_tty) and not non_interactive
+    split = lambda value: [v.strip() for v in value.split(',') if v.strip()] if isinstance(value, str) else list(value)
+    if workers is None and not interactive:
+        raise config.ConfigError('--workers is required for non-interactive init; detected CLIs: ' + ','.join(detected))
+    if workers is None:
+        output_fn('Detected CLIs: ' + ', '.join(detected))
+        default = ','.join(w for w in detected if w != 'claude')
+        answer = input_fn(f'Enter workers in preference order, comma-separated [{default}]: ')
+        chosen = split(answer or default)
+        if 'claude' in detected:
+            opted_in = input_fn('Claude Code detected. Add it? [y/N] ').strip().lower() in ('y', 'yes')
+            chosen = [w for w in chosen if w != 'claude']
+            if opted_in:
+                chosen.append('claude')
+    else:
+        chosen = split(workers)
+    if len(set(chosen)) != len(chosen) or any(w not in known for w in chosen):
+        raise config.ConfigError('unknown or duplicate workers; choose from: ' + ','.join(known))
+    banned, enabled = split(never), split(meters)
+    if any(w not in ('codex', 'grok-build', 'cursor', 'claude') for w in enabled):
+        raise config.ConfigError('--meters names must be codex,grok-build,cursor,claude')
+    if any(w not in chosen for w in enabled):
+        raise config.ConfigError('--meters must name chosen workers')
+    if interactive:
+        for name in chosen:
+            if name in ('grok-build', 'cursor', 'claude') and name not in enabled:
+                if input_fn(f'{name}: Enable experimental usage reader? [y/N] ').strip().lower() in ('y', 'yes'):
+                    enabled.append(name)
+    if 'codex' in chosen and 'codex' not in enabled:
+        enabled.append('codex')
+    fragment = {'worker_order': chosen, 'never': banned, 'workers': {}, 'quota': {}, 'unmetered_workers': []}
     examples = resources.files('llm_router').joinpath('examples')
-    for name, dest in (('config.example.json', 'config.json'), ('repos.example.json', 'repos.json'),
-                       ('private_terms.example.txt', 'private_terms.txt')):
+    warnings = []
+    for name in chosen:
+        if name in ('aider', 'aider-ollama', 'opencode'):
+            preset = json.loads(examples.joinpath('workers', name + '.json').read_text())
+            fragment['workers'].update(preset['workers'])
+        if name in ('codex', 'grok-build', 'cursor', 'claude'):
+            fragment['quota'][name] = {'enabled': name in enabled}
+        if name not in enabled:
+            fragment['unmetered_workers'].append(name)
+            warnings.append(f'{name} is unmetered: not paced')
+        if name == 'opencode':
+            warnings.append('prompt passed in argv: visible to other local users in the process list')
+    config.validate(config.deep_merge(config.defaults(), fragment))
+    target = config.config_dir()
+    path = target / 'config.json'
+    if path.exists() and not force and not dry_run:
+        raise config.ConfigError('config.json already exists; use --force to back it up and overwrite')
+    summary = {'config_dir': str(target), 'config': fragment, 'detected': detected, 'warnings': warnings,
+               'dry_run': dry_run, 'written': [], 'skipped_existing': []}
+    if dry_run:
+        return summary
+    target.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        backup = path.with_name('config.json.bak-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ'))
+        shutil.copyfile(path, backup)
+        backup.chmod(0o600)
+        summary['backup'] = str(backup)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as handle:
+        json.dump(fragment, handle, indent=2)
+        handle.write('\n')
+    path.chmod(0o600)
+    summary['written'].append(str(path))
+    for name, dest in [('repos.example.json', 'repos.json'), ('private_terms.example.txt', 'private_terms.txt')]:
         path = target / dest
-        if path.exists() and not force:
-            skipped.append(str(path))
-            continue
-        path.write_text(examples.joinpath(name).read_text())
-        path.chmod(0o600)
-        written.append(str(path))
-    return {'config_dir': str(target), 'written': written, 'skipped_existing': skipped}
+        if path.exists():
+            summary['skipped_existing'].append(str(path))
+        else:
+            path.write_text(examples.joinpath(name).read_text())
+            path.chmod(0o600)
+            summary['written'].append(str(path))
+    return summary
 
 
 def doctor(policy):
     from . import observers, quota_service
     report = paths_report(policy)
     problems = []
-    for worker in policy['worker_order']:
+    warnings = []
+    for worker in dict.fromkeys(policy['worker_order'] + list(policy.get('workers', {}))):
         if worker == 'developer':
             continue
+        argv0 = policy['run_task']['commands'][worker][0]
         placeholder = config.WORKER_BINARY.get(worker)
-        if placeholder and not report['binaries'].get(placeholder):
+        if worker in policy.get('workers', {}) or not placeholder:
+            executable = argv0
+            for key in config.BINARY_DEFAULTS:
+                executable = executable.replace('{' + key + '}', config.binary(policy, key))
+            if not shutil.which(executable):
+                problems.append(f'{worker}: binary {executable!r} not found on PATH')
+        if policy['run_task'].get('prompt_delivery', {}).get(worker) == 'arg':
+            warnings.append(f'{worker}: prompt passed in argv: visible to other local users in the process list')
+        quota = config.quota_cfg(policy, worker)
+        if worker in policy['worker_order'] and quota and not quota.get('enabled', True) and worker not in policy.get('unmetered_workers', []):
+            warnings.append(f'{worker}: observer disabled and worker is not unmetered')
+        if placeholder and worker not in policy.get('workers', {}) and not report['binaries'].get(placeholder):
             problems.append(f'{worker}: binary {config.binary(policy, placeholder)!r} not found on PATH')
     for worker in config.metered_workers(policy):
         try:
@@ -141,6 +225,7 @@ def doctor(policy):
     if not terms.exists():
         problems.append(f'private terms file missing ({terms}); leak checks are secret-shape only')
     report['cached_meters'] = {r['worker']: r['used'] + ' ' + r['freshness'] for r in quota_service.status_rows(policy)}
+    report['warnings'] = warnings
     report['problems'] = problems
     report['ok'] = not problems
     return report
@@ -149,6 +234,14 @@ def doctor(policy):
 def main(argv=None):
     parser, gate_help = build_parser()
     args = parser.parse_args(argv)
+    if args.command == 'init':
+        try:
+            _print(init_config(force=args.force, workers=args.workers, never=args.never, meters=args.meters,
+                               non_interactive=args.non_interactive, dry_run=args.dry_run))
+            return 0
+        except config.ConfigError as error:
+            _print({'ok': False, 'config_error': str(error)})
+            return 2
     try:
         policy = config.load_policy(args.config)
     except config.ConfigError as error:
@@ -156,9 +249,6 @@ def main(argv=None):
         return 2
     if args.command == 'paths':
         _print(paths_report(policy))
-        return 0
-    if args.command == 'init':
-        _print(init_config(force=args.force))
         return 0
     if args.command == 'doctor':
         report = doctor(policy)
@@ -232,7 +322,7 @@ def main(argv=None):
             print(json.dumps({'ok': False, 'refused': str(refusal)}))
             return 3
         _print(result)
-        return 0 if result.get('ok', True) else 1
+        return 3 if result.get('status') == 'refused' else 0 if result.get('ok', True) else 1
     if args.command == 'run-task':
         from . import task_dispatch
         try:

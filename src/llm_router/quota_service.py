@@ -22,9 +22,10 @@ def cache_path(worker):
     return config.state_dir() / 'state' / f'{worker}_quota_observation.json'
 
 
-def default_io(policy=None):
+def default_io(policy=None, only=None):
     """Real observers (isolated, hard timeout) and caches for every configured quota worker."""
-    names = config.metered_workers(policy) if policy else ['codex', 'grok-build', 'cursor']
+    names = ([only] if only and config.quota_cfg(policy, only) and config.quota_cfg(policy, only).get('enabled', True) else
+             [] if only else config.metered_workers(policy) if policy else [])
     io = {}
     for name in names:
         io[name] = {'observe': (lambda pol, _n=name: observers.observe_isolated(pol, _n)),
@@ -271,11 +272,12 @@ def _local(value, zone=None):
 
 def read_meter(policy, worker, now=None, io=None):
     """One worker's meter: fresh cache first, else one live read of that worker only."""
-    io = io or default_io(policy)
+    io = io if io is not None else default_io(policy, only=worker)
     if worker not in io:
         unmetered = worker == 'developer' or worker in (policy.get('unmetered_workers') or [])
         return {'meters': {}, 'eligible': [worker] if unmetered else [],
                 'reason': 'unmetered' if unmetered else 'no_meter', 'source': None}
+    clock_injected = now is not None
     now = _utcnow(now)
     cached = io[worker]['load']()
     evidence, source = evidence_of(cached), 'cache'
@@ -285,11 +287,17 @@ def read_meter(policy, worker, now=None, io=None):
         except Exception:
             observation = None
         evidence, source = evidence_of(observation), 'live'
+        if not clock_injected:
+            now = _utcnow()
         if evidence is not None:
             io[worker]['save'](observation)
+    from . import selection
+    reason = selection.evidence_reason(worker, evidence, now)
     percent, _, _ = peak(evidence)
     limit = threshold(policy, worker)
-    usable = evidence is not None and (is_fresh(evidence, now) or exhausted_until(evidence, now) is not None)
+    usable = reason in ('quota_available', 'quota_exhausted')
+    if reason == 'quota_expired' and exhausted_until(evidence, now) is not None:
+        usable = True
     ok = usable and percent is not None and percent < limit
     return {'meters': {worker: percent if usable else None}, 'eligible': [worker] if ok else [],
             'reason': 'quota_available' if ok else 'quota_exhausted_or_over_threshold' if usable else 'quota_unknown',

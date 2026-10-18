@@ -1,0 +1,26 @@
+{
+  "_why": "Check flags against your CLI version before use.",
+  "workers": {
+    "custom-with-quota": {
+      "command": [
+        "sample-worker"
+      ],
+      "prompt_delivery": "stdin",
+      "quota": {
+        "command": [
+          "sample-worker",
+          "usage"
+        ],
+        "regex": "Used: (?P<percent>\\d+)%",
+        "window": "monthly",
+        "percent_is": "used",
+        "timeout_seconds": 20,
+        "hard_timeout_seconds": 40,
+        "freshness_seconds": 1800,
+        "usage_threshold_percent": 85,
+        "enabled": true
+      }
+    }
+  },
+  "unmetered_workers": []
+}

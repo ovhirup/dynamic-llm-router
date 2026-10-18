@@ -45,7 +45,7 @@ CODE_IDIOMS = [
     re.compile(r'\b(?:let|var|const)\s+key\s*='),   # local variable named key
 ]
 SECRET_FLAGS = re.compile(r'(?i)^--?(api[-_]?key|token|secret|password|auth|bearer|key)(=.*)?$')
-ALLOWED_PLACEHOLDERS = {'{codex}', '{grok}', '{cursor}', '{claude}', '{cwd}', '{prompt_file}', '{prompt_pointer}'}
+ALLOWED_PLACEHOLDERS = {'{codex}', '{grok}', '{cursor}', '{claude}', '{cwd}', '{repo}', '{prompt_file}', '{prompt_pointer}'}
 PLACEHOLDER = re.compile(r'\{[^{}]*\}')
 REDACTED = '[REDACTED]'
 
@@ -122,19 +122,22 @@ def redact_obj(value):
     return value
 
 
-def lint_commands(commands, allowed=ALLOWED_PLACEHOLDERS):
+def lint_commands(commands, allowed=ALLOWED_PLACEHOLDERS, prompt_delivery=None):
     """Reject argv {prompt}, unknown placeholders, secret flags and inline secrets."""
     if not isinstance(commands, dict) or not commands:
         raise LintError('run_task.commands must be a non-empty object')
     for worker, argv in commands.items():
         if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
             raise LintError(f'{worker}: template must be a non-empty list of strings')
+        worker_allowed = set(allowed)
+        if (prompt_delivery or {}).get(worker) == 'arg':
+            worker_allowed.add('{prompt}')
         for arg in argv:
             for token in PLACEHOLDER.findall(arg):
-                if token == '{prompt}' and token not in allowed:
+                if token == '{prompt}' and token not in worker_allowed:
                     raise LintError(f'{worker}: {{prompt}} in argv exposes the task in the process list; '
                                     'use stdin, {prompt_file} or {prompt_pointer}')
-                if token not in allowed:
+                if token not in worker_allowed:
                     raise LintError(f'{worker}: unknown placeholder {token}')
             if SECRET_FLAGS.match(arg):
                 raise LintError(f'{worker}: credential flag {arg.split("=")[0]} not allowed; use the CLI\'s env var')

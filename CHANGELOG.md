@@ -3,6 +3,15 @@
 All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/);
 versions follow [SemVer](https://semver.org/) (0.x: minor versions may break config).
 
+## [0.3.0] - 2026-10-18
+
+- Bring any worker: config-defined CLI adapters, prompt delivery, safe environment allowlists,
+  working directories, success checks and command quota observers.
+- Choose your own order with interactive init; packaged defaults select no workers.
+- Claude Code is a built-in opt-in adapter with an experimental usage reader and per-worker env prefixes.
+- Forced workers override ordering and eligibility while preserving denylist and pacing checks.
+- Add aider, aider with Ollama, opencode and custom quota examples; update CI actions to v7.
+
 ## [0.2.0] - 2026-10-18
 
 First public release, extracted from a private single-user setup and generalised.

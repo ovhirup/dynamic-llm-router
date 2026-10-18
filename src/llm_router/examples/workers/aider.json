@@ -1,0 +1,19 @@
+{
+  "_why": "Check flags against your CLI version before use.",
+  "workers": {
+    "aider": {
+      "command": [
+        "aider",
+        "--yes-always",
+        "--no-auto-commits",
+        "--no-gitignore",
+        "--message-file",
+        "{prompt_file}"
+      ],
+      "prompt_delivery": "file"
+    }
+  },
+  "unmetered_workers": [
+    "aider"
+  ]
+}

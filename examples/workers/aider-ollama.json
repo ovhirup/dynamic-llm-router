@@ -1,0 +1,26 @@
+{
+  "_why": "Check flags against your CLI version before use.",
+  "workers": {
+    "aider-ollama": {
+      "command": [
+        "aider",
+        "--yes-always",
+        "--no-auto-commits",
+        "--no-gitignore",
+        "--model",
+        "ollama_chat/qwen2.5-coder:14b",
+        "--message-file",
+        "{prompt_file}"
+      ],
+      "prompt_delivery": "file",
+      "env": {
+        "allow": [
+          "OLLAMA_API_BASE"
+        ]
+      }
+    }
+  },
+  "unmetered_workers": [
+    "aider-ollama"
+  ]
+}
