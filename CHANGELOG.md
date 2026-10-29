@@ -10,8 +10,10 @@ versions follow [SemVer](https://semver.org/) (0.x: minor versions may break con
 
 - Add a Claude-only fenced handoff with explicit effort flags, file-reading and checklist instructions,
   and a shared time budget across bounded headless continuations.
-- Detect Claude quota failures even at exit 0, permit one eligible failover from a Stackwich pin,
-  and stop on safety refusals without failing over.
+- Detect Claude quota from real limit signals: broad limit wording on a non-zero exit or stream error,
+  only Claude's own limit messages at exit 0. Allow one paced eligible failover; stop on safety refusals.
+- A quota failover from a Stackwich-required attempt only goes to a Stackwich-capable worker; otherwise
+  it is skipped with a warning and the job ends `blocked_by_stackwich`.
 
 ## [0.4.0] - 2026-10-19
 

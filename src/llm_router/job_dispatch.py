@@ -299,8 +299,8 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
                    not (r.get('worker') == 'claude' and r.get('quota_error'))]
         selected = result.get('worker')
         if claude_quota and selected != 'claude':
-            # The replacement worker owns subsequent corrections and its own protocol.
-            required, pinned, evidence = False, selected, None
+            # The Stackwich-capable replacement owns subsequent corrections; a required cycle stays required.
+            pinned, evidence = selected, None
         active = (bool(invoked) or (result.get('stackwich') or {}).get('status') == 'required' or
                   (selected is not None and stackwich.status(policy, selected) == 'required'))
         if active and not required:

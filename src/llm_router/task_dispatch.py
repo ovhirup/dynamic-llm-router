@@ -384,6 +384,11 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
     _, block_log = worker_environment(policy)
     blocks_before = security.count_lines(block_log)
     for attempt, name in enumerate(order[:2]):  # the chosen worker plus one failover
+        # A failover from a Stackwich-required attempt keeps the requirement: only a Stackwich-capable worker.
+        if (attempt and summary['attempts'][-1]['stackwich']['status'] == 'required' and
+                stackwich.status(policy, name) != 'required'):
+            summary['warnings'].append(f'failover skipped: {name} cannot run Stackwich')
+            break
         if attempt and name in coding:
             refuse, warning = pacing(policy, meters, name, size)
             if refuse:
@@ -460,7 +465,7 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
                     elapsed += result['elapsed_seconds']
                     if name != 'claude':
                         break
-                    final = claude_handoff.inspect(result['stdout'], result['stderr'])
+                    final = claude_handoff.inspect(result['stdout'], result['stderr'], result['returncode'])
                     if (result['timed_out'] or result['returncode'] != 0 or final['failure'] or
                             not final['open_items'] or elapsed >= timeout or
                             continuation >= claude_handoff.continuation_limit(policy['run_task'])):

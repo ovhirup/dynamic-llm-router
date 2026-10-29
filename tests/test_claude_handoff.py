@@ -62,7 +62,22 @@ class BriefTests(unittest.TestCase):
         self.assertEqual(ch.inspect(json.dumps({'type': 'result', 'is_error': True, 'result': 'failed'}))['failure'], 'stream_error')
         for text in ['usage limit', 'rate limit', 'quota', 'out of credits', 'limit reached', 'exhausted',
                      'out of extra usage'] + [f"You've hit your {kind} limit" for kind in ['session', 'weekly', 'opus', 'sonnet', 'fable']]:
-            self.assertEqual(ch.inspect(text)['failure'], 'quota')
+            self.assertEqual(ch.inspect(text, returncode=1)['failure'], 'quota')
+
+    def test_quota_needs_real_limit_signal(self):
+        for text in ["You've hit your weekly limit", 'Claude AI usage limit reached|1761750000',
+                     '5-hour limit reached ∙ resets 3pm', "You're out of extra usage"]:
+            with self.subTest(text=text):
+                self.assertEqual(ch.inspect(text)['failure'], 'quota')
+        self.assertEqual(ch.inspect('done', stderr="You've hit your session limit")['failure'], 'quota')
+        for text in ['Added backoff for rate limit and quota errors.',
+                     'The pool is exhausted only on shutdown; usage limit checks pass.',
+                     'Fixed early exit when the retry limit reached zero.']:
+            with self.subTest(text=text):
+                self.assertIsNone(ch.inspect(text)['failure'])
+        self.assertIsNone(ch.inspect('done', stderr='rate limit warning')['failure'])
+        self.assertEqual(ch.inspect(json.dumps({'type': 'result', 'is_error': True, 'result': 'out of credits'}))['failure'], 'quota')
+        self.assertEqual(ch.inspect('quota', returncode=1)['failure'], 'quota')
 
 
 class DispatchTests(unittest.TestCase):
@@ -73,16 +88,20 @@ class DispatchTests(unittest.TestCase):
         worker = options.pop('worker', None)
         codex_meter = options.pop('codex_meter', 10)
         stackwich = options.pop('stackwich', None)
+        pinned = options.pop('pinned', False)
+        failover_stackwich = options.pop('failover_stackwich', False)
         policy = load_policy(worker_order=['claude', 'codex'], unmetered_workers=['claude'],
             workers={'claude': {'command': ['fake-claude'], 'prompt_delivery': 'stdin',
                                 **({'stackwich': stackwich} if stackwich else {})}},
             run_task={'ledger': str(self.base / 'ledger.csv'), 'shim_dir': str(self.base / 'shims'),
                       'block_log': str(self.base / 'blocks'), 'timeouts_seconds': {'claude': 100}, **options})
+        if failover_stackwich:
+            policy['run_task'].setdefault('stackwich', {})['codex'] = {'enabled': True, 'supported': True}
         def runner(argv, cwd, timeout, grace, **kwargs):
             self.seen.append((argv, kwargs['input_text'], timeout))
             return {'returncode': 0, 'timed_out': False, 'elapsed_seconds': 2,
                     'stdout': '', 'stderr': '', **outputs.pop(0)}
-        return td.run_task(self.task, self.repo, policy=policy, runner=runner, worker=worker,
+        return td.run_task(self.task, self.repo, policy=policy, runner=runner, worker=worker, _claude_pinned=pinned,
             select=lambda *a, **kw: {'eligible': ['claude', 'codex', 'cursor'], 'meters': {'codex': codex_meter}},
             output_root=self.base / 'out')
 
@@ -157,7 +176,7 @@ class DispatchTests(unittest.TestCase):
         result = self.run_claude([{'stdout': 'Usage limit reached'}], codex_meter=90)
         self.assertEqual(len(result['attempts']), 1)
         self.assertTrue(any('failover skipped' in warning for warning in result['warnings']))
-        result = self.run_claude([{'stdout': 'quota'}, {'returncode': 1, 'stdout': 'quota'}])
+        result = self.run_claude([{'stdout': "You've hit your session limit"}, {'returncode': 1, 'stdout': 'quota'}])
         self.assertEqual([r['worker'] for r in result['attempts']], ['claude', 'codex'])
         self.assertFalse(result['ok'])
 
@@ -167,12 +186,35 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(result['attempts'][0]['success_check'], 'refusal')
         self.assertFalse(result['ok'])
 
-    def test_nonzero_quota_leaves_stackwich_pin(self):
+    def test_stackwich_quota_fails_over_to_stackwich_worker(self):
         result = self.run_claude([{'returncode': 1, 'stderr': 'Usage limit reached'}, {'stdout': 'done'}],
-                                 stackwich={'enabled': True, 'supported': True})
+                                 stackwich={'enabled': True, 'supported': True}, failover_stackwich=True)
         self.assertEqual([a['worker'] for a in result['attempts']], ['claude', 'codex'])
         self.assertEqual(result['attempts'][0]['stackwich']['status'], 'required')
         self.assertEqual(result['attempts'][0]['success_check'], 'quota')
+        self.assertEqual(result['attempts'][1]['stackwich']['status'], 'required')
+        self.assertIn('Stackwich verification required', self.seen[1][1])
+
+    def test_stackwich_quota_without_stackwich_worker_does_not_fail_over(self):
+        for extra in ({}, {'pinned': True, 'worker': 'claude'}):
+            with self.subTest(extra=extra):
+                result = self.run_claude([{'stdout': "You've hit your weekly limit"}],
+                                         stackwich={'enabled': True, 'supported': True}, **extra)
+                self.assertEqual(len(self.seen), 1)
+                self.assertEqual([a['worker'] for a in result['attempts']], ['claude'])
+                self.assertTrue(result['attempts'][0]['quota_error'])
+                self.assertFalse(result['ok'])
+                self.assertIn('failover skipped: codex cannot run Stackwich', result['warnings'])
+
+    def test_mentioning_quota_words_is_not_quota(self):
+        result = self.run_claude([{'stdout': 'Added backoff for rate limit and quota errors.'}])
+        self.assertEqual(len(result['attempts']), 1)
+        self.assertFalse(result['attempts'][0]['quota_error'])
+        self.assertIsNone(result['attempts'][0]['success_check'])
+        self.assertTrue(result['ok'])
+        result = self.run_claude([{'returncode': 1, 'stdout': 'quota'}, {'stdout': 'done'}])
+        self.assertEqual([a['worker'] for a in result['attempts']], ['claude', 'codex'])
+        self.assertTrue(result['attempts'][0]['quota_error'])
 
     def test_forced_quota(self):
         result = self.run_claude([{'stdout': 'out of extra usage'}], worker='claude')
@@ -201,7 +243,7 @@ class DispatchTests(unittest.TestCase):
         for output in [{'stdout': 'done'}, {'stdout': '- [ ] fix', 'timed_out': True},
                        {'stdout': '- [ ] fix', 'returncode': 1},
                        {'stdout': "I am unable to help\n- [ ] fix"},
-                       {'stdout': 'Quota exhausted\n- [ ] fix'},
+                       {'stdout': "You've hit your weekly limit\n- [ ] fix"},
                        {'stdout': '- [ ] fix', 'elapsed_seconds': 100}]:
             with self.subTest(output=output):
                 self.run_claude([output], worker='claude')
@@ -215,6 +257,7 @@ class JobIntegrationTests(unittest.TestCase):
     tearDown = fixtures.JobTests.tearDown
     worker = fixtures.JobTests.worker
     job = fixtures.JobTests.job
+    supported = fixtures.StackwichJobTests.supported
 
     def select(self, *args, **kwargs):
         return {'eligible': ['claude', 'codex'], 'meters': {'codex': 10}}
@@ -225,13 +268,27 @@ class JobIntegrationTests(unittest.TestCase):
         self.policy['run_task']['commands']['claude'] = [sys.executable, '-c', code]
         self.policy['run_task'].setdefault('stackwich', {})['claude'] = {'enabled': True, 'supported': True}
 
-    def test_quota_releases_job_pin(self):
+    def test_quota_failover_keeps_stackwich(self):
+        self.configure_claude('print("Usage limit reached")')
+        self.supported()
+        result = self.job(test_cmd='test -f out.txt')
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['status'], 'committed')
+        self.assertEqual(len(result['attempts']), 1)
+        self.assertEqual([r['worker'] for r in result['attempts'][0]['runs']], ['claude', 'codex'])
+        self.assertEqual(result['attempts'][0]['runs'][1]['stackwich']['status'], 'required')
+        self.assertEqual(result['stackwich']['status'], 'verified')
+
+    def test_quota_without_stackwich_replacement_blocks(self):
+        from pathlib import Path
         self.configure_claude('print("Usage limit reached")')
         self.worker("open('out.txt', 'w').write('done')")
         result = self.job(test_cmd='true')
-        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['status'], 'blocked_by_stackwich')
         self.assertEqual(len(result['attempts']), 1)
-        self.assertEqual([r['worker'] for r in result['attempts'][0]['runs']], ['claude', 'codex'])
+        self.assertEqual([r['worker'] for r in result['attempts'][0]['runs']], ['claude'])
+        self.assertIn('failover skipped: codex cannot run Stackwich', result['attempts'][0]['warnings'])
+        self.assertFalse((Path(result['worktree']) / 'out.txt').exists())
 
     def test_refusal_and_terminal_quota_do_not_repeat_job(self):
         for text in ["I can't help with that request.", 'Usage limit reached']:
@@ -242,16 +299,31 @@ class JobIntegrationTests(unittest.TestCase):
                 self.assertEqual(len(result['attempts']), 1)
                 self.assertEqual(result['attempts'][0]['runs'][0]['success_check'],
                                  'refusal' if text.startswith('I ') else 'quota')
+                self.assertEqual(result['status'], 'blocked_by_stackwich')
 
-    def test_quota_on_internal_correction_pin_can_failover(self):
+    def correction_quota_claude(self):
         marker = self.base / 'claude-calls'
         self.configure_claude(
             'from pathlib import Path; p=Path(' + repr(str(marker)) + '); '
             'already=p.exists(); p.write_text("called"); '
             'print("Usage limit reached" if already else "done")')
-        self.worker("open('out.txt', 'w').write('done')")
-        result = self.job(test_cmd='true')
+
+    def test_correction_quota_fails_over_to_stackwich_worker(self):
+        self.correction_quota_claude()
+        self.supported()
+        result = self.job(test_cmd='test -f out.txt')
         self.assertTrue(result['ok'], result)
+        self.assertEqual(result['status'], 'committed')
         self.assertEqual(len(result['attempts']), 2)
         self.assertEqual([r['worker'] for r in result['attempts'][1]['runs']], ['claude', 'codex'])
         self.assertEqual(result['attempts'][1]['runs'][0]['success_check'], 'quota')
+        self.assertEqual(result['stackwich']['status'], 'verified')
+        self.assertEqual(result['stackwich']['cycle'], 2)
+
+    def test_correction_quota_without_stackwich_replacement_blocks(self):
+        self.correction_quota_claude()
+        self.worker("open('out.txt', 'w').write('done')")
+        result = self.job(test_cmd='true')
+        self.assertEqual(result['status'], 'blocked_by_stackwich')
+        self.assertEqual(len(result['attempts']), 2)
+        self.assertEqual([r['worker'] for r in result['attempts'][1]['runs']], ['claude'])

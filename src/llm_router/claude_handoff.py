@@ -9,6 +9,10 @@ _REASONING = re.compile(
 _QUOTA = re.compile(
     r'usage limit|rate limit|quota|out of credits|limit reached|exhausted|'
     r'hit your (?:session|weekly|opus|sonnet|fable) limit|out of extra usage', re.I)
+# Claude's own limit messages; the only quota signal trusted on an exit-0 run without a stream error.
+_LIMIT = re.compile(
+    r'hit your (?:session|weekly|opus|sonnet|fable) limit|usage limit reached|'
+    r'\b\d+-hour limit reached|out of extra usage', re.I)
 _REFUSAL = re.compile(r"I can't help with that|I am unable to help", re.I)
 _BOX = re.compile(r'^\s*[-*] \[ \] .+', re.M)
 
@@ -58,7 +62,7 @@ def build_prompt(task, effort, timeout, elapsed=0, prefix='', extra='', tail='',
     return '\n\n'.join(parts)
 
 
-def inspect(stdout, stderr=''):
+def inspect(stdout, stderr='', returncode=0):
     """Prefer the last stream result, then assistant text; plain stdout is its own final."""
     events = []
     for line in stdout.splitlines():
@@ -89,9 +93,11 @@ def inspect(stdout, stderr=''):
 
     # A refusal wins over quota words in the same text: it must stop, never fail over to another worker.
     refusal = bool(_REFUSAL.search(text)) or any(refused(event) for event in events)
-    quota = bool(_QUOTA.search(text + '\n' + stderr))
-    failure = ('refusal' if refusal else 'quota' if quota else 'stream_error' if
-               any(event.get('is_error') is True for event in events) else None)
+    signals = text + '\n' + stderr
+    stream_error = any(event.get('is_error') is True for event in events)
+    # Broad wording counts only when the run failed; a normal exit-0 answer must name a real Claude limit.
+    quota = bool((_QUOTA if returncode != 0 or stream_error else _LIMIT).search(signals))
+    failure = 'refusal' if refusal else 'quota' if quota else 'stream_error' if stream_error else None
     return {'text': text, 'failure': failure, 'open_items': _BOX.findall(text)}
 
 

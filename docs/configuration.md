@@ -119,8 +119,11 @@ Default: `{"claude": ["ANTHROPIC_", "CLAUDE_"]}`; other workers strip these plus
 
 Success checks inspect stdout+stderr. Attempts record `success_check`: `exit_code`, `fail_regex`,
 `require_regex_missing`, `no_changes`, or null on success. Claude also records `quota`, `refusal`,
-`stream_error`, or `checklist_open`; quota failures (including exit 0) allow one eligible failover,
-even from a Stackwich pin. Refusals never fail over; forced Claude never fails over. Changes are compared before/after each attempt,
+`stream_error`, or `checklist_open`; quota counts broad limit wording only on a non-zero exit or stream error,
+and at exit 0 only Claude's own limit messages (hit your … limit, usage limit reached, N-hour limit reached,
+out of extra usage). A quota failure allows one paced eligible failover; from a Stackwich-required attempt the
+replacement must also be Stackwich-capable, otherwise there is no failover and the job ends
+`blocked_by_stackwich`. Refusals never fail over; forced Claude never fails over. Changes are compared before/after each attempt,
 including when an allowed dirty checkout already contains changes. Timeouts remain failures.
 
 A command quota block has `command` (argv), `regex` (exactly one match with named `percent` group),
