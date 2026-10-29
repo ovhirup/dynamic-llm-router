@@ -17,8 +17,20 @@ _REFUSAL = re.compile(r"I can't help with that|I am unable to help", re.I)
 _BOX = re.compile(r'^\s*[-*] \[ \] .+', re.M)
 
 
+_SENTENCE = re.compile(r'(?<=[.!?])\s+')
+
+
 def clean(text):
-    return '\n'.join(line for line in text.splitlines() if not _REASONING.search(line))
+    """Drop reasoning directives sentence by sentence, so a requirement on the same line survives."""
+    lines = []
+    for line in text.splitlines():
+        if not _REASONING.search(line):
+            lines.append(line)
+            continue
+        kept = ' '.join(part for part in _SENTENCE.split(line.strip()) if part and not _REASONING.search(part))
+        if kept:
+            lines.append(kept)
+    return '\n'.join(lines)
 
 
 def effort(size, template, allow_raised=False):

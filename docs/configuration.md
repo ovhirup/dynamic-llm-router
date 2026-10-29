@@ -41,7 +41,7 @@ Relative paths in the config resolve against the **state dir**, except `run_task
 | `timeouts_seconds`, `stall_seconds`, `kill_grace_seconds` | Wall-clock limit, no-output watchdog and SIGTERM→SIGKILL grace. |
 | `pacing.warn_percent` / `pacing.refuse_full_percent` | 70 / 85 by default. |
 | `max_prompt_chars` | Maximum assembled prompt length in characters, default 100000. Checked before each worker launch, including Claude continuations; counts the brief, task, prefix, router extra text and Stackwich tail. Oversized prompts are refused before delivery or execution. |
-| `prompt_prefix` | Text prepended to ordinary worker tasks; for Claude, included outside the fenced task after its effort, file-reading, checklist and time brief. Lines demanding written reasoning are stripped from the Claude handoff. |
+| `prompt_prefix` | Text prepended to ordinary worker tasks; for Claude, included outside the fenced task after its effort, file-reading, checklist and time brief. Sentences demanding written reasoning are stripped from the Claude handoff; the rest of the line is kept. |
 | `claude_continuations` | Automatic fresh Claude invocations for open final checkboxes: default 2, hard cap 3, sharing its wall-clock budget. No checklist means no retry. |
 | `claude_allow_raised_effort` | Default false. Claude uses `--effort low` for draft and `--effort medium` for full, overwriting existing flags. True permits explicit `xhigh` or `max` in the argv template; `{claude_effort}` expands to the selected effort. |
 | `quota_error_pattern` | Regex that marks worker output as a quota failure (triggers the one failover). |

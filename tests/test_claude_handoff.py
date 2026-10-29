@@ -22,6 +22,11 @@ class BriefTests(unittest.TestCase):
         self.assertTrue(prompt.endswith('Stackwich tail'))
         self.assertEqual(ch.clean('\n'.join(['think step by step', 'THINK DEEPLY', 'think carefully',
             'show your reasoning', 'show your chain of thought', 'write out your internal reasoning', 'task'])), 'task')
+        self.assertEqual(ch.clean('Fix the off-by-one error in parser.py. Think carefully about the boundary.'),
+                         'Fix the off-by-one error in parser.py.')
+        self.assertEqual(ch.clean('Think step by step! Then update the README and add a test.'),
+                         'Then update the README and add a test.')
+        self.assertEqual(ch.clean('  indented line stays as is'), '  indented line stays as is')
 
     def test_effort(self):
         for template in (['claude', '-p'], ['claude', '--effort', 'max'],
@@ -229,6 +234,13 @@ class DispatchTests(unittest.TestCase):
         self.assertIn('Elapsed: 2s.', self.seen[1][1])
         self.assertIn('These checklist items remain open:\n- [ ] fix bug', self.seen[1][1])
         self.assertNotIn('--resume', self.seen[1][0])
+
+    def test_fail_regex_stops_continuation(self):
+        result = self.run_claude([{'stdout': 'FAILED: verification rejected\n- [ ] fix bug'}, {'stdout': '- [x] fix bug'}],
+                                 worker='claude', success={'claude': {'fail_regex': 'FAILED'}})
+        self.assertEqual(len(self.seen), 1, 'no continuation after a configured failure signal')
+        self.assertEqual(result['attempts'][0]['success_check'], 'fail_regex')
+        self.assertFalse(result['ok'])
 
     def test_caps(self):
         for configured, calls in [(None, 3), (0, 1), (100, 4)]:

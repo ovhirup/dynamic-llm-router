@@ -466,7 +466,10 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
                     if name != 'claude':
                         break
                     final = claude_handoff.inspect(result['stdout'], result['stderr'], result['returncode'])
+                    # A configured failure signal ends the attempt here; a continuation must not hide it.
+                    fail_regex = policy['run_task'].get('success', {}).get(name, {}).get('fail_regex')
                     if (result['timed_out'] or result['returncode'] != 0 or final['failure'] or
+                            (fail_regex and re.search(fail_regex, result['stdout'] + result['stderr'])) or
                             not final['open_items'] or elapsed >= timeout or
                             continuation >= claude_handoff.continuation_limit(policy['run_task'])):
                         break
