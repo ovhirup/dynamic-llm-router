@@ -91,6 +91,7 @@
     "ledger": "logs/ledger.csv",
     "extra_ledgers": [],
     "output_dir": "logs/task-output",
+    "max_prompt_chars": 100000,
     "prompt_prefix": "You are working in a git checkout. Make the requested change in this directory only. Do not run git commit, git push or any remote operation.",
     "quota_error_pattern": "(?i)(usage limit|rate limit|quota|out of credits|limit reached|exhausted)",
     "commands": {
