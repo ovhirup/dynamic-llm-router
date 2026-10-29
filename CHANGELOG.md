@@ -3,6 +3,18 @@
 All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/);
 versions follow [SemVer](https://semver.org/) (0.x: minor versions may break config).
 
+## [Unreleased]
+
+- Refuse worker launches when the assembled prompt exceeds `run_task.max_prompt_chars` (default 100000),
+  including brief, router text, Stackwich instructions and continuation items.
+
+- Add a Claude-only fenced handoff with explicit effort flags, file-reading and checklist instructions,
+  and a shared time budget across bounded headless continuations.
+- Detect Claude quota from real limit signals: broad limit wording on a non-zero exit or stream error,
+  only Claude's own limit messages at exit 0. Allow one paced eligible failover; stop on safety refusals.
+- A quota failover from a Stackwich-required attempt only goes to a Stackwich-capable worker; otherwise
+  it is skipped with a warning and the job ends `blocked_by_stackwich`.
+
 ## [0.4.0] - 2026-10-19
 
 - Add optional worker-neutral Stackwich plan, execute, verify and review evidence.

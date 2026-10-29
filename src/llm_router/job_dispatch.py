@@ -274,6 +274,8 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         kwargs = {'size': size, 'worker': pinned or worker, 'allow_dirty': attempt_number > 0,
                   'policy': policy, 'extra_prompt': extra, 'stamp': f'{stamp}-a{cycle}',
                   'stackwich_cycle': cycle}
+        if pinned == 'claude' and worker is None:
+            kwargs['_claude_pinned'] = True
         if select is not None:
             kwargs['select'] = select
         try:
@@ -288,9 +290,17 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
             if attempt_number == 0:
                 raise
             break
-        invoked = [r.get('worker') for r in result.get('attempts', [])
-                   if (r.get('stackwich') or {}).get('status') == 'required']
+        runs = result.get('attempts', [])
+        claude_quota = any(r.get('worker') == 'claude' and r.get('quota_error') for r in runs)
+        claude_refusal = any(r.get('worker') == 'claude' and r.get('success_check') == 'refusal'
+                             for r in runs)
+        invoked = [r.get('worker') for r in runs
+                   if (r.get('stackwich') or {}).get('status') == 'required' and
+                   not (r.get('worker') == 'claude' and r.get('quota_error'))]
         selected = result.get('worker')
+        if claude_quota and selected != 'claude':
+            # The Stackwich-capable replacement owns subsequent corrections; a required cycle stays required.
+            pinned, evidence = selected, None
         active = (bool(invoked) or (result.get('stackwich') or {}).get('status') == 'required' or
                   (selected is not None and stackwich.status(policy, selected) == 'required'))
         if active and not required:
@@ -361,6 +371,9 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         if result['ok'] and changed and tests['status'] in ('passed', 'skipped') and (
                 not required or evidence['status'] == 'verified'):
             break
+        if claude_refusal or (claude_quota and not result.get('ok')):
+            summary['status'] = 'blocked_by_stackwich' if required else 'failed'
+            return
         extra = _retry_note(result, tests) or ''
         if required:
             extra += '\nStackwich errors: ' + '; '.join(evidence['errors'])

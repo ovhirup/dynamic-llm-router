@@ -45,7 +45,7 @@ CODE_IDIOMS = [
     re.compile(r'\b(?:let|var|const)\s+key\s*='),   # local variable named key
 ]
 SECRET_FLAGS = re.compile(r'(?i)^--?(api[-_]?key|token|secret|password|auth|bearer|key)(=.*)?$')
-ALLOWED_PLACEHOLDERS = {'{codex}', '{grok}', '{cursor}', '{claude}', '{cwd}', '{repo}', '{prompt_file}', '{prompt_pointer}'}
+ALLOWED_PLACEHOLDERS = {'{codex}', '{grok}', '{cursor}', '{claude}', '{cwd}', '{repo}', '{prompt_file}', '{prompt_pointer}', '{claude_effort}'}
 PLACEHOLDER = re.compile(r'\{[^{}]*\}')
 REDACTED = '[REDACTED]'
 

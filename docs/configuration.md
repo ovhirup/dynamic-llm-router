@@ -40,7 +40,10 @@ Relative paths in the config resolve against the **state dir**, except `run_task
 | `prompt_delivery.<worker>` | `stdin`, `file` (0600 temp file), explicit `arg` (task exposed in process list), or `pointer` (argv carries only a pointer to a 0600 file). |
 | `timeouts_seconds`, `stall_seconds`, `kill_grace_seconds` | Wall-clock limit, no-output watchdog and SIGTERM→SIGKILL grace. |
 | `pacing.warn_percent` / `pacing.refuse_full_percent` | 70 / 85 by default. |
-| `prompt_prefix` | Text prepended to every task. |
+| `max_prompt_chars` | Maximum assembled prompt length in characters, default 100000. Checked before each worker launch, including Claude continuations; counts the brief, task, prefix, router extra text and Stackwich tail. Oversized prompts are refused before delivery or execution. |
+| `prompt_prefix` | Text prepended to ordinary worker tasks; for Claude, included outside the fenced task after its effort, file-reading, checklist and time brief. Sentences demanding written reasoning are stripped from the Claude handoff; the rest of the line is kept. |
+| `claude_continuations` | Automatic fresh Claude invocations for open final checkboxes: default 2, hard cap 3, sharing its wall-clock budget. No checklist means no retry. |
+| `claude_allow_raised_effort` | Default false. Claude uses `--effort low` for draft and `--effort medium` for full, overwriting existing flags. True permits explicit `xhigh` or `max` in the argv template; `{claude_effort}` expands to the selected effort. |
 | `quota_error_pattern` | Regex that marks worker output as a quota failure (triggers the one failover). |
 | `protect_paths.<worker>` | Files restored after that worker runs (e.g. a hand-written `HANDOFF.md`). |
 | `private_terms_file` | Your private names for the leak gate (config dir). |
@@ -115,7 +118,12 @@ Pass secrets from the parent environment through `allow`, never literal config. 
 Default: `{"claude": ["ANTHROPIC_", "CLAUDE_"]}`; other workers strip these plus LITELLM_.
 
 Success checks inspect stdout+stderr. Attempts record `success_check`: `exit_code`, `fail_regex`,
-`require_regex_missing`, `no_changes`, or null on success. Changes are compared before/after each attempt,
+`require_regex_missing`, `no_changes`, or null on success. Claude also records `quota`, `refusal`,
+`stream_error`, or `checklist_open`; quota counts broad limit wording only on a non-zero exit or stream error,
+and at exit 0 only Claude's own limit messages (hit your … limit, usage limit reached, N-hour limit reached,
+out of extra usage). A quota failure allows one paced eligible failover; from a Stackwich-required attempt the
+replacement must also be Stackwich-capable, otherwise there is no failover and the job ends
+`blocked_by_stackwich`. Refusals never fail over; forced Claude never fails over. Changes are compared before/after each attempt,
 including when an allowed dirty checkout already contains changes. Timeouts remain failures.
 
 A command quota block has `command` (argv), `regex` (exactly one match with named `percent` group),

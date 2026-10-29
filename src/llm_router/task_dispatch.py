@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.request
 
-from . import config, security, stackwich
+from . import claude_handoff, config, security, stackwich
 
 
 def coding_workers(policy):
@@ -177,9 +177,36 @@ def handoff_restore(cwd, snapshot):
     return {'before': state, 'action': 'restored'}
 
 
-def build_argv(policy, worker, cwd, prompt_file=None, prompt=None, repo=None, env=None):
+def build_argv(policy, worker, cwd, prompt_file=None, prompt=None, repo=None, env=None, size='full'):
     """Expand a linted template; task text enters argv only for explicit arg delivery."""
     template = policy['run_task']['commands'][worker]
+    if worker == 'claude':
+        chosen_effort = claude_handoff.effort(size, template,
+            policy['run_task'].get('claude_allow_raised_effort') is True)
+        normalized = []
+        index, found = 0, False
+        while index < len(template):
+            arg = template[index]
+            if arg == '--':
+                if not found:
+                    normalized.extend(['--effort', '{claude_effort}'])
+                normalized.extend(template[index:])
+                found = True
+                break
+            if arg == '--effort':
+                normalized.extend([arg, '{claude_effort}'])
+                index += 2
+                found = True
+            elif arg.startswith('--effort='):
+                normalized.append('--effort={claude_effort}')
+                index += 1
+                found = True
+            else:
+                normalized.append(arg)
+                index += 1
+        if not found:
+            normalized.extend(['--effort', '{claude_effort}'])
+        template = normalized
     values = {'{cwd}': str(cwd), '{repo}': str(repo or cwd)}
     if prompt_file is not None:
         values['{prompt_file}'] = str(prompt_file)
@@ -187,6 +214,8 @@ def build_argv(policy, worker, cwd, prompt_file=None, prompt=None, repo=None, en
                                       'it exactly; do not copy it into the repository.')
     values.update({'{' + name + '}': config.binary(policy, name) for name in config.BINARY_DEFAULTS
                    if '{' + name + '}' in template})
+    if worker == 'claude':
+        values['{claude_effort}'] = chosen_effort
     argv = []
     for arg in template:
         for key, value in values.items():
@@ -274,9 +303,18 @@ def pacing(policy, meters, worker, size):
     return None, None
 
 
+def check_prompt_size(policy, prompt):
+    limit = policy['run_task'].get('max_prompt_chars', 100000)
+    if type(limit) is not int or limit < 0:
+        raise Refused('run_task.max_prompt_chars must be a non-negative integer')
+    if len(prompt) > limit:
+        raise Refused(f'assembled prompt has {len(prompt)} characters, exceeding '
+                      f'run_task.max_prompt_chars={limit}; refusing worker launch')
+
+
 def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select=None,
              runner=run_bounded, draft=developer_draft, policy=None, output_root=None,
-             extra_prompt=None, stamp=None, meter=None, stackwich_cycle=1):
+             extra_prompt=None, stamp=None, meter=None, stackwich_cycle=1, _claude_pinned=False):
     from . import selection as selection_module
     policy = policy or config.load_policy()
     injected_select = select is not None
@@ -309,13 +347,16 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
     summary['cwd'] = str(cwd)
     chars = 0 if size == 'draft' else policy['developer']['draft_max_chars'] + 1
     # A forced cursor still gets its own meter read (it is otherwise consulted only as a fallback).
-    if worker is not None and (meter is not None or not injected_select):
+    if worker is not None and not _claude_pinned and (meter is not None or not injected_select):
         # A forced worker reads only its own meter (fresh refresher cache, else one live read).
         selection = (meter or (lambda name: selection_module.read_meter(policy, name)))(worker)
     else:
         selection = select(chars, consult_cursor=True) if worker == 'cursor' else select(chars)
     meters = selection.get('meters', {})
-    if worker is not None:
+    if worker == 'claude' and _claude_pinned:
+        order = [worker] + [name for name in selection.get('eligible', []) if name != worker]
+        summary['reason'] = 'stackwich_pinned'
+    elif worker is not None:
         order, summary['reason'] = [worker], 'forced'
     else:
         order, summary['reason'] = list(selection.get('eligible', [])), selection.get('reason')
@@ -343,6 +384,11 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
     _, block_log = worker_environment(policy)
     blocks_before = security.count_lines(block_log)
     for attempt, name in enumerate(order[:2]):  # the chosen worker plus one failover
+        # A failover from a Stackwich-required attempt keeps the requirement: only a Stackwich-capable worker.
+        if (attempt and summary['attempts'][-1]['stackwich']['status'] == 'required' and
+                stackwich.status(policy, name) != 'required'):
+            summary['warnings'].append(f'failover skipped: {name} cannot run Stackwich')
+            break
         if attempt and name in coding:
             refuse, warning = pacing(policy, meters, name, size)
             if refuse:
@@ -358,8 +404,19 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
         protocol = stackwich.status(policy, name)
         record = {'worker': name, 'stackwich': {'status': protocol, 'cycle': stackwich_cycle}}
         invocation_prompt = prompt
+        claude_tail = ''
+        if name == 'claude':
+            claude_tail = stackwich.prompt(stackwich_cycle) if protocol == 'required' else ''
+            chosen_effort = claude_handoff.effort(size, policy['run_task']['commands'][name],
+                policy['run_task'].get('claude_allow_raised_effort') is True)
+            invocation_prompt = claude_handoff.build_prompt(
+                task, chosen_effort, policy['run_task']['timeouts_seconds'][name],
+                prefix=policy['run_task']['prompt_prefix'], extra=extra_prompt or '', tail=claude_tail)
         if protocol == 'unsupported':
             summary['warnings'].append(f'{name}: Stackwich unsupported; ordinary execution')
+        if protocol == 'required' and name != 'claude':
+            invocation_prompt += '\n\n' + stackwich.prompt(stackwich_cycle)
+        check_prompt_size(policy, invocation_prompt)
         if protocol == 'required':
             try:
                 stackwich.prepare(cwd, _git(cwd, 'ls-files', '--error-unmatch', '--',
@@ -370,7 +427,6 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
                 summary.update(worker=name, ok=False, stackwich=record['stackwich'])
                 summary['warnings'].append(str(error))
                 break
-            invocation_prompt += '\n\n' + stackwich.prompt(stackwich_cycle)
         if name == 'developer':
             path = out_dir / f'{stamp}-developer.md'
             try:
@@ -391,13 +447,40 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
             if mode == 'arg':
                 summary['warnings'].append('prompt passed in argv: visible to other local users in the process list')
             try:
-                if mode in ('file', 'pointer'):
-                    prompt_file = write_prompt_file(cwd, stamp, name, invocation_prompt)
-                result = runner(build_argv(policy, name, run_cwd, prompt_file, prompt=invocation_prompt, repo=cwd, env=env), run_cwd,
-                                policy['run_task']['timeouts_seconds'][name],
-                                policy['run_task']['kill_grace_seconds'],
-                                input_text=invocation_prompt if mode == 'stdin' else None, env=env,
-                                stall_seconds=policy['run_task'].get('stall_seconds', {}).get(name))
+                timeout = policy['run_task']['timeouts_seconds'][name]
+                elapsed = 0
+                logs = []
+                continuation = 0
+                while True:
+                    check_prompt_size(policy, invocation_prompt)
+                    if mode in ('file', 'pointer'):
+                        prompt_file = write_prompt_file(cwd, stamp, name, invocation_prompt)
+                    result = runner(build_argv(policy, name, run_cwd, prompt_file,
+                                    prompt=invocation_prompt, repo=cwd, env=env, size=size), run_cwd,
+                                    max(0, timeout - elapsed),
+                                    policy['run_task']['kill_grace_seconds'],
+                                    input_text=invocation_prompt if mode == 'stdin' else None, env=env,
+                                    stall_seconds=policy['run_task'].get('stall_seconds', {}).get(name))
+                    logs.append(result.copy())
+                    elapsed += result['elapsed_seconds']
+                    if name != 'claude':
+                        break
+                    final = claude_handoff.inspect(result['stdout'], result['stderr'], result['returncode'])
+                    # A configured failure signal ends the attempt here; a continuation must not hide it.
+                    fail_regex = policy['run_task'].get('success', {}).get(name, {}).get('fail_regex')
+                    if (result['timed_out'] or result['returncode'] != 0 or final['failure'] or
+                            (fail_regex and re.search(fail_regex, result['stdout'] + result['stderr'])) or
+                            not final['open_items'] or elapsed >= timeout or
+                            continuation >= claude_handoff.continuation_limit(policy['run_task'])):
+                        break
+                    continuation += 1
+                    invocation_prompt = claude_handoff.build_prompt(
+                        task, chosen_effort, timeout, elapsed=round(elapsed, 1),
+                        prefix=policy['run_task']['prompt_prefix'], extra=extra_prompt or '',
+                        tail=claude_tail, open_items=final['open_items'])
+                if name == 'claude':
+                    record['continuations'] = continuation
+                    result['elapsed_seconds'] = elapsed
             finally:
                 if prompt_file is not None:
                     prompt_file.unlink(missing_ok=True)
@@ -406,11 +489,15 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
                     summary['handoff_cleanup'] = (actions[0] if len(actions) == 1 else
                                                   {snap['name']: act for snap, act in zip(snapshots, actions)})
             record['prompt_delivery'] = mode
-            path.write_text(security.redact('$ exit=%s timed_out=%s elapsed=%ss\n--- stdout\n%s\n--- stderr\n%s\n' % (
-                result['returncode'], result['timed_out'], result['elapsed_seconds'],
-                result['stdout'], result['stderr'])))
+            path.write_text(security.redact('\n'.join(
+                '$ exit=%s timed_out=%s elapsed=%ss\n--- stdout\n%s\n--- stderr\n%s\n' % (
+                    item['returncode'], item['timed_out'], item['elapsed_seconds'],
+                    item['stdout'], item['stderr']) for item in logs)))
             quota = bool(quota_error.search(result['stderr'] + result['stdout'][-4000:])) and result['returncode'] != 0
             success_check = check_success(policy, name, result, before_tree != tree_fingerprint(cwd))
+            if name == 'claude':
+                quota = final['failure'] == 'quota'
+                success_check = final['failure'] or success_check or ('checklist_open' if final['open_items'] else None)
             record.update(ok=success_check is None and not result['timed_out'],
                           success_check=success_check,
                           timed_out=result['timed_out'], returncode=result['returncode'],
@@ -419,7 +506,8 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
         record['output_path'] = str(path)
         summary['attempts'].append(record)
         summary.update(worker=name, ok=record['ok'], output_path=str(path), stackwich=record['stackwich'])
-        if record['ok'] or protocol == 'required':
+        if (record['ok'] or record.get('success_check') == 'refusal' or
+                (protocol == 'required' and not (name == 'claude' and record.get('quota_error')))):
             break
     head_after = _git(cwd, 'rev-parse', '--verify', '-q', 'HEAD').stdout.strip() or None
     if head_after != head_before:
