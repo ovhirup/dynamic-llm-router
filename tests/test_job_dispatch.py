@@ -203,12 +203,34 @@ class JobTests(unittest.TestCase):
         git(self.repo, '-c', 'tag.gpgsign=false', 'tag', 'v1', head)
         self.assertEqual(jd.resolve_base(self.repo, 'v1'), head)
 
-    def test_changed_paths_ignores_bytecode_caches(self):
+    def test_changed_paths_ignores_only_untracked_interpreter_caches(self):
         (self.repo / 'a.py').write_text('x = 1\n')
         (self.repo / 'pkg' / '__pycache__').mkdir(parents=True)
         (self.repo / 'pkg' / '__pycache__' / 'm.cpython-312.pyc').write_bytes(b'\0')
-        (self.repo / 'stray.pyc').write_bytes(b'\0')
-        self.assertEqual(jd.changed_paths(self.repo), {'a.py', 'local-notes.txt'})
+        (self.repo / 'stray.pyc').write_bytes(b'\0')  # importable as a sourceless module: a real change
+        (self.repo / 'x__pycache__').mkdir()
+        (self.repo / 'x__pycache__' / 'run.sh').write_text('true\n')  # a look-alike directory is not a cache
+        (self.repo / '__pycache__').mkdir()
+        (self.repo / '__pycache__' / 'notes.txt').write_text('n\n')  # only .pyc/.pyo files are caches
+        self.assertEqual(jd.changed_paths(self.repo),
+                         {'a.py', 'local-notes.txt', 'stray.pyc', 'x__pycache__/run.sh', '__pycache__/notes.txt'})
+
+    def test_tracked_cache_changes_still_count(self):
+        cache = self.repo / '__pycache__' / 'kept.cpython-312.pyc'
+        cache.parent.mkdir()
+        cache.write_bytes(b'\0')
+        git(self.repo, 'add', '-f', str(cache))
+        git(self.repo, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'tracked cache')
+        cache.write_bytes(b'\1')
+        self.assertIn('__pycache__/kept.cpython-312.pyc', jd.changed_paths(self.repo))
+
+    def test_worker_left_caches_are_removed_before_tests(self):
+        self.worker("import os; os.makedirs('__pycache__', exist_ok=True); open('__pycache__/out.cpython-312.pyc','wb').write(b'planted'); "
+                    "open('out.txt','w').write('hi\\n')")
+        result = self.job(test_cmd='test ! -e __pycache__/out.cpython-312.pyc')
+        self.assertTrue(result['ok'], result)
+        files = git(self.repo, 'show', '--name-only', '--format=', result['commit']).split()
+        self.assertEqual(files, ['out.txt'])
 
     def test_same_second_jobs_get_distinct_worktrees(self):
         self.worker("open('out.txt','w').write('hi\\n')")

@@ -107,23 +107,40 @@ def run_tests(policy, cwd, command, timeout, log_path, runner=td.run_bounded):
 
 
 def _is_bytecode_cache(path):
-    """Interpreter caches are never worker output; counting them caused spurious out-of-scope failures."""
-    return path.endswith(('.pyc', '.pyo')) or '__pycache__/' in path or path.startswith('__pycache__')
+    """A CPython 3 cache file: .pyc/.pyo directly inside a __pycache__ directory. A .pyc anywhere else can be
+    imported as a sourceless module, so it is a real change."""
+    parts = path.split('/')
+    return len(parts) >= 2 and parts[-2] == '__pycache__' and parts[-1].endswith(('.pyc', '.pyo'))
+
+
+def _untracked_caches(cwd):
+    out = _git(cwd, 'status', '--porcelain', '-z', '--untracked-files=all').stdout
+    return [entry[3:] for entry in out.split('\0') if entry.startswith('?? ') and _is_bytecode_cache(entry[3:])]
+
+
+def remove_bytecode_caches(cwd):
+    """Delete untracked interpreter caches the worker left, so tests rebuild them from the reviewed source.
+    A planted cache could otherwise run unreviewed bytecode during tests."""
+    root = Path(cwd).resolve()
+    for rel in _untracked_caches(cwd):
+        path = (root / rel)
+        if path.is_file() and not path.is_symlink() and root in path.resolve().parents:
+            path.unlink()
 
 
 def changed_paths(cwd):
-    """Paths with any change vs HEAD (tracked or untracked), from porcelain -z. Bytecode caches are left out."""
+    """Paths with any change vs HEAD (tracked or untracked), from porcelain -z. Untracked interpreter caches are
+    left out (counting them caused spurious out-of-scope failures); tracked ones still count."""
     out = _git(cwd, 'status', '--porcelain', '-z', '--untracked-files=all').stdout
     entries, paths, skip = out.split('\0'), set(), False
     for entry in entries:
         if skip:
             skip = False
-            if not _is_bytecode_cache(entry):
-                paths.add(entry)
+            paths.add(entry)
             continue
         if len(entry) < 4:
             continue
-        if not _is_bytecode_cache(entry[3:]):
+        if not (entry.startswith('?? ') and _is_bytecode_cache(entry[3:])):
             paths.add(entry[3:])
         if entry[0] in 'RC':
             skip = True  # next entry is the rename source
@@ -332,6 +349,7 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
             summary['attempts'].append({'attempt': cycle, 'worker': selected, 'ok': False,
                                         'leak_check': (result.get('leak_check') or {}).get('status')})
             return
+        remove_bytecode_caches(worktree)
         worker_paths = changed_paths(worktree) - test_artifacts
         if required:
             worker_paths.discard(stackwich.REPORT_PATH)
