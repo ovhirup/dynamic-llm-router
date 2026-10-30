@@ -27,6 +27,17 @@ def _git(cwd, *args, check=False):
     return done
 
 
+def resolve_base(repo, ref):
+    """Commit sha for a base ref, or ''. A branch name wins over a same-named tag (git's own order prefers the tag,
+    so `main` could resolve to a stale `main` tag): try refs/heads/, then refs/remotes/, then the ref as given."""
+    candidates = [ref] if ref == 'HEAD' or ref.startswith('refs/') else [f'refs/heads/{ref}', f'refs/remotes/{ref}', ref]
+    for candidate in candidates:
+        sha = _git(repo, 'rev-parse', '-q', '--verify', candidate + '^{commit}').stdout.strip()
+        if sha:
+            return sha
+    return ''
+
+
 def _path(policy, key, default):
     return config.policy_path(policy, 'run_job', key, default)
 
@@ -95,18 +106,25 @@ def run_tests(policy, cwd, command, timeout, log_path, runner=td.run_bounded):
             'tail': output[-policy['run_job'].get('test_output_tail_chars', 4000):]}
 
 
+def _is_bytecode_cache(path):
+    """Interpreter caches are never worker output; counting them caused spurious out-of-scope failures."""
+    return path.endswith(('.pyc', '.pyo')) or '__pycache__/' in path or path.startswith('__pycache__')
+
+
 def changed_paths(cwd):
-    """Paths with any change vs HEAD (tracked or untracked), from porcelain -z."""
+    """Paths with any change vs HEAD (tracked or untracked), from porcelain -z. Bytecode caches are left out."""
     out = _git(cwd, 'status', '--porcelain', '-z', '--untracked-files=all').stdout
     entries, paths, skip = out.split('\0'), set(), False
     for entry in entries:
         if skip:
             skip = False
-            paths.add(entry)
+            if not _is_bytecode_cache(entry):
+                paths.add(entry)
             continue
         if len(entry) < 4:
             continue
-        paths.add(entry[3:])
+        if not _is_bytecode_cache(entry[3:]):
+            paths.add(entry[3:])
         if entry[0] in 'RC':
             skip = True  # next entry is the rename source
     return paths
@@ -167,7 +185,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
     test_cmd = test_cmd if test_cmd is not None else settings.get('test_cmd')
     test_timeout = settings.get('test_timeout_seconds', policy['run_job']['test_timeout_seconds'])
     base_ref = base or 'HEAD'
-    base_sha = _git(repo, 'rev-parse', '-q', '--verify', base_ref + '^{commit}').stdout.strip()
+    base_sha = resolve_base(repo, base_ref)
     if not base_sha:
         raise Refused(f'base {base_ref!r} is not a commit')
     slug = slugify(task_path.stem)

@@ -147,7 +147,7 @@ class JobTests(unittest.TestCase):
         self.worker("open('out.txt','w').write('ok\\n')")
         result = self.job(test_cmd='echo Zephyrquill > report.txt; mkdir -p __pycache__; echo b > __pycache__/x.pyc')
         self.assertTrue(result['ok'], result)
-        self.assertEqual(result['excluded_test_artifacts'], ['__pycache__/x.pyc', 'report.txt'])
+        self.assertEqual(result['excluded_test_artifacts'], ['report.txt'])  # bytecode caches are ignored outright
         files = git(self.repo, 'show', '--name-only', '--format=', result['commit']).split()
         self.assertEqual(files, ['out.txt'])
         self.assertEqual(result['leak_check']['status'], 'clean')
@@ -181,6 +181,34 @@ class JobTests(unittest.TestCase):
             self.job(branch='bad..name')
         with self.assertRaisesRegex(jd.Refused, 'not a git'):
             jd.run_job(self.base, self.task, policy=self.policy)
+
+    def test_branch_beats_same_named_tag(self):
+        branch = git(self.repo, 'symbolic-ref', '--short', 'HEAD')
+        older = git(self.repo, 'rev-parse', 'HEAD')
+        (self.repo / 'f.txt').write_text('x')
+        git(self.repo, 'add', 'f.txt')
+        git(self.repo, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'two')
+        newer = git(self.repo, 'rev-parse', 'HEAD')
+        git(self.repo, '-c', 'tag.gpgsign=false', 'tag', branch, older)  # a tag named like the branch, on the older commit
+        self.assertEqual(git(self.repo, 'rev-parse', branch), older, 'git itself prefers the tag')
+        self.assertEqual(jd.resolve_base(self.repo, branch), newer)
+        self.assertEqual(jd.resolve_base(self.repo, 'HEAD'), newer)
+        self.assertEqual(jd.resolve_base(self.repo, older[:10]), older)
+        self.assertEqual(jd.resolve_base(self.repo, 'no-such-ref'), '')
+        self.worker("open('out.txt','w').write('hi\\n')")
+        self.assertEqual(self.job(base=branch, test_cmd='true')['base_sha'], newer)
+
+    def test_tag_only_base_still_resolves(self):
+        head = git(self.repo, 'rev-parse', 'HEAD')
+        git(self.repo, '-c', 'tag.gpgsign=false', 'tag', 'v1', head)
+        self.assertEqual(jd.resolve_base(self.repo, 'v1'), head)
+
+    def test_changed_paths_ignores_bytecode_caches(self):
+        (self.repo / 'a.py').write_text('x = 1\n')
+        (self.repo / 'pkg' / '__pycache__').mkdir(parents=True)
+        (self.repo / 'pkg' / '__pycache__' / 'm.cpython-312.pyc').write_bytes(b'\0')
+        (self.repo / 'stray.pyc').write_bytes(b'\0')
+        self.assertEqual(jd.changed_paths(self.repo), {'a.py', 'local-notes.txt'})
 
     def test_same_second_jobs_get_distinct_worktrees(self):
         self.worker("open('out.txt','w').write('hi\\n')")
