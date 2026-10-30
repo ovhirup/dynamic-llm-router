@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -223,6 +224,32 @@ class JobTests(unittest.TestCase):
         git(self.repo, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'tracked cache')
         cache.write_bytes(b'\1')
         self.assertIn('__pycache__/kept.cpython-312.pyc', jd.changed_paths(self.repo))
+
+    def test_cache_removal_covers_ignored_symlinked_and_stray_bytecode(self):
+        (self.repo / '.gitignore').write_text('__pycache__/\n*.pyc\n')
+        outside = self.base / 'outside'
+        outside.mkdir()
+        (outside / 'target.pyc').write_bytes(b'keep')
+        (self.repo / 'pkg' / '__pycache__').mkdir(parents=True)
+        ignored = self.repo / 'pkg' / '__pycache__' / 'm.cpython-312.pyc'
+        ignored.write_bytes(b'planted')
+        link = self.repo / 'pkg' / '__pycache__' / 'n.cpython-312.pyc'
+        link.symlink_to(outside / 'target.pyc')
+        (self.repo / 'lib').mkdir()
+        (self.repo / 'lib' / '__pycache__').symlink_to(outside, target_is_directory=True)
+        stray = self.repo / 'stray.pyc'
+        stray.write_bytes(b'planted')
+        jd.remove_bytecode_caches(self.repo)
+        for path in (ignored, link, self.repo / 'lib' / '__pycache__', stray):
+            self.assertFalse(os.path.lexists(path), path)
+        self.assertEqual((outside / 'target.pyc').read_bytes(), b'keep', 'a link target is never touched')
+        self.assertTrue((self.repo / '.gitignore').exists())
+
+    def test_symlinked_cache_is_never_hidden_from_changed_paths(self):
+        (self.base / 'elsewhere.pyc').write_bytes(b'x')
+        (self.repo / '__pycache__').mkdir()
+        (self.repo / '__pycache__' / 'm.cpython-312.pyc').symlink_to(self.base / 'elsewhere.pyc')
+        self.assertIn('__pycache__/m.cpython-312.pyc', jd.changed_paths(self.repo))
 
     def test_worker_left_caches_are_removed_before_tests(self):
         self.worker("import os; os.makedirs('__pycache__', exist_ok=True); open('__pycache__/out.cpython-312.pyc','wb').write(b'planted'); "

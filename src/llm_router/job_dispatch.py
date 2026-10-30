@@ -113,19 +113,26 @@ def _is_bytecode_cache(path):
     return len(parts) >= 2 and parts[-2] == '__pycache__' and parts[-1].endswith(('.pyc', '.pyo'))
 
 
-def _untracked_caches(cwd):
-    out = _git(cwd, 'status', '--porcelain', '-z', '--untracked-files=all').stdout
-    return [entry[3:] for entry in out.split('\0') if entry.startswith('?? ') and _is_bytecode_cache(entry[3:])]
-
-
 def remove_bytecode_caches(cwd):
-    """Delete untracked interpreter caches the worker left, so tests rebuild them from the reviewed source.
-    A planted cache could otherwise run unreviewed bytecode during tests."""
-    root = Path(cwd).resolve()
-    for rel in _untracked_caches(cwd):
-        path = (root / rel)
-        if path.is_file() and not path.is_symlink() and root in path.resolve().parents:
-            path.unlink()
+    """Delete every untracked .pyc/.pyo and any symlinked __pycache__ the worker left, including gitignored ones
+    (git status does not list those), so tests rebuild caches from the reviewed source and never run planted
+    bytecode. The tree is walked without following links; a link is removed itself, never its target."""
+    root = Path(cwd)
+    tracked = set(filter(None, _git(cwd, 'ls-tree', '-r', '--name-only', '-z', 'HEAD').stdout.split('\0')))
+    for folder, dirs, files in os.walk(root, followlinks=False):
+        here = Path(folder)
+        if here == root and '.git' in dirs:
+            dirs.remove('.git')
+        for name in list(dirs):
+            path = here / name
+            if name == '__pycache__' and path.is_symlink():
+                os.unlink(path)
+                dirs.remove(name)
+        for name in files:
+            path = here / name
+            rel = path.relative_to(root).as_posix()
+            if name.endswith(('.pyc', '.pyo')) and rel not in tracked:
+                os.unlink(path)
 
 
 def changed_paths(cwd):
@@ -140,7 +147,8 @@ def changed_paths(cwd):
             continue
         if len(entry) < 4:
             continue
-        if not (entry.startswith('?? ') and _is_bytecode_cache(entry[3:])):
+        if not (entry.startswith('?? ') and _is_bytecode_cache(entry[3:])
+                and not os.path.islink(os.path.join(cwd, entry[3:]))):
             paths.add(entry[3:])
         if entry[0] in 'RC':
             skip = True  # next entry is the rename source
