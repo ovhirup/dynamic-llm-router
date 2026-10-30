@@ -126,14 +126,19 @@ def remove_bytecode_caches(cwd):
         if rel_dir == '.' and '.git' in dirs:
             dirs.remove('.git')
         # A symlinked __pycache__ is never descended into; it may be listed with the dirs or the files.
+        # Anything tracked at HEAD is baseline content and is never removed.
         for name in list(dirs):
+            rel = name if rel_dir == '.' else f'{rel_dir}/{name}'.replace(os.sep, '/')
             if name == '__pycache__' and stat.S_ISLNK(os.lstat(name, dir_fd=dir_fd).st_mode):
-                os.unlink(name, dir_fd=dir_fd)
                 dirs.remove(name)
+                if rel not in tracked:
+                    os.unlink(name, dir_fd=dir_fd)
         for name in files:
             rel = name if rel_dir == '.' else f'{rel_dir}/{name}'.replace(os.sep, '/')
+            if rel in tracked:
+                continue
             linked = stat.S_ISLNK(os.lstat(name, dir_fd=dir_fd).st_mode)
-            if (name == '__pycache__' and linked) or (name.endswith(('.pyc', '.pyo')) and rel not in tracked):
+            if (name == '__pycache__' and linked) or name.endswith(('.pyc', '.pyo')):
                 os.unlink(name, dir_fd=dir_fd)
 
 
@@ -565,8 +570,10 @@ def cleanup(older_than, dry_run=False, policy=None, now=None):
         branch = _git(worktree, 'symbolic-ref', '-q', '--short', 'HEAD').stdout.strip()
         entry = {'worktree': str(worktree), 'branch': branch, 'branch_action': 'kept'}
         if not dry_run:
-            # --force only discards the job's own recorded test artifacts (checked above).
-            _git(repo, 'worktree', 'remove', *(['--force'] if pending else []), str(worktree), check=True)
+            # --force only discards the job's own recorded test artifacts and untracked interpreter caches
+            # (changed_paths hides those, so git still sees them as dirty); both were checked above.
+            force = bool(pending) or _has_changes(worktree)
+            _git(repo, 'worktree', 'remove', *(['--force'] if force else []), str(worktree), check=True)
             base_sha = job.get('base_sha')
             head = _git(repo, 'rev-parse', '-q', '--verify', f'refs/heads/{branch}').stdout.strip() if branch else ''
             if branch.startswith(policy['run_job'].get('branch_prefix', 'router/')) and base_sha and head == base_sha:

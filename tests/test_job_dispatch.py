@@ -245,6 +245,22 @@ class JobTests(unittest.TestCase):
         self.assertEqual((outside / 'target.pyc').read_bytes(), b'keep', 'a link target is never touched')
         self.assertTrue((self.repo / '.gitignore').exists())
 
+    def test_tracked_cache_symlinks_are_baseline_and_kept(self):
+        (self.base / 'cache-target').mkdir()
+        (self.repo / 'lib').mkdir()
+        (self.repo / 'lib' / '__pycache__').symlink_to(self.base / 'cache-target', target_is_directory=True)
+        (self.repo / '__pycache__').symlink_to(self.base / 'missing-target')  # dangling, listed with the files
+        git(self.repo, 'add', 'lib/__pycache__', '__pycache__')
+        git(self.repo, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'tracked links')
+        jd.remove_bytecode_caches(self.repo)
+        self.assertTrue((self.repo / 'lib' / '__pycache__').is_symlink())
+        self.assertTrue((self.repo / '__pycache__').is_symlink())
+        self.worker("open('out.txt','w').write('hi\\n')")
+        result = self.job(test_cmd='true')
+        self.assertTrue(result['ok'], result)
+        files = git(self.repo, 'show', '--name-only', '--format=', result['commit']).split()
+        self.assertEqual(files, ['out.txt'], 'baseline cache links are not committed as worker changes')
+
     def test_symlinked_cache_is_never_hidden_from_changed_paths(self):
         (self.base / 'elsewhere.pyc').write_bytes(b'x')
         (self.repo / '__pycache__').mkdir()
@@ -323,6 +339,14 @@ class JobTests(unittest.TestCase):
         self.assertEqual(done['excluded_test_artifacts'], ['artifact.log'])
         report = jd.cleanup('0m', policy=self.policy)
         self.assertEqual(len(report['removed']), 1)
+        self.assertFalse(Path(done['worktree']).exists())
+
+    def test_cleanup_removes_worktree_with_only_untracked_bytecode(self):
+        self.worker("open('out.txt','w').write('hi\\n')")
+        done = self.job(test_cmd='mkdir -p __pycache__; echo b > __pycache__/x.pyc')
+        self.assertEqual(done['excluded_test_artifacts'], [])
+        report = jd.cleanup('0m', policy=self.policy)
+        self.assertEqual(len(report['removed']), 1, report)
         self.assertFalse(Path(done['worktree']).exists())
 
     def test_cleanup_skips_dirty_worktree(self):
