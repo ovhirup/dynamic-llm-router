@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 
 from . import alerts, config, security, stackwich
@@ -116,23 +117,24 @@ def _is_bytecode_cache(path):
 def remove_bytecode_caches(cwd):
     """Delete every untracked .pyc/.pyo and any symlinked __pycache__ the worker left, including gitignored ones
     (git status does not list those), so tests rebuild caches from the reviewed source and never run planted
-    bytecode. The tree is walked without following links; a link is removed itself, never its target."""
-    root = Path(cwd)
+    bytecode. The walk holds directory descriptors and never follows links, and each deletion is relative to the
+    descriptor, so a path swapped mid-walk (e.g. by a leftover worker process) cannot redirect it outside the tree.
+    A link is removed itself, never its target."""
     tracked = set(filter(None, _git(cwd, 'ls-tree', '-r', '--name-only', '-z', 'HEAD').stdout.split('\0')))
-    for folder, dirs, files in os.walk(root, followlinks=False):
-        here = Path(folder)
-        if here == root and '.git' in dirs:
+    for folder, dirs, files, dir_fd in os.fwalk(str(cwd), follow_symlinks=False):
+        rel_dir = os.path.relpath(folder, str(cwd))
+        if rel_dir == '.' and '.git' in dirs:
             dirs.remove('.git')
+        # A symlinked __pycache__ is never descended into; it may be listed with the dirs or the files.
         for name in list(dirs):
-            path = here / name
-            if name == '__pycache__' and path.is_symlink():
-                os.unlink(path)
+            if name == '__pycache__' and stat.S_ISLNK(os.lstat(name, dir_fd=dir_fd).st_mode):
+                os.unlink(name, dir_fd=dir_fd)
                 dirs.remove(name)
         for name in files:
-            path = here / name
-            rel = path.relative_to(root).as_posix()
-            if name.endswith(('.pyc', '.pyo')) and rel not in tracked:
-                os.unlink(path)
+            rel = name if rel_dir == '.' else f'{rel_dir}/{name}'.replace(os.sep, '/')
+            linked = stat.S_ISLNK(os.lstat(name, dir_fd=dir_fd).st_mode)
+            if (name == '__pycache__' and linked) or (name.endswith(('.pyc', '.pyo')) and rel not in tracked):
+                os.unlink(name, dir_fd=dir_fd)
 
 
 def changed_paths(cwd):
