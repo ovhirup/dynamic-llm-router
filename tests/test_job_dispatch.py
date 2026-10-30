@@ -245,6 +245,20 @@ class JobTests(unittest.TestCase):
         self.assertEqual((outside / 'target.pyc').read_bytes(), b'keep', 'a link target is never touched')
         self.assertTrue((self.repo / '.gitignore').exists())
 
+    def test_tests_use_a_fresh_pycache_prefix_outside_the_worktree(self):
+        seen = {}
+
+        def runner(argv, cwd, timeout, grace, env=None, stall_seconds=None):
+            seen['prefix'] = env['PYTHONPYCACHEPREFIX']
+            seen['existed'] = Path(seen['prefix']).is_dir()
+            return {'stdout': '', 'stderr': '', 'returncode': 0, 'timed_out': False, 'elapsed_seconds': 0}
+
+        result = jd.run_tests(self.policy, self.repo, 'true', 5, self.base / 'tests.log', runner=runner)
+        self.assertEqual(result['status'], 'passed')
+        self.assertTrue(seen['existed'])
+        self.assertNotIn(str(self.repo.resolve()), str(Path(seen['prefix']).resolve()))
+        self.assertFalse(Path(seen['prefix']).exists(), 'the prefix is removed after the run')
+
     def test_tracked_cache_symlinks_are_baseline_and_kept(self):
         (self.base / 'cache-target').mkdir()
         (self.repo / 'lib').mkdir()

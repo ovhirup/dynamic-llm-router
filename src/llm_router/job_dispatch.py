@@ -13,6 +13,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 
 from . import alerts, config, security, stackwich
 from . import task_dispatch as td
@@ -95,9 +96,13 @@ def run_tests(policy, cwd, command, timeout, log_path, runner=td.run_bounded):
     if not command:
         return {'status': 'skipped', 'command': None}
     env, _ = td.worker_environment(policy)
-    result = runner(['/bin/sh', '-c', command], cwd, timeout, policy['run_task']['kill_grace_seconds'],
-                    env=env,
-                    stall_seconds=policy['run_job'].get('test_stall_seconds'))
+    # Python reads and writes bytecode only under a fresh router-owned prefix, never an in-tree __pycache__
+    # (linked or not), so bytecode planted in the worktree or behind a tracked cache link is never executed.
+    with tempfile.TemporaryDirectory(prefix='llm-router-pycache-') as pycache:
+        env = dict(env, PYTHONPYCACHEPREFIX=pycache)
+        result = runner(['/bin/sh', '-c', command], cwd, timeout, policy['run_task']['kill_grace_seconds'],
+                        env=env,
+                        stall_seconds=policy['run_job'].get('test_stall_seconds'))
     output = security.redact(result['stdout'] + result['stderr'])
     log_path.write_text(f'$ {security.redact(command)}\nexit={result["returncode"]} timed_out={result["timed_out"]} '
                         f'stalled={result.get("stalled")}\n{output}')
