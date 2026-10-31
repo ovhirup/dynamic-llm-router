@@ -22,6 +22,21 @@ import urllib.request
 from . import claude_handoff, config, security, stackwich
 
 
+
+def failure_reason(stderr, stdout='', limit=300):
+    """Last meaningful error line from a failed worker's output (redacted, trimmed), or None.
+
+    Prefers a line that looks like an exception/error (e.g. 'ImportError: ...'), else the last non-empty line.
+    """
+    for text in (stderr or '', stdout or ''):
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            continue
+        errors = [line for line in lines if re.match(r'^[A-Za-z_.]*(Error|Exception)\b', line) or line.lower().startswith('error')]
+        line = security.redact(errors[-1] if errors else lines[-1])
+        return line if len(line) <= limit else line[:limit - 1] + '\u2026'
+    return None
+
 def coding_workers(policy):
     return tuple(k for k in policy['run_task']['commands'] if not k.startswith('_'))
 
@@ -503,6 +518,10 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
                           timed_out=result['timed_out'], returncode=result['returncode'],
                           quota_error=quota, elapsed_seconds=result['elapsed_seconds'],
                           stalled=result.get('stalled', False))
+            if not record['ok']:
+                reason = failure_reason(result.get('stderr', ''), result.get('stdout', ''))
+                if reason:
+                    record['failure_reason'] = reason
         record['output_path'] = str(path)
         summary['attempts'].append(record)
         summary.update(worker=name, ok=record['ok'], output_path=str(path), stackwich=record['stackwich'])
