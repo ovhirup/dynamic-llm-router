@@ -114,6 +114,9 @@ class SelectionTests(unittest.TestCase):
                     'save': lambda o: None} for w in ('codex', 'grok-build', 'cursor')}
 
     def policy(self, **kw):
+        # grok-build's grok-bot pool is billed separately and on its week curve, so its own meter decides.
+        kw.setdefault('grok_bot', {'billing': {'mode': 'separate'}, 'evidence': {
+            'percent_used': 0, 'reset_at': (self.NOW + timedelta(days=6)).isoformat()}})
         return load_policy(quota={'grok-build': {'enabled': True}, 'cursor': {'enabled': True}}, **kw)
 
     def test_order_threshold_and_fallback(self):

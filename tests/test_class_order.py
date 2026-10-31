@@ -20,6 +20,9 @@ CLASS_ORDER = {
 
 
 def class_policy(**extra):
+    # class ranking is under test, so grok-build's grok-bot pool is billed separately and on its week curve.
+    extra.setdefault('grok_bot', {'billing': {'mode': 'separate'}, 'evidence': {
+        'percent_used': 0, 'reset_at': (NOW + timedelta(days=6)).isoformat()}})
     policy = load_policy(class_order=CLASS_ORDER, **extra)
     policy['unmetered_workers'] = ['codex', 'grok-build', 'cursor']
     return policy

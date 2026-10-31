@@ -264,5 +264,13 @@
     },
     "_why": "A human approves every push and merge: approvals bind job+action+exact head SHA, expire, are single use; a new commit needs a new review+approval. Never force/--admin/--auto/delete."
   },
-  "workers": {}
+  "workers": {},
+  "grok_bot": {
+    "billing": {
+      "mode": "unknown"
+    },
+    "reserve_percent": 15,
+    "evidence": null,
+    "_why": "Week-curve for the grok-bot orchestrator seat: pace, never ban (docs/STRATEGY_WORKERS_FALLBACK.md). mode unknown (default) tries every worker sharing the grok-bot pool (grok-build and any worker tagged shares_pool_with grok-bot) last among cloud workers; shared never dispatches to them; separate paces them by week_budget over evidence {percent_used, reset_at}: allowed = (100 - reserve_percent) x elapsed week, ahead of curve drops one rank, the last 24h release the reserve to 95%."
+  }
 }

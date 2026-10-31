@@ -56,6 +56,9 @@ class Base(unittest.TestCase):
         policy['quota_refresh'].update(state_file=str(base / 'state.json'), lock_file=str(base / 'refresh.lock'))
         policy['alerts'] = {'file': str(base / 'alerts.jsonl'), 'summary': str(base / 'ALERTS.md'),
                             'macos_notification': False}
+        # These meter tests exercise grok-build's own meter, so its grok-bot pool is billed separately and on curve.
+        policy['grok_bot'] = {'billing': {'mode': 'separate'}, 'reserve_percent': 15,
+                              'evidence': {'percent_used': 0, 'reset_at': (NOW + timedelta(days=6)).isoformat()}}
         self.base, self.policy = base, policy
         reset = NOW + timedelta(days=5)
         self.codex = {'evidence': evidence('codex', {'primary': (2, NOW + timedelta(hours=4)), 'weekly': (81, reset)}),

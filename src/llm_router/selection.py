@@ -11,8 +11,9 @@ from datetime import datetime, timezone
 import math
 import re
 
-from . import claude_account, config, cooldown, quota_service
+from . import claude_account, config, cooldown, quota_service, week_curve
 
+LOCAL_WORKERS = ('developer', 'aider-ollama', config.ORCHESTRATOR)  # never displaced by week-curve pacing
 NAME = re.compile(r'[a-z][a-z0-9_-]{0,31}')
 
 
@@ -114,12 +115,14 @@ def developer_ready(policy, task_chars):
 
 def select(task_chars, policy=None, cached_only=False, now=None, io=None, consult_all=False,
            consult_cursor=False, threshold_overrides=None, claude_profile_loader=None, cooldowns=None,
-           task_class=None):
+           task_class=None, grok_bot_evidence=None):
     """Return {'worker', 'reason', 'eligible', 'meters', 'reasons', 'sources', 'versions', ...}.
 
     Workers cooling down after a quota error (see cooldown.py) are skipped until their reset.
     task_class walks class_order.<task_class> instead of worker_order; grok-bot ends every class
     order and is never quota-gated, so a class job is handed back to the orchestrator, not refused.
+    Workers sharing the grok-bot pool are paced by week_curve.gate(): an unknown pool is tried last
+    among cloud workers and ahead-of-curve drops one rank; neither bans.
     """
     policy = policy or config.load_policy()
     clock_injected = now is not None
@@ -131,6 +134,9 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
     overrides = threshold_overrides or {}
     eligible, meters, reasons, sources, versions, warnings = [], {}, {}, {}, {}, {}
     order = config.worker_order(policy, task_class)
+    grok_budget, grok_verdict, grok_why = week_curve.gate(policy, now, grok_bot_evidence)
+    grok_family = week_curve.pool_members(policy)
+    paced = grok_family if grok_verdict != week_curve.FIRST_FIT else set()
     for worker in order:
         if worker == config.ORCHESTRATOR:
             reasons[worker] = 'orchestrator_fallback'
@@ -162,7 +168,8 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
             eligible += [worker] if ok else []
             continue
         consult = quota.get('consult', 'always')
-        if consult == 'fallback' and eligible and not consult_all and not (consult_cursor and worker == 'cursor'):
+        # a paced grok-family worker is not a first choice, so it must not stop a fallback read
+        if consult == 'fallback' and any(w not in paced for w in eligible) and not consult_all and not (consult_cursor and worker == 'cursor'):
             reasons[worker] = 'not_consulted'
             continue
         observation, sources[worker] = _observation(policy, worker, io, now, cached_only)
@@ -182,6 +189,9 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
         reasons[worker] = reason
         if reason == 'quota_available':
             eligible.append(worker)
+    if grok_why:
+        reasons.update({w: grok_why for w in eligible if w in grok_family})
+    eligible = week_curve.pace(eligible, grok_family, grok_verdict, LOCAL_WORKERS)
     worker = eligible[0] if eligible else None
     reason = ('handoff_to_orchestrator' if worker == config.ORCHESTRATOR else 'preferred_eligible_worker' if worker
               else 'no_eligible_worker' if order else 'no_workers_configured')
@@ -190,7 +200,8 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
             'eligible': eligible, 'meters': meters, 'reasons': reasons, 'sources': sources,
             'cli_versions': versions, 'version_warnings': warnings,
             'never': sorted(never), 'ineligible': policy.get('ineligible') or {},
-            'cooldowns': {name: until.isoformat() for name, until in cooled.items()}}
+            'cooldowns': {name: until.isoformat() for name, until in cooled.items()},
+            'grok_bot': dict(grok_budget, verdict=grok_verdict)}
 
 
 def read_meter(policy, worker, now=None, io=None):
