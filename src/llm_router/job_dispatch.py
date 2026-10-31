@@ -11,7 +11,9 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
+import tempfile
 
 from . import alerts, config, security, stackwich
 from . import task_dispatch as td
@@ -25,6 +27,17 @@ def _git(cwd, *args, check=False):
     if check and done.returncode != 0:
         raise Refused(f'git {args[0]} failed: ' + security.redact(done.stderr.strip())[:300])
     return done
+
+
+def resolve_base(repo, ref):
+    """Commit sha for a base ref, or ''. A branch name wins over a same-named tag (git's own order prefers the tag,
+    so `main` could resolve to a stale `main` tag): try refs/heads/, then refs/remotes/, then the ref as given."""
+    candidates = [ref] if ref == 'HEAD' or ref.startswith('refs/') else [f'refs/heads/{ref}', f'refs/remotes/{ref}', ref]
+    for candidate in candidates:
+        sha = _git(repo, 'rev-parse', '-q', '--verify', candidate + '^{commit}').stdout.strip()
+        if sha:
+            return sha
+    return ''
 
 
 def _path(policy, key, default):
@@ -83,9 +96,13 @@ def run_tests(policy, cwd, command, timeout, log_path, runner=td.run_bounded):
     if not command:
         return {'status': 'skipped', 'command': None}
     env, _ = td.worker_environment(policy)
-    result = runner(['/bin/sh', '-c', command], cwd, timeout, policy['run_task']['kill_grace_seconds'],
-                    env=env,
-                    stall_seconds=policy['run_job'].get('test_stall_seconds'))
+    # Python reads and writes bytecode only under a fresh router-owned prefix, never an in-tree __pycache__
+    # (linked or not), so bytecode planted in the worktree or behind a tracked cache link is never executed.
+    with tempfile.TemporaryDirectory(prefix='llm-router-pycache-') as pycache:
+        env = dict(env, PYTHONPYCACHEPREFIX=pycache)
+        result = runner(['/bin/sh', '-c', command], cwd, timeout, policy['run_task']['kill_grace_seconds'],
+                        env=env,
+                        stall_seconds=policy['run_job'].get('test_stall_seconds'))
     output = security.redact(result['stdout'] + result['stderr'])
     log_path.write_text(f'$ {security.redact(command)}\nexit={result["returncode"]} timed_out={result["timed_out"]} '
                         f'stalled={result.get("stalled")}\n{output}')
@@ -95,8 +112,44 @@ def run_tests(policy, cwd, command, timeout, log_path, runner=td.run_bounded):
             'tail': output[-policy['run_job'].get('test_output_tail_chars', 4000):]}
 
 
+def _is_bytecode_cache(path):
+    """A CPython 3 cache file: .pyc/.pyo directly inside a __pycache__ directory. A .pyc anywhere else can be
+    imported as a sourceless module, so it is a real change."""
+    parts = path.split('/')
+    return len(parts) >= 2 and parts[-2] == '__pycache__' and parts[-1].endswith(('.pyc', '.pyo'))
+
+
+def remove_bytecode_caches(cwd):
+    """Delete every untracked .pyc/.pyo and any symlinked __pycache__ the worker left, including gitignored ones
+    (git status does not list those), so tests rebuild caches from the reviewed source and never run planted
+    bytecode. The walk holds directory descriptors and never follows links, and each deletion is relative to the
+    descriptor, so a path swapped mid-walk (e.g. by a leftover worker process) cannot redirect it outside the tree.
+    A link is removed itself, never its target."""
+    tracked = set(filter(None, _git(cwd, 'ls-tree', '-r', '--name-only', '-z', 'HEAD').stdout.split('\0')))
+    for folder, dirs, files, dir_fd in os.fwalk(str(cwd), follow_symlinks=False):
+        rel_dir = os.path.relpath(folder, str(cwd))
+        if rel_dir == '.' and '.git' in dirs:
+            dirs.remove('.git')
+        # A symlinked __pycache__ is never descended into; it may be listed with the dirs or the files.
+        # Anything tracked at HEAD is baseline content and is never removed.
+        for name in list(dirs):
+            rel = name if rel_dir == '.' else f'{rel_dir}/{name}'.replace(os.sep, '/')
+            if name == '__pycache__' and stat.S_ISLNK(os.lstat(name, dir_fd=dir_fd).st_mode):
+                dirs.remove(name)
+                if rel not in tracked:
+                    os.unlink(name, dir_fd=dir_fd)
+        for name in files:
+            rel = name if rel_dir == '.' else f'{rel_dir}/{name}'.replace(os.sep, '/')
+            if rel in tracked:
+                continue
+            linked = stat.S_ISLNK(os.lstat(name, dir_fd=dir_fd).st_mode)
+            if (name == '__pycache__' and linked) or name.endswith(('.pyc', '.pyo')):
+                os.unlink(name, dir_fd=dir_fd)
+
+
 def changed_paths(cwd):
-    """Paths with any change vs HEAD (tracked or untracked), from porcelain -z."""
+    """Paths with any change vs HEAD (tracked or untracked), from porcelain -z. Untracked interpreter caches are
+    left out (counting them caused spurious out-of-scope failures); tracked ones still count."""
     out = _git(cwd, 'status', '--porcelain', '-z', '--untracked-files=all').stdout
     entries, paths, skip = out.split('\0'), set(), False
     for entry in entries:
@@ -106,7 +159,9 @@ def changed_paths(cwd):
             continue
         if len(entry) < 4:
             continue
-        paths.add(entry[3:])
+        if not (entry.startswith('?? ') and _is_bytecode_cache(entry[3:])
+                and not os.path.islink(os.path.join(cwd, entry[3:]))):
+            paths.add(entry[3:])
         if entry[0] in 'RC':
             skip = True  # next entry is the rename source
     return paths
@@ -167,7 +222,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
     test_cmd = test_cmd if test_cmd is not None else settings.get('test_cmd')
     test_timeout = settings.get('test_timeout_seconds', policy['run_job']['test_timeout_seconds'])
     base_ref = base or 'HEAD'
-    base_sha = _git(repo, 'rev-parse', '-q', '--verify', base_ref + '^{commit}').stdout.strip()
+    base_sha = resolve_base(repo, base_ref)
     if not base_sha:
         raise Refused(f'base {base_ref!r} is not a commit')
     slug = slugify(task_path.stem)
@@ -314,6 +369,7 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
             summary['attempts'].append({'attempt': cycle, 'worker': selected, 'ok': False,
                                         'leak_check': (result.get('leak_check') or {}).get('status')})
             return
+        remove_bytecode_caches(worktree)
         worker_paths = changed_paths(worktree) - test_artifacts
         if required:
             worker_paths.discard(stackwich.REPORT_PATH)
@@ -519,8 +575,10 @@ def cleanup(older_than, dry_run=False, policy=None, now=None):
         branch = _git(worktree, 'symbolic-ref', '-q', '--short', 'HEAD').stdout.strip()
         entry = {'worktree': str(worktree), 'branch': branch, 'branch_action': 'kept'}
         if not dry_run:
-            # --force only discards the job's own recorded test artifacts (checked above).
-            _git(repo, 'worktree', 'remove', *(['--force'] if pending else []), str(worktree), check=True)
+            # --force only discards the job's own recorded test artifacts and untracked interpreter caches
+            # (changed_paths hides those, so git still sees them as dirty); both were checked above.
+            force = bool(pending) or _has_changes(worktree)
+            _git(repo, 'worktree', 'remove', *(['--force'] if force else []), str(worktree), check=True)
             base_sha = job.get('base_sha')
             head = _git(repo, 'rev-parse', '-q', '--verify', f'refs/heads/{branch}').stdout.strip() if branch else ''
             if branch.startswith(policy['run_job'].get('branch_prefix', 'router/')) and base_sha and head == base_sha:

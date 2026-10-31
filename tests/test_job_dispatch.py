@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -147,7 +148,7 @@ class JobTests(unittest.TestCase):
         self.worker("open('out.txt','w').write('ok\\n')")
         result = self.job(test_cmd='echo Zephyrquill > report.txt; mkdir -p __pycache__; echo b > __pycache__/x.pyc')
         self.assertTrue(result['ok'], result)
-        self.assertEqual(result['excluded_test_artifacts'], ['__pycache__/x.pyc', 'report.txt'])
+        self.assertEqual(result['excluded_test_artifacts'], ['report.txt'])  # bytecode caches are ignored outright
         files = git(self.repo, 'show', '--name-only', '--format=', result['commit']).split()
         self.assertEqual(files, ['out.txt'])
         self.assertEqual(result['leak_check']['status'], 'clean')
@@ -181,6 +182,112 @@ class JobTests(unittest.TestCase):
             self.job(branch='bad..name')
         with self.assertRaisesRegex(jd.Refused, 'not a git'):
             jd.run_job(self.base, self.task, policy=self.policy)
+
+    def test_branch_beats_same_named_tag(self):
+        branch = git(self.repo, 'symbolic-ref', '--short', 'HEAD')
+        older = git(self.repo, 'rev-parse', 'HEAD')
+        (self.repo / 'f.txt').write_text('x')
+        git(self.repo, 'add', 'f.txt')
+        git(self.repo, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'two')
+        newer = git(self.repo, 'rev-parse', 'HEAD')
+        git(self.repo, '-c', 'tag.gpgsign=false', 'tag', branch, older)  # a tag named like the branch, on the older commit
+        self.assertEqual(git(self.repo, 'rev-parse', branch), older, 'git itself prefers the tag')
+        self.assertEqual(jd.resolve_base(self.repo, branch), newer)
+        self.assertEqual(jd.resolve_base(self.repo, 'HEAD'), newer)
+        self.assertEqual(jd.resolve_base(self.repo, older[:10]), older)
+        self.assertEqual(jd.resolve_base(self.repo, 'no-such-ref'), '')
+        self.worker("open('out.txt','w').write('hi\\n')")
+        self.assertEqual(self.job(base=branch, test_cmd='true')['base_sha'], newer)
+
+    def test_tag_only_base_still_resolves(self):
+        head = git(self.repo, 'rev-parse', 'HEAD')
+        git(self.repo, '-c', 'tag.gpgsign=false', 'tag', 'v1', head)
+        self.assertEqual(jd.resolve_base(self.repo, 'v1'), head)
+
+    def test_changed_paths_ignores_only_untracked_interpreter_caches(self):
+        (self.repo / 'a.py').write_text('x = 1\n')
+        (self.repo / 'pkg' / '__pycache__').mkdir(parents=True)
+        (self.repo / 'pkg' / '__pycache__' / 'm.cpython-312.pyc').write_bytes(b'\0')
+        (self.repo / 'stray.pyc').write_bytes(b'\0')  # importable as a sourceless module: a real change
+        (self.repo / 'x__pycache__').mkdir()
+        (self.repo / 'x__pycache__' / 'run.sh').write_text('true\n')  # a look-alike directory is not a cache
+        (self.repo / '__pycache__').mkdir()
+        (self.repo / '__pycache__' / 'notes.txt').write_text('n\n')  # only .pyc/.pyo files are caches
+        self.assertEqual(jd.changed_paths(self.repo),
+                         {'a.py', 'local-notes.txt', 'stray.pyc', 'x__pycache__/run.sh', '__pycache__/notes.txt'})
+
+    def test_tracked_cache_changes_still_count(self):
+        cache = self.repo / '__pycache__' / 'kept.cpython-312.pyc'
+        cache.parent.mkdir()
+        cache.write_bytes(b'\0')
+        git(self.repo, 'add', '-f', str(cache))
+        git(self.repo, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'tracked cache')
+        cache.write_bytes(b'\1')
+        self.assertIn('__pycache__/kept.cpython-312.pyc', jd.changed_paths(self.repo))
+
+    def test_cache_removal_covers_ignored_symlinked_and_stray_bytecode(self):
+        (self.repo / '.gitignore').write_text('__pycache__/\n*.pyc\n')
+        outside = self.base / 'outside'
+        outside.mkdir()
+        (outside / 'target.pyc').write_bytes(b'keep')
+        (self.repo / 'pkg' / '__pycache__').mkdir(parents=True)
+        ignored = self.repo / 'pkg' / '__pycache__' / 'm.cpython-312.pyc'
+        ignored.write_bytes(b'planted')
+        link = self.repo / 'pkg' / '__pycache__' / 'n.cpython-312.pyc'
+        link.symlink_to(outside / 'target.pyc')
+        (self.repo / 'lib').mkdir()
+        (self.repo / 'lib' / '__pycache__').symlink_to(outside, target_is_directory=True)
+        stray = self.repo / 'stray.pyc'
+        stray.write_bytes(b'planted')
+        jd.remove_bytecode_caches(self.repo)
+        for path in (ignored, link, self.repo / 'lib' / '__pycache__', stray):
+            self.assertFalse(os.path.lexists(path), path)
+        self.assertEqual((outside / 'target.pyc').read_bytes(), b'keep', 'a link target is never touched')
+        self.assertTrue((self.repo / '.gitignore').exists())
+
+    def test_tests_use_a_fresh_pycache_prefix_outside_the_worktree(self):
+        seen = {}
+
+        def runner(argv, cwd, timeout, grace, env=None, stall_seconds=None):
+            seen['prefix'] = env['PYTHONPYCACHEPREFIX']
+            seen['existed'] = Path(seen['prefix']).is_dir()
+            return {'stdout': '', 'stderr': '', 'returncode': 0, 'timed_out': False, 'elapsed_seconds': 0}
+
+        result = jd.run_tests(self.policy, self.repo, 'true', 5, self.base / 'tests.log', runner=runner)
+        self.assertEqual(result['status'], 'passed')
+        self.assertTrue(seen['existed'])
+        self.assertNotIn(str(self.repo.resolve()), str(Path(seen['prefix']).resolve()))
+        self.assertFalse(Path(seen['prefix']).exists(), 'the prefix is removed after the run')
+
+    def test_tracked_cache_symlinks_are_baseline_and_kept(self):
+        (self.base / 'cache-target').mkdir()
+        (self.repo / 'lib').mkdir()
+        (self.repo / 'lib' / '__pycache__').symlink_to(self.base / 'cache-target', target_is_directory=True)
+        (self.repo / '__pycache__').symlink_to(self.base / 'missing-target')  # dangling, listed with the files
+        git(self.repo, 'add', 'lib/__pycache__', '__pycache__')
+        git(self.repo, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'tracked links')
+        jd.remove_bytecode_caches(self.repo)
+        self.assertTrue((self.repo / 'lib' / '__pycache__').is_symlink())
+        self.assertTrue((self.repo / '__pycache__').is_symlink())
+        self.worker("open('out.txt','w').write('hi\\n')")
+        result = self.job(test_cmd='true')
+        self.assertTrue(result['ok'], result)
+        files = git(self.repo, 'show', '--name-only', '--format=', result['commit']).split()
+        self.assertEqual(files, ['out.txt'], 'baseline cache links are not committed as worker changes')
+
+    def test_symlinked_cache_is_never_hidden_from_changed_paths(self):
+        (self.base / 'elsewhere.pyc').write_bytes(b'x')
+        (self.repo / '__pycache__').mkdir()
+        (self.repo / '__pycache__' / 'm.cpython-312.pyc').symlink_to(self.base / 'elsewhere.pyc')
+        self.assertIn('__pycache__/m.cpython-312.pyc', jd.changed_paths(self.repo))
+
+    def test_worker_left_caches_are_removed_before_tests(self):
+        self.worker("import os; os.makedirs('__pycache__', exist_ok=True); open('__pycache__/out.cpython-312.pyc','wb').write(b'planted'); "
+                    "open('out.txt','w').write('hi\\n')")
+        result = self.job(test_cmd='test ! -e __pycache__/out.cpython-312.pyc')
+        self.assertTrue(result['ok'], result)
+        files = git(self.repo, 'show', '--name-only', '--format=', result['commit']).split()
+        self.assertEqual(files, ['out.txt'])
 
     def test_same_second_jobs_get_distinct_worktrees(self):
         self.worker("open('out.txt','w').write('hi\\n')")
@@ -246,6 +353,14 @@ class JobTests(unittest.TestCase):
         self.assertEqual(done['excluded_test_artifacts'], ['artifact.log'])
         report = jd.cleanup('0m', policy=self.policy)
         self.assertEqual(len(report['removed']), 1)
+        self.assertFalse(Path(done['worktree']).exists())
+
+    def test_cleanup_removes_worktree_with_only_untracked_bytecode(self):
+        self.worker("open('out.txt','w').write('hi\\n')")
+        done = self.job(test_cmd='mkdir -p __pycache__; echo b > __pycache__/x.pyc')
+        self.assertEqual(done['excluded_test_artifacts'], [])
+        report = jd.cleanup('0m', policy=self.policy)
+        self.assertEqual(len(report['removed']), 1, report)
         self.assertFalse(Path(done['worktree']).exists())
 
     def test_cleanup_skips_dirty_worktree(self):
