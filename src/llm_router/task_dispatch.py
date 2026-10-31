@@ -303,6 +303,29 @@ def pacing(policy, meters, worker, size):
     return None, None
 
 
+def concurrency_cap(policy, worker):
+    """Max simultaneous runs of worker across all router processes, or None for uncapped."""
+    return (policy['run_task'].get('concurrency') or {}).get(worker)
+
+
+def acquire_slot(policy, worker):
+    """('uncapped', None), ('held', handle) or ('full', None); closing handle frees the slot."""
+    cap = concurrency_cap(policy, worker)
+    if cap is None:
+        return 'uncapped', None
+    slot_dir = config.policy_path(policy, 'run_task', 'slot_dir', 'state/slots')
+    slot_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(cap):
+        handle = (slot_dir / f'{worker}.{index}.lock').open('a')
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)  # held until close or process exit
+        except BlockingIOError:
+            handle.close()
+            continue
+        return 'held', handle
+    return 'full', None
+
+
 def check_prompt_size(policy, prompt):
     limit = policy['run_task'].get('max_prompt_chars', 100000)
     if type(limit) is not int or limit < 0:
@@ -312,10 +335,25 @@ def check_prompt_size(policy, prompt):
                       f'run_task.max_prompt_chars={limit}; refusing worker launch')
 
 
-def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select=None,
-             runner=run_bounded, draft=developer_draft, policy=None, output_root=None,
-             extra_prompt=None, stamp=None, meter=None, stackwich_cycle=1, _claude_pinned=False):
+def _release(slots):
+    while slots:
+        slots.pop().close()
+
+
+def run_task(*args, **kwargs):
+    slots = []
+    try:
+        return _run_task(*args, _slots=slots, **kwargs)
+    finally:
+        _release(slots)  # a worker slot never outlives its run, even when the run raises
+
+
+def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select=None,
+              runner=run_bounded, draft=developer_draft, policy=None, output_root=None,
+              extra_prompt=None, stamp=None, meter=None, stackwich_cycle=1, _claude_pinned=False,
+              _slots=None):
     from . import selection as selection_module
+    _slots = [] if _slots is None else _slots
     policy = policy or config.load_policy()
     injected_select = select is not None
     select = select or (lambda chars, **kw: selection_module.select(chars, policy=policy, **kw))
@@ -384,8 +422,14 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
     _, block_log = worker_environment(policy)
     blocks_before = security.count_lines(block_log)
     for attempt, name in enumerate(order[:2]):  # the chosen worker plus one failover
+        _release(_slots)  # the previous attempt's slot
+        state, handle = acquire_slot(policy, name)
+        _slots += [handle] if handle else []
+        if state == 'full':
+            summary['warnings'].append(f'{name} at its concurrency cap ({concurrency_cap(policy, name)}): skipped')
+            continue
         # A failover from a Stackwich-required attempt keeps the requirement: only a Stackwich-capable worker.
-        if (attempt and summary['attempts'][-1]['stackwich']['status'] == 'required' and
+        if (summary['attempts'] and summary['attempts'][-1]['stackwich']['status'] == 'required' and
                 stackwich.status(policy, name) != 'required'):
             summary['warnings'].append(f'failover skipped: {name} cannot run Stackwich')
             break
@@ -509,6 +553,9 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
         if (record['ok'] or record.get('success_check') == 'refusal' or
                 (protocol == 'required' and not (name == 'claude' and record.get('quota_error')))):
             break
+    _release(_slots)
+    if not summary['attempts']:
+        raise Refused('every eligible worker is at its concurrency cap: ' + '; '.join(summary['warnings']))
     head_after = _git(cwd, 'rev-parse', '--verify', '-q', 'HEAD').stdout.strip() or None
     if head_after != head_before:
         summary['warnings'].append('target HEAD changed during the run; review it (router never commits)')

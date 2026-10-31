@@ -129,6 +129,7 @@ def materialise_workers(policy):
                                         ('cwd', 'cwd', '.'), ('env', 'env', {}),
                                         ('timeout_seconds', 'timeouts_seconds', 900),
                                         ('stall_seconds', 'stall_seconds', 300),
+                                        ('concurrency', 'concurrency', None),
                                         ('success', 'success', {}), ('stackwich', 'stackwich', {})]:
             run.setdefault(internal, {})[name] = opts.get(field, run.get(internal, {}).get(name, default))
         if 'quota' in opts:
@@ -148,6 +149,16 @@ def materialise_workers(policy):
         if not isinstance(options, dict) or set(options) - {'enabled', 'supported'} or any(
                 type(value) is not bool for value in options.values()):
             raise ConfigError('stackwich requires only boolean enabled and supported options')
+    caps = run.setdefault('concurrency', {})
+    if not isinstance(caps, dict):
+        raise ConfigError('run_task.concurrency must be an object')
+    for name, cap in caps.items():
+        if name.startswith('_'):
+            continue
+        if name not in run['commands'] and name != 'developer':
+            raise ConfigError('run_task.concurrency names unknown worker')
+        if cap is not None and (type(cap) is not int or not 1 <= cap <= 64):
+            raise ConfigError(f'{name}: concurrency must be null or an integer 1-64')
     for name in list(run['commands']) + ['developer']:
         if not name.startswith('_'):
             stackwich[name] = dict({'enabled': False, 'supported': False}, **stackwich.get(name, {}))

@@ -72,6 +72,9 @@ class MergeAndValidateTests(unittest.TestCase):
                ({'worker_order': ['nope']}, 'unknown workers'),
                ({'worker_order': ['codex', 'claude'], 'never': ['claude']}, 'never'),
                ({'timezone': 'Mars/Olympus'}, 'timezone'),
+               ({'run_task': {'concurrency': {'nope': 1}}}, 'concurrency names unknown'),
+               ({'run_task': {'concurrency': {'developer': 0}}}, 'concurrency must be'),
+               ({'run_task': {'concurrency': {'codex': True}}}, 'concurrency must be'),
                ({'worker_order': ['codex'], 'quota': {'codex': {'freshness_seconds': 10}}}, 'freshness')]
         for data, message in bad:
             with self.subTest(data=data):
