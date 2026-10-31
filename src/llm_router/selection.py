@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import math
 import re
 
-from . import config, quota_service
+from . import config, cooldown, quota_service
 
 NAME = re.compile(r'[a-z][a-z0-9_-]{0,31}')
 
@@ -113,11 +113,15 @@ def developer_ready(policy, task_chars):
 
 
 def select(task_chars, policy=None, cached_only=False, now=None, io=None, consult_all=False,
-           consult_cursor=False, threshold_overrides=None):
-    """Return {'worker', 'reason', 'eligible', 'meters', 'reasons', 'sources', 'versions', ...}."""
+           consult_cursor=False, threshold_overrides=None, cooldowns=None):
+    """Return {'worker', 'reason', 'eligible', 'meters', 'reasons', 'sources', 'versions', ...}.
+
+    Workers cooling down after a quota error (see cooldown.py) are skipped until their reset.
+    """
     policy = policy or config.load_policy()
     clock_injected = now is not None
     now = now or datetime.now(timezone.utc)
+    cooled = cooldown.active(now, cooldowns)
     io = io if io is not None else quota_service.default_io(policy)
     never = set(policy.get('never') or [])
     unmetered = set(policy.get('unmetered_workers') or [])
@@ -129,6 +133,9 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
             continue
         if worker in (policy.get('ineligible') or {}):
             reasons[worker] = 'ineligible'
+            continue
+        if worker in cooled:
+            reasons[worker] = 'cooldown_until_' + cooled[worker].isoformat()
             continue
         if worker == 'developer':
             ok = developer_ready(policy, task_chars)
@@ -167,7 +174,8 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
             'hint': None if policy['worker_order'] else 'run llm-router init',
             'eligible': eligible, 'meters': meters, 'reasons': reasons, 'sources': sources,
             'cli_versions': versions, 'version_warnings': warnings,
-            'never': sorted(never), 'ineligible': policy.get('ineligible') or {}}
+            'never': sorted(never), 'ineligible': policy.get('ineligible') or {},
+            'cooldowns': {name: until.isoformat() for name, until in cooled.items()}}
 
 
 def read_meter(policy, worker, now=None, io=None):

@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.request
 
-from . import claude_handoff, config, security, stackwich
+from . import claude_handoff, config, cooldown, security, stackwich
 
 
 def coding_workers(policy):
@@ -503,6 +503,10 @@ def run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select
                           timed_out=result['timed_out'], returncode=result['returncode'],
                           quota_error=quota, elapsed_seconds=result['elapsed_seconds'],
                           stalled=result.get('stalled', False))
+            if quota:
+                until = cooldown.record(name)
+                record['cooldown_until'] = until.isoformat()
+                summary['warnings'].append(f'{name} quota error: cooling down until {until.isoformat()}')
         record['output_path'] = str(path)
         summary['attempts'].append(record)
         summary.update(worker=name, ok=record['ok'], output_path=str(path), stackwich=record['stackwich'])

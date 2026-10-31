@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from helpers import load_policy, TERM
-from llm_router import task_dispatch as td
+from llm_router import cooldown, task_dispatch as td
 
 MARK = 'router-dispatch-timeout-marker'
 
@@ -92,6 +92,9 @@ class TaskDispatchTests(unittest.TestCase):
         self.assertEqual([a['worker'] for a in result['attempts']], ['codex', 'grok-build'])
         self.assertTrue(result['attempts'][0]['quota_error'])
         self.assertIn('--cwd', calls[1])
+        self.assertIn('codex', cooldown.active())
+        self.assertEqual(result['attempts'][0]['cooldown_until'], cooldown.active()['codex'].isoformat())
+        self.assertNotIn('cooldown_until', result['attempts'][1])
 
     def test_only_one_failover(self):
         result = self.run_task(select=self.selection(['codex', 'grok-build', 'cursor']),
