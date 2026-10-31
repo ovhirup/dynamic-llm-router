@@ -80,3 +80,9 @@ Learns from its own outcomes: feedback loop updates worker scorecards; adaptive 
 exploration with a safety floor); drift detection when a worker's quality drops; every weight change validated by
 the harness before applying; human-readable change log in the Obsidian vault. **No local model fine-tuning**
 (16 GB Mac, and frontier models outpace it). Related: #49 #56 #53-#55.
+
+## (h) External tool integrations (plugins)
+Once public, DLR lets users plug in productivity tools over MCP via a simple plugin manifest: name, capabilities
+(input source / context / notifier / output sink), and how to call it. Reference plugins: Hark (voice dictation and
+meeting transcripts become task files, searchable via hark-mcp; #19), the Obsidian vault (#50), notifiers
+(Slack/email summaries). Per-plugin opt-in consent and permissions; no secrets in logs.
