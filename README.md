@@ -15,6 +15,8 @@ without babysitting terminals, and without ever leaking a private repo name or k
 > Status: alpha (0.4). macOS and Linux. Python 3.10+, no third-party dependencies.
 > Works with Codex, Grok, Cursor and Claude Code CLIs; not affiliated with or endorsed by any of them.
 
+> **Routing strategy:** see [docs/ROUTING_STRATEGY.md](docs/ROUTING_STRATEGY.md), the master architecture (worker order, selection, parallel dispatch, switching, Router Brain).
+
 ![Architecture](docs/architecture.png)
 
 ## What it does
