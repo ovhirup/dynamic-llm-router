@@ -60,6 +60,21 @@ def build_parser():
     clean.add_argument('--older-than', required=True, help='age like 30m, 12h or 7d')
     clean.add_argument('--dry-run', action='store_true')
 
+    evaluate = commands.add_parser('eval', help='Evaluation harness: replay past jobs and A/B two routing policies')
+    eval_cmds = evaluate.add_subparsers(dest='eval_command', required=True)
+    capture = eval_cmds.add_parser('capture', help='Build the replay corpus (JSONL) from run-job logs')
+    capture.add_argument('--jobs-dir', help='job logs to read (default: the jobs_dir)')
+    capture.add_argument('--out', help='corpus file (default: <state>/logs/eval/corpus.jsonl)')
+    capture.add_argument('--limit', type=int, help='keep only the newest N jobs')
+    replay = eval_cmds.add_parser('run', help='Replay the corpus under two policies and write the A/B report')
+    replay.add_argument('--policies', required=True, help='JSON file: [baseline spec, candidate spec]')
+    replay.add_argument('--corpus', help='corpus file (default: <state>/logs/eval/corpus.jsonl)')
+    replay.add_argument('--mode', choices=('offline', 'live'), default='offline')
+    replay.add_argument('--fake-workers', help='offline: JSON file of per-worker fake profiles')
+    replay.add_argument('--no-recorded', action='store_true',
+                        help='offline: never replay recorded outcomes, use fake profiles for every worker')
+    replay.add_argument('--yes', action='store_true', help='live: confirm running real workers')
+
     quota = commands.add_parser('quota', help='Quota meter refresh')
     quota_cmds = quota.add_subparsers(dest='quota_command', required=True)
     refresh = quota_cmds.add_parser('refresh')
@@ -283,6 +298,24 @@ def main(argv=None):
             return 3
         _print(result)
         return 1 if args.command == 'ci' and result.get('status') in ('failed', 'error') else 0
+    if args.command == 'eval':
+        from . import eval_corpus, eval_harness
+        if args.eval_command == 'capture':
+            _print(eval_corpus.capture(policy, source=args.jobs_dir, out=args.out, limit=args.limit))
+            return 0
+        try:
+            specs = json.loads(Path(args.policies).read_text())
+            profiles = json.loads(Path(args.fake_workers).read_text()) if args.fake_workers else {}
+            cases = eval_corpus.load(args.corpus or eval_corpus.corpus_path(policy))
+            report = eval_harness.run(cases, specs, mode=args.mode, profiles=profiles, policy=policy,
+                                      confirm=args.yes, use_recorded=not args.no_recorded)
+        except (eval_harness.Refused, OSError, json.JSONDecodeError) as refusal:
+            print(json.dumps({'ok': False, 'refused': str(refusal)}))
+            return 3
+        stamp = config.now_local(policy).strftime('%Y%m%d-%H%M%S')
+        _print({'gate': report['gate'], 'metrics': {name: entry['metrics'] for name, entry in report['policies'].items()},
+                'skipped': len(report['skipped']), 'report': eval_harness.write_report(report, policy, stamp)})
+        return 0 if report['gate']['adopt'] else 1
     if args.command in ('quota', 'status', 'alerts', 'install-agent', 'uninstall-agent'):
         from . import alerts as alerts_module, quota_service
         if args.command == 'quota':

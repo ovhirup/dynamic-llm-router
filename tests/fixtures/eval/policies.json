@@ -1,0 +1,2 @@
+[{"name": "baseline", "worker_order": ["grok-build", "codex"]},
+ {"name": "cursor-first", "worker_order": ["cursor", "codex"], "never": ["grok-build"]}]

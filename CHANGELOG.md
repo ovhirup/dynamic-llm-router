@@ -5,6 +5,12 @@ versions follow [SemVer](https://semver.org/) (0.x: minor versions may break con
 
 ## [Unreleased]
 
+- Add the evaluation harness (#61): `llm-router eval capture` builds a redacted replay corpus from
+  run-job logs (#62); a scoring rubric covers tests, diff scope, reviewer score, tokens, quota % and time,
+  with an adoption gate that never adopts on a tie or a regression (#63); `llm-router eval run` replays
+  the corpus under a baseline and a candidate policy, offline with fake workers or live (`--yes`), and
+  writes a JSON + Markdown A/B report (#64). See `docs/evaluation.md`.
+
 - Refuse worker launches when the assembled prompt exceeds `run_task.max_prompt_chars` (default 100000),
   including brief, router text, Stackwich instructions and continuation items.
 

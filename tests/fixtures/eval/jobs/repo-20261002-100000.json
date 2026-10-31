@@ -1,0 +1,9 @@
+{"job_id": "repo-20261002-100000", "repo": "/tmp/eval-repo", "task": "fix-bug.md",
+ "base": "HEAD", "base_sha": "3333333333333333333333333333333333333333", "branch": "router/fix-bug-20261002-100000",
+ "size": "full", "started_at": "2026-10-02T10:00:00+01:00", "finished_at": null,
+ "ok": false, "status": "failed", "commit": null, "diff_stat": "", "tests_status": "failed",
+ "test_command": "make test",
+ "attempts": [{"attempt": 1, "worker": "grok-build", "ok": true, "changed": true, "tests": "failed",
+               "runs": [{"worker": "grok-build", "ok": true, "elapsed_seconds": 400.0},
+                        {"worker": "grok-build", "ok": true, "elapsed_seconds": 100.5}]}],
+ "workers": ["grok-build"], "handoffs": [{"path": "HANDOFF_PLACEHOLDER", "worker": "grok-build"}], "warnings": []}
