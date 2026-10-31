@@ -83,6 +83,14 @@ def build_parser():
     unit_queue.add_argument('--batch', required=True)
     unit_qstatus = unit_cmds.add_parser('queue-status', help='List merge-queue entries and their gate results')
     unit_qstatus.add_argument('--batch')
+    unit_run = unit_cmds.add_parser('run', help='Assign units, create worktrees, run them in DAG waves and gate '
+                                    'finished units in the merge queue; never pushes or merges')
+    unit_run.add_argument('--repo', required=True)
+    unit_run.add_argument('--units-file', required=True,
+                          help='unit list or {"units": [...], "assign": {...}}; without an assignment, '
+                               'workers are picked from current meter evidence')
+    unit_run.add_argument('--base', default='HEAD')
+    unit_run.add_argument('--assign-file', help='JSON {unit id: worker}; overrides any inline assign')
 
     evaluate = commands.add_parser('eval', help='Evaluation harness: replay past jobs and A/B two routing policies')
     eval_cmds = evaluate.add_subparsers(dest='eval_command', required=True)
@@ -393,6 +401,10 @@ def main(argv=None):
             elif args.units_command == 'create':
                 units, assignment = uw.load_units_file(args.units_file)
                 result = uw.create_batch(args.repo, units, assignment, base=args.base, policy=policy)
+            elif args.units_command == 'run':
+                from . import wave_runner
+                units, assignment = wave_runner.load_run_files(args.units_file, args.assign_file)
+                result = wave_runner.run_batch(args.repo, units, assignment, base=args.base, policy=policy)
             elif args.units_command == 'list':
                 result = uw.list_batches(policy=policy, repo=args.repo)
             else:
