@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import math
 import re
 
-from . import config, quota_service
+from . import claude_account, config, quota_service
 
 NAME = re.compile(r'[a-z][a-z0-9_-]{0,31}')
 
@@ -113,7 +113,7 @@ def developer_ready(policy, task_chars):
 
 
 def select(task_chars, policy=None, cached_only=False, now=None, io=None, consult_all=False,
-           consult_cursor=False, threshold_overrides=None):
+           consult_cursor=False, threshold_overrides=None, claude_profile_loader=None):
     """Return {'worker', 'reason', 'eligible', 'meters', 'reasons', 'sources', 'versions', ...}."""
     policy = policy or config.load_policy()
     clock_injected = now is not None
@@ -130,6 +130,11 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
         if worker in (policy.get('ineligible') or {}):
             reasons[worker] = 'ineligible'
             continue
+        if worker == 'claude':
+            account = claude_account.check(policy, claude_profile_loader)
+            if account is not None and account != 'personal':
+                reasons[worker] = f'claude_account_{account}'
+                continue
         if worker == 'developer':
             ok = developer_ready(policy, task_chars)
             reasons[worker] = 'draft_fallback' if ok else 'developer_disabled_or_task_too_large'
