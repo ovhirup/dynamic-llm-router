@@ -44,6 +44,7 @@ Grok Bot is the orchestrator: it classifies and splits tasks, dispatches, review
 - Jobs are decomposed into a task DAG of independent units with explicit file scopes (#36). Units run in separate worktrees and are merged by the orchestrator.
 - Task class to worker matching: feature/bugfix go to strong workers; mechanical work goes to Codex, Cursor or local; drafts go to local; review goes to Grok Bot or Claude. A `design` class with design plugins comes later (#90).
 - A worker that is ahead of its weekly pace drops a rank rather than being banned.
+- **Grok Bot is not in the parallel pool.** Only the workers (Claude, Codex, Grok Build, Cursor, local) are dispatched in parallel. Grok Bot orchestrates, merges and reviews, and is selected as a worker for a unit only when no worker is both capable of that unit and has enough tokens left. When several units have no eligible worker, Grok Bot takes them one at a time.
 
 ```mermaid
 flowchart TB
@@ -51,7 +52,8 @@ flowchart TB
   D --> U1[unit A -> Claude]
   D --> U2[unit B -> Codex]
   D --> U3[unit C -> local]
-  U1 & U2 & U3 --> R[Orchestrator merges + reviews]
+  D -. no capable worker with tokens .-> G[unit D -> Grok Bot fallback]
+  U1 & U2 & U3 & G --> R[Orchestrator merges + reviews]
 ```
 
 ## 4. Token optimisation [Planned #91, #92]
