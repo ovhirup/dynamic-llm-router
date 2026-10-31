@@ -91,8 +91,43 @@ def load_user_config(path=None):
     return data
 
 
+TASK_CLASSES = ('feature', 'bugfix', 'review', 'mechanical', 'draft')
+ORCHESTRATOR = 'grok-bot'  # hands the job back to Grok Bot; never run, never metered, always last
+
+
 def known_workers(policy):
-    return set(k for k in policy['run_task']['commands'] if not k.startswith('_')) | {'developer'}
+    return set(k for k in policy['run_task']['commands'] if not k.startswith('_')) | {'developer', ORCHESTRATOR}
+
+
+def worker_order(policy, task_class=None):
+    """class_order.<task_class> (grok-bot appended last) when a class is given, else flat worker_order."""
+    if task_class is None:
+        return list(policy['worker_order'])
+    if task_class not in TASK_CLASSES:
+        raise ConfigError(f'unknown task class {task_class!r}: use one of {", ".join(TASK_CLASSES)}')
+    order = [w for w in (policy.get('class_order') or {}).get(task_class) or policy['worker_order']
+             if w != ORCHESTRATOR]
+    return order + [ORCHESTRATOR]
+
+
+def _validate_order(policy, label, order):
+    if not isinstance(order, list) or not all(isinstance(n, str) for n in order) or len(set(order)) != len(order):
+        raise ConfigError(f'{label} must be a list of unique worker names')
+    unknown = [name for name in order if name not in known_workers(policy)]
+    if unknown:
+        raise ConfigError(f'{label} names unknown workers: {unknown} (add run_task.commands entries)')
+    banned = [name for name in order if blocked_worker(policy, name)]
+    if banned:
+        raise ConfigError(f'{label} contains workers listed in never: {banned}')
+    if label.startswith('class_order.') and ORCHESTRATOR in order[:-1]:
+        raise ConfigError(f'{label}: {ORCHESTRATOR} is the orchestrator fallback and must be last')
+    for name in order:
+        if name in ('developer', ORCHESTRATOR):
+            continue
+        quota = (policy.get('quota') or {}).get(name)
+        if quota is None and name not in policy.get('unmetered_workers', []):
+            raise ConfigError(f'{name}: no quota observer configured; add quota.{name} or list it in '
+                              'unmetered_workers (unmetered workers are never paced)')
 
 
 def blocked_worker(policy, name):
@@ -226,19 +261,20 @@ def materialise_workers(policy):
 
 def validate(policy):
     from . import quota_service, security
-    order = policy.get('worker_order')
     materialise_workers(policy)
-    if not isinstance(order, list) or not all(isinstance(n, str) for n in order) or len(set(order)) != len(order):
-        raise ConfigError('worker_order must be a list of unique worker names')
-    unknown = [name for name in order if name not in known_workers(policy)]
-    if unknown:
-        raise ConfigError(f'worker_order names unknown workers: {unknown} (add run_task.commands entries)')
     never = policy.get('never') or []
     if not isinstance(never, list) or not all(isinstance(n, str) for n in never):
         raise ConfigError('never must be a list of worker names')
-    banned = [name for name in order if blocked_worker(policy, name)]
-    if banned:
-        raise ConfigError(f'worker_order contains workers listed in never: {banned}')
+    _validate_order(policy, 'worker_order', policy.get('worker_order'))
+    classes = policy.get('class_order') or {}
+    if not isinstance(classes, dict):
+        raise ConfigError('class_order must be an object of class -> worker list')
+    for name, order in classes.items():
+        if name.startswith('_'):
+            continue
+        if name not in TASK_CLASSES:
+            raise ConfigError(f'class_order: unknown class {name!r} (use {", ".join(TASK_CLASSES)})')
+        _validate_order(policy, f'class_order.{name}', order)
     commands = {k: v for k, v in policy['run_task']['commands'].items() if not k.startswith('_')}
     try:
         security.lint_commands(commands, prompt_delivery=policy['run_task'].get('prompt_delivery', {}))
@@ -247,13 +283,6 @@ def validate(policy):
     for name, argv in commands.items():
         if not argv[0] or (not Path(argv[0]).is_absolute() and ('/' in argv[0] or '\\' in argv[0])):
             raise ConfigError(f'{name}: executable must be a bare name or absolute path')
-    for name in order:
-        if name == 'developer':
-            continue
-        quota = (policy.get('quota') or {}).get(name)
-        if quota is None and name not in policy.get('unmetered_workers', []):
-            raise ConfigError(f'{name}: no quota observer configured; add quota.{name} or list it in '
-                              'unmetered_workers (unmetered workers are never paced)')
     tz(policy)
     quota_service.validate(policy)
     return policy

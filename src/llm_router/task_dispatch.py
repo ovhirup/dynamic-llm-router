@@ -7,6 +7,7 @@ are refused and shadowed on PATH by a refusing shim.
 import csv
 import fcntl
 import fnmatch
+import functools
 import hashlib
 import shutil
 import json
@@ -371,6 +372,16 @@ def hop_reason(record):
     return record.get('success_check') or record.get('error') or 'failed'
 
 
+def orchestrator_handoff(policy, summary, task_path, why, selection=None):
+    """grok-bot is never run: the job goes back to the orchestrator with the task file path."""
+    summary.update(worker=LAST_RESORT, status='handoff_to_orchestrator', reason=why,
+                   task_file=str(task_path), ok=False,
+                   finished_at=now_local(policy).isoformat(timespec='seconds'))
+    if selection is not None:
+        summary['selection_reasons'] = selection.get('reasons', {})
+    return summary
+
+
 def run_task(*args, **kwargs):
     slots = []
     try:
@@ -382,15 +393,20 @@ def run_task(*args, **kwargs):
 def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select=None,
               runner=run_bounded, draft=developer_draft, policy=None, output_root=None,
               extra_prompt=None, stamp=None, meter=None, stackwich_cycle=1, _claude_pinned=False,
-              exclude=(), tried=(), _slots=None, handoff=None):
+              exclude=(), tried=(), _slots=None, handoff=None, task_class=None):
     """exclude: workers that already failed in this job (never re-run); tried: workers this job has
     already used, counted against MAX_WORKERS. handoff(record, next_worker) runs before every
-    failover hop and returns the handoff text the next worker gets in its prompt."""
+    failover hop and returns the handoff text the next worker gets in its prompt.
+    task_class ranks workers by class_order.<task_class>; when only grok-bot is left the run returns
+    status handoff_to_orchestrator with the task file path instead of being refused."""
     from . import selection as selection_module
     _slots = [] if _slots is None else _slots
     policy = policy or config.load_policy()
     injected_select = select is not None
     select = select or (lambda chars, **kw: selection_module.select(chars, policy=policy, **kw))
+    if task_class is not None:
+        config.worker_order(policy, task_class)  # unknown class -> ConfigError before any work
+        select = functools.partial(select, task_class=task_class)
     coding = coding_workers(policy)
     metered = set(config.metered_workers(policy))
     forced_quota = config.quota_cfg(policy, worker)
@@ -434,6 +450,8 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
         order, summary['reason'] = [worker], 'forced'
     else:
         order, summary['reason'] = hops, selection.get('reason')
+    if not order and worker is None and task_class is not None and LAST_RESORT in selection.get('eligible', []):
+        return orchestrator_handoff(policy, summary, task_path, 'no_eligible_worker', selection)
     if not order:
         raise Refused('no eligible worker: ' + str(selection.get('reason')))
     unmetered = set(policy.get('unmetered_workers') or [])

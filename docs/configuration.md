@@ -21,6 +21,7 @@ Relative paths in the config resolve against the **state dir**, except `run_task
 |-----|---------|---------|
 | `timezone` | `"local"` | IANA zone (e.g. `"Europe/Berlin"`) for display, quota resets and screen parsing. |
 | `worker_order` | `[]` | User-chosen preference order; empty means no workers configured. Run `llm-router init`. |
+| `class_order.<class>` | unset | Per-class order for `feature`, `bugfix`, `review`, `mechanical`, `draft`, used when `select`, `run-task` or `run-job` gets `--class`. A class without an entry uses `worker_order`. `grok-bot` (the orchestrator) is always appended last, is never quota-gated, and may only appear last. When every other worker in the class is out, the run returns `status: handoff_to_orchestrator` with `task_file` (exit 0) instead of refusing. Without `--class` the flat `worker_order` behaviour is unchanged. |
 | `never` | `[]` | CLIs that must never run. They are refused as workers and shadowed by refusing PATH shims inside worker environments. |
 | `ineligible` | `{}` | `{"worker": "reason"}`: temporarily take a worker out without editing the order. |
 | `unmetered_workers` | `[]` | Workers allowed without a quota observer (run unpaced, with a warning). |

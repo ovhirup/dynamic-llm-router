@@ -113,10 +113,13 @@ def developer_ready(policy, task_chars):
 
 
 def select(task_chars, policy=None, cached_only=False, now=None, io=None, consult_all=False,
-           consult_cursor=False, threshold_overrides=None, claude_profile_loader=None, cooldowns=None):
+           consult_cursor=False, threshold_overrides=None, claude_profile_loader=None, cooldowns=None,
+           task_class=None):
     """Return {'worker', 'reason', 'eligible', 'meters', 'reasons', 'sources', 'versions', ...}.
 
     Workers cooling down after a quota error (see cooldown.py) are skipped until their reset.
+    task_class walks class_order.<task_class> instead of worker_order; grok-bot ends every class
+    order and is never quota-gated, so a class job is handed back to the orchestrator, not refused.
     """
     policy = policy or config.load_policy()
     clock_injected = now is not None
@@ -127,7 +130,12 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
     unmetered = set(policy.get('unmetered_workers') or [])
     overrides = threshold_overrides or {}
     eligible, meters, reasons, sources, versions, warnings = [], {}, {}, {}, {}, {}
-    for worker in policy['worker_order']:
+    order = config.worker_order(policy, task_class)
+    for worker in order:
+        if worker == config.ORCHESTRATOR:
+            reasons[worker] = 'orchestrator_fallback'
+            eligible.append(worker)
+            continue
         if config.blocked_worker(policy, worker):
             reasons[worker] = 'never'
             continue
@@ -175,8 +183,10 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
         if reason == 'quota_available':
             eligible.append(worker)
     worker = eligible[0] if eligible else None
-    return {'worker': worker, 'reason': 'preferred_eligible_worker' if worker else 'no_eligible_worker' if policy['worker_order'] else 'no_workers_configured',
-            'hint': None if policy['worker_order'] else 'run llm-router init',
+    reason = ('handoff_to_orchestrator' if worker == config.ORCHESTRATOR else 'preferred_eligible_worker' if worker
+              else 'no_eligible_worker' if order else 'no_workers_configured')
+    return {'worker': worker, 'reason': reason, 'task_class': task_class,
+            'hint': None if order else 'run llm-router init',
             'eligible': eligible, 'meters': meters, 'reasons': reasons, 'sources': sources,
             'cli_versions': versions, 'version_warnings': warnings,
             'never': sorted(never), 'ineligible': policy.get('ineligible') or {},

@@ -34,12 +34,14 @@ def build_parser():
     selection = commands.add_parser('select', help='Show which worker would be picked (reads meters)')
     selection.add_argument('--size', choices=('draft', 'full'), default='full')
     selection.add_argument('--cached-only', action='store_true')
+    selection.add_argument('--class', dest='task_class', choices=config.TASK_CLASSES)
 
     task = commands.add_parser('run-task', help='Run a task file headless in a clean git checkout')
     task.add_argument('--task-file', required=True)
     task.add_argument('--cwd', required=True)
     task.add_argument('--size', choices=('draft', 'full'), default='full')
     task.add_argument('--worker')
+    task.add_argument('--class', dest='task_class', choices=config.TASK_CLASSES)
     task.add_argument('--allow-dirty', action='store_true')
 
     job = commands.add_parser('run-job', help='Run a task in a new worktree branch, test, retry once, commit locally')
@@ -50,6 +52,7 @@ def build_parser():
     job.add_argument('--test-cmd', help='shell test command (default: test_cmd from repos.json)')
     job.add_argument('--size', choices=('draft', 'full'), default='full')
     job.add_argument('--worker')
+    job.add_argument('--class', dest='task_class', choices=config.TASK_CLASSES)
     keep = job.add_mutually_exclusive_group()
     keep.add_argument('--keep', action='store_true', help='keep the worktree even on failure')
     keep.add_argument('--prune', action='store_true', help='remove the worktree even on success')
@@ -313,7 +316,7 @@ def main(argv=None):
                 result = job_dispatch.run_job(args.repo, args.task_file, base=args.base, branch=args.branch,
                                               test_cmd=args.test_cmd, size=args.size, worker=args.worker,
                                               keep=True if args.keep else False if args.prune else None,
-                                              policy=policy)
+                                              policy=policy, task_class=args.task_class)
             elif args.command == 'jobs':
                 result = job_dispatch.list_jobs(policy=policy, limit=args.limit)
             else:
@@ -322,21 +325,24 @@ def main(argv=None):
             print(json.dumps({'ok': False, 'refused': str(refusal)}))
             return 3
         _print(result)
+        if result.get('status') == 'handoff_to_orchestrator':
+            return 0
         return 3 if result.get('status') == 'refused' else 0 if result.get('ok', True) else 1
     if args.command == 'run-task':
         from . import task_dispatch
         try:
             result = task_dispatch.run_task(args.task_file, args.cwd, size=args.size, worker=args.worker,
-                                            allow_dirty=args.allow_dirty, policy=policy)
+                                            allow_dirty=args.allow_dirty, policy=policy,
+                                            task_class=args.task_class)
         except task_dispatch.Refused as refusal:
             print(json.dumps({'ok': False, 'refused': str(refusal)}))
             return 3
         _print(result)
-        return 0 if result['ok'] else 1
+        return 0 if result['ok'] or result.get('status') == 'handoff_to_orchestrator' else 1
     if args.command == 'select':
         from . import selection
         chars = 0 if args.size == 'draft' else (policy.get('developer') or {}).get('draft_max_chars', 4000) + 1
-        _print(selection.select(chars, policy=policy, cached_only=args.cached_only))
+        _print(selection.select(chars, policy=policy, cached_only=args.cached_only, task_class=args.task_class))
         return 0
     parser.error('unknown command')
     return 2

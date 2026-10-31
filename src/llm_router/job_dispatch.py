@@ -5,6 +5,7 @@ the base branch, never pushes. A leak-check hit blocks the commit.
 """
 from datetime import datetime, timedelta
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -243,10 +244,14 @@ def _commit_message(task_text, job_id, workers, tests, verified=False):
 
 def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full', worker=None,
             keep=None, policy=None, run_task=td.run_task, select=None, now=None, test_runner=td.run_bounded,
-            popen=subprocess.Popen, notifier=None, meter=None):
+            popen=subprocess.Popen, notifier=None, meter=None, task_class=None):
     """keep: True (--keep), False (--prune) or None (keep on success, prune on failure).
-    meter(worker) -> percent used or None (default: the cached meter, never a live read)."""
+    meter(worker) -> percent used or None (default: the cached meter, never a live read).
+    task_class ranks workers by class_order.<task_class> (see selection.select)."""
     policy = policy or config.load_policy()
+    if task_class is not None:
+        config.worker_order(policy, task_class)  # unknown class -> ConfigError before any worktree
+        run_task = functools.partial(run_task, task_class=task_class)
     if worker is not None and config.blocked_worker(policy, worker):
         raise Refused(f'{worker} is in never; remove it from never to use it')
     started = now or td.now_local(policy)
@@ -429,6 +434,12 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
             if attempt_number == 0:
                 raise
             break
+        if result.get('status') == 'handoff_to_orchestrator':
+            # Every worker is out: the job goes back to the orchestrator, not refused.
+            summary.update(status='handoff_to_orchestrator', task_file=result.get('task_file'),
+                           reason=result.get('reason'))
+            summary['attempts'].append({'attempt': cycle, 'handoff_to_orchestrator': result.get('task_file')})
+            return
         runs = result.get('attempts', [])
         used |= {r['worker'] for r in runs if r.get('worker')}
         failed |= {r['worker'] for r in runs if r.get('worker') and not r.get('ok')}
