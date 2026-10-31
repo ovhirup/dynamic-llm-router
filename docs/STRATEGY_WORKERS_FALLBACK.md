@@ -9,7 +9,7 @@ Status: proposed (31 Oct 2026). Owner: Abhirup. Supersedes the "ban Grok-family 
 
 ## 2. Worker ranking
 
-Default fallback order when the preferred worker is out of tokens (owner's order): **Claude > Grok Build > Codex > local**. Cursor sits between Grok Build and Codex: strong for editor-scale edits, but it is a seat with a monthly cap and no headless CLI contract yet.
+Default fallback order when the preferred worker is out of tokens (owner's order): **Claude > Codex > Grok Build > Cursor > local** (updated 31 Oct 2026; see ROUTING_STRATEGY.md). Cursor sits after Grok Build: strong for editor-scale edits, but it is a seat with a monthly cap and no headless CLI contract yet.
 
 | Class | 1st | 2nd | 3rd | 4th | Last |
 |---|---|---|---|---|---|

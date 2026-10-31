@@ -4,7 +4,7 @@ Status: proposal (31 Oct 2026). Board: https://github.com/users/ovhirup/projects
 
 ## Principle
 No capable worker sits idle while it has quota and there is eligible work. Grok Bot orchestrates; workers
-(Claude personal Pro > Grok Build > Codex > Cursor (after 3 Nov) > local Nativ/aider-ollama) execute in parallel.
+(Claude personal Pro > Codex > Grok Build > Cursor (after 3 Nov) > local Nativ/aider-ollama) execute in parallel.
 
 ## (a) Parallel dispatch
 - **Decompose** each job into independent units (issue/sub-issue = unit) with declared files/paths, class
