@@ -324,6 +324,7 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
     required, pinned, evidence = False, None, None
     retries = policy['run_job'].get('max_retries', 1)
     attempt_number = 0
+    used, failed = set(), set()
     while attempt_number <= (1 if required else retries):
         cycle = attempt_number + 1
         kwargs = {'size': size, 'worker': pinned or worker, 'allow_dirty': attempt_number > 0,
@@ -331,6 +332,9 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
                   'stackwich_cycle': cycle}
         if pinned == 'claude' and worker is None:
             kwargs['_claude_pinned'] = True
+        if not (pinned or worker) and used:
+            # A failed worker is never retried: the job moves to the next eligible one (max MAX_WORKERS).
+            kwargs.update(exclude=sorted(failed), tried=sorted(used))
         if select is not None:
             kwargs['select'] = select
         try:
@@ -346,6 +350,8 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
                 raise
             break
         runs = result.get('attempts', [])
+        used |= {r['worker'] for r in runs if r.get('worker')}
+        failed |= {r['worker'] for r in runs if r.get('worker') and not r.get('ok')}
         claude_quota = any(r.get('worker') == 'claude' and r.get('quota_error') for r in runs)
         claude_refusal = any(r.get('worker') == 'claude' and r.get('success_check') == 'refusal'
                              for r in runs)
@@ -429,6 +435,10 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
             break
         if claude_refusal or (claude_quota and not result.get('ok')):
             summary['status'] = 'blocked_by_stackwich' if required else 'failed'
+            return
+        if not (pinned or worker or result.get('ok')) and len(used) >= td.MAX_WORKERS:
+            summary['warnings'].append(f'failover stopped: {td.MAX_WORKERS} workers already tried')
+            summary['status'] = 'failed'
             return
         extra = _retry_note(result, tests) or ''
         if required:

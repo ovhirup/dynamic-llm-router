@@ -21,6 +21,9 @@ import urllib.request
 
 from . import claude_handoff, config, cooldown, security, stackwich
 
+MAX_WORKERS = 3  # distinct workers one job may hop across before it stops and reports
+LAST_RESORT = 'grok-bot'  # out-of-band last resort (ROUTING_STRATEGY.md section 3): never a failover hop
+
 
 
 def failure_reason(stderr, stdout='', limit=300):
@@ -355,6 +358,19 @@ def _release(slots):
         slots.pop().close()
 
 
+def hop_reason(record):
+    """Why a run ended: 'ok', or the failure that moves the job to the next worker."""
+    if record.get('ok'):
+        return 'ok'
+    if record.get('quota_error'):
+        return 'quota_error'
+    if record.get('stalled'):
+        return 'stalled'
+    if record.get('timed_out'):
+        return 'timeout'
+    return record.get('success_check') or record.get('error') or 'failed'
+
+
 def run_task(*args, **kwargs):
     slots = []
     try:
@@ -366,7 +382,9 @@ def run_task(*args, **kwargs):
 def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select=None,
               runner=run_bounded, draft=developer_draft, policy=None, output_root=None,
               extra_prompt=None, stamp=None, meter=None, stackwich_cycle=1, _claude_pinned=False,
-              _slots=None):
+              exclude=(), tried=(), _slots=None):
+    """exclude: workers that already failed in this job (never re-run); tried: workers this job has
+    already used, counted against MAX_WORKERS."""
     from . import selection as selection_module
     _slots = [] if _slots is None else _slots
     policy = policy or config.load_policy()
@@ -406,13 +424,15 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
     else:
         selection = select(chars, consult_cursor=True) if worker == 'cursor' else select(chars)
     meters = selection.get('meters', {})
+    hops = [name for name in selection.get('eligible', [])
+            if name not in (worker, LAST_RESORT) and name not in exclude]
     if worker == 'claude' and _claude_pinned:
-        order = [worker] + [name for name in selection.get('eligible', []) if name != worker]
+        order = [worker] + hops
         summary['reason'] = 'stackwich_pinned'
     elif worker is not None:
         order, summary['reason'] = [worker], 'forced'
     else:
-        order, summary['reason'] = list(selection.get('eligible', [])), selection.get('reason')
+        order, summary['reason'] = hops, selection.get('reason')
     if not order:
         raise Refused('no eligible worker: ' + str(selection.get('reason')))
     unmetered = set(policy.get('unmetered_workers') or [])
@@ -436,7 +456,11 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
     quota_error = re.compile(policy['run_task']['quota_error_pattern'])
     _, block_log = worker_environment(policy)
     blocks_before = security.count_lines(block_log)
-    for attempt, name in enumerate(order[:2]):  # the chosen worker plus one failover
+    used = set(tried)
+    for attempt, name in enumerate(order):  # one run per worker, MAX_WORKERS distinct workers per job
+        if name not in used and len(used) >= MAX_WORKERS:
+            summary['warnings'].append(f'failover stopped: {MAX_WORKERS} workers already tried')
+            break
         _release(_slots)  # the previous attempt's slot
         state, handle = acquire_slot(policy, name)
         _slots += [handle] if handle else []
@@ -481,11 +505,13 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                 stackwich.prepare(cwd, _git(cwd, 'ls-files', '--error-unmatch', '--',
                                             stackwich.REPORT_PATH).returncode == 0)
             except ValueError as error:
-                record.update(ok=False, error=str(error))
+                used.add(name)
+                record.update(ok=False, error=str(error), reason='stackwich_prepare_failed')
                 summary['attempts'].append(record)
                 summary.update(worker=name, ok=False, stackwich=record['stackwich'])
                 summary['warnings'].append(str(error))
                 break
+        used.add(name)
         if name == 'developer':
             path = out_dir / f'{stamp}-developer.md'
             try:
@@ -570,6 +596,7 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                 until = cooldown.record(name)
                 record['cooldown_until'] = until.isoformat()
                 summary['warnings'].append(f'{name} quota error: cooling down until {until.isoformat()}')
+        record['reason'] = hop_reason(record)
         record['output_path'] = str(path)
         summary['attempts'].append(record)
         summary.update(worker=name, ok=record['ok'], output_path=str(path), stackwich=record['stackwich'])

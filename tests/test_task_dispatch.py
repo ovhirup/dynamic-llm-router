@@ -95,12 +95,35 @@ class TaskDispatchTests(unittest.TestCase):
         self.assertIn('codex', cooldown.active())
         self.assertEqual(result['attempts'][0]['cooldown_until'], cooldown.active()['codex'].isoformat())
         self.assertNotIn('cooldown_until', result['attempts'][1])
+        self.assertEqual([a['reason'] for a in result['attempts']], ['quota_error', 'ok'])
 
-    def test_only_one_failover(self):
-        result = self.run_task(select=self.selection(['codex', 'grok-build', 'cursor']),
-                               runner=self.fake_runner(['timeout', 'timeout', 'edit'], []))
+    def test_failover_stops_after_three_workers(self):
+        calls = []
+        result = self.run_task(select=self.selection(['codex', 'grok-build', 'cursor', 'developer']),
+                               runner=self.fake_runner(['timeout', 'quota', 'timeout', 'edit'], calls))
         self.assertFalse(result['ok'])
-        self.assertEqual(len(result['attempts']), 2)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([(a['worker'], a['reason']) for a in result['attempts']],
+                         [('codex', 'timeout'), ('grok-build', 'quota_error'), ('cursor', 'timeout')])
+        self.assertIn('grok-build', cooldown.active())
+        self.assertTrue(any('3 workers already tried' in w for w in result['warnings']))
+
+    def test_grok_bot_and_failed_workers_are_never_hops(self):
+        result = self.run_task(select=self.selection(['codex', 'grok-bot', 'grok-build']),
+                               runner=self.fake_runner(['timeout', 'timeout'], []))
+        self.assertEqual([a['worker'] for a in result['attempts']], ['codex', 'grok-build'])
+        subprocess.run(['git', '-C', str(self.repo), 'checkout', '-q', '.'], check=True)
+        result = self.run_task(select=self.selection(['codex', 'grok-bot', 'grok-build', 'cursor']),
+                               exclude=['codex'], tried=['codex', 'grok-build'],
+                               runner=self.fake_runner(['timeout', 'edit'], []))
+        self.assertEqual([a['worker'] for a in result['attempts']], ['grok-build', 'cursor'])
+        subprocess.run(['git', '-C', str(self.repo), 'checkout', '-q', '.'], check=True)
+        result = self.run_task(select=self.selection(['grok-build', 'cursor']),
+                               tried=['codex', 'grok-build', 'developer'],
+                               runner=self.fake_runner(['timeout'], []))
+        self.assertEqual([a['worker'] for a in result['attempts']], ['grok-build'])  # cursor would be a 4th
+        with self.assertRaisesRegex(td.Refused, 'no eligible'):
+            self.run_task(select=self.selection(['codex', 'grok-bot']), exclude=['codex'])
 
     def test_forced_workers_and_never(self):
         for name in ('claude', 'grok-bot'):
