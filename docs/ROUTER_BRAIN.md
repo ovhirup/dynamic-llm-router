@@ -68,3 +68,15 @@ Paid API key needed (user decision). *May age quickly.*
 - Parallel Claudes (10 levels): https://x.com/Slonski_rt/status/2115519302338281801
 - Grok Bots incl. outer/inner loop + Ship Evidence Auditor: https://x.com/maestrooth/status/2115548587174068225
 - Claude Code skill repos: https://x.com/neerajjj6785/status/2115683570886828270
+
+## (f) Evaluation harness (ranks above self-learning)
+Replay real past router jobs (`~/.local/state/llm-router/logs/jobs`) against any worker or routing policy.
+Score quality (tests pass, diff scope, reviewer score), cost (tokens / quota %) and time. Modes: offline (fake
+workers) and live. Output: policy A/B report. **Gate:** no routing/config change is adopted unless it beats the
+baseline in the harness. Related: #26 #55 #12 #13 #60.
+
+## (g) Self-learning router (no fine-tuning)
+Learns from its own outcomes: feedback loop updates worker scorecards; adaptive routing weights (bandit-style
+exploration with a safety floor); drift detection when a worker's quality drops; every weight change validated by
+the harness before applying; human-readable change log in the Obsidian vault. **No local model fine-tuning**
+(16 GB Mac, and frontier models outpace it). Related: #49 #56 #53-#55.
