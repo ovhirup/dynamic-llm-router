@@ -1,0 +1,4 @@
+{"job_id": "repo-20261003-100000", "repo": "/tmp/eval-repo", "task": "refused.md",
+ "base": "HEAD", "base_sha": "4444444444444444444444444444444444444444", "status": "refused", "ok": false,
+ "started_at": "2026-10-03T10:00:00+01:00", "finished_at": "2026-10-03T10:00:01+01:00",
+ "attempts": [], "workers": [], "handoffs": [], "warnings": ["no eligible worker"]}

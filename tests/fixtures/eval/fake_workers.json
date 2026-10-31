@@ -1,0 +1,3 @@
+{"codex": {"pass_rate": 1.0, "tokens": 15000, "quota_percent": 4.0, "elapsed_seconds": 240},
+ "grok-build": {"pass_rate": 0.0, "tokens": 30000, "quota_percent": 6.0, "elapsed_seconds": 500, "scope": 3},
+ "cursor": {"pass_rate": 1.0, "tokens": 9000, "quota_percent": 1.0, "elapsed_seconds": 120}}

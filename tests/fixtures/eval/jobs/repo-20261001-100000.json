@@ -1,0 +1,10 @@
+{"job_id": "repo-20261001-100000", "repo": "/tmp/eval-repo", "task": "add-out.md",
+ "task_text": "# Add out.txt\nCreate out.txt.\n",
+ "base": "HEAD", "base_sha": "1111111111111111111111111111111111111111", "branch": "router/add-out-20261001-100000",
+ "size": "full", "started_at": "2026-10-01T10:00:00+01:00", "finished_at": "2026-10-01T10:05:00+01:00",
+ "ok": true, "status": "committed", "commit": "2222222222222222222222222222222222222222",
+ "diff_stat": " out.txt     | 1 +\n src/app.py  | 4 ++--\n 2 files changed, 3 insertions(+), 2 deletions(-)",
+ "tests": [{"status": "passed"}], "test_command": "python -m pytest -q", "tests_status": "passed",
+ "attempts": [{"attempt": 1, "worker": "codex", "ok": true, "changed": true, "tests": "passed",
+               "runs": [{"worker": "codex", "ok": true, "elapsed_seconds": 250.0, "tokens": 12000}]}],
+ "workers": ["codex"], "quota_percent": 3.5, "handoffs": [], "warnings": []}
