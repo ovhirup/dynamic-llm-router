@@ -91,6 +91,16 @@ See the inline `_why` notes in the defaults file. Notable: `pr_gate.approval_ttl
 `alerts.macos_notification` (false), `launch_agent.label` (`dev.llm-router.quota`), and
 `developer.api_key_env` (the **name** of an env var; the key itself is never stored in config).
 
+## `scheduler`
+
+`scheduler.assign` scores each parallel worker for a unit as capability × quota headroom × week-curve pace
+and picks the highest score; ties keep `worker_order`. `scheduler.capabilities.<worker>.<unit kind>` is
+a number from 0 to 1. A worker with no entry can take any kind; a listed worker takes only the kinds it lists.
+Headroom is the remaining share of `usage_threshold_percent`, and unmetered workers get 1. Pace compares
+the weekly window's remaining quota with a linear week curve up to `reset_at`, giving a value from 0 to 2.
+A worker behind the curve scores higher. `grok-bot` is never in the parallel pool. It is chosen only when
+no pool worker is both capable and has quota headroom left.
+
 ## `workers.<name>`
 
 Names match `[a-z][a-z0-9_-]{0,31}`. Built-in names override adapter settings. At load, definitions
