@@ -24,6 +24,12 @@ class ClaudeAccountTests(unittest.TestCase):
         self.assertEqual(ca.classify({'email': 'a@corp.example'}), 'work')
         self.assertEqual(ca.classify({'email': 'a@corp.example'}, {'personal_emails': ['A@corp.example']}), 'personal')
         self.assertEqual(ca.classify({'email': 'a@gmail.com'}, {'personal_domains': ['me.dev']}), 'work')
+
+    def test_empty_personal_domains_means_exact_email_only(self):
+        opts = {'personal_emails': ['me@gmail.com'], 'personal_domains': []}
+        self.assertEqual(ca.classify({'email': 'me@gmail.com'}, opts), 'personal')
+        self.assertEqual(ca.classify({'email': 'other@gmail.com'}, opts), 'work')
+
         self.assertEqual(ca.classify(None), 'unknown')
         self.assertEqual(ca.classify({'email': None}), 'unknown')
 

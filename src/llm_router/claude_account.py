@@ -40,7 +40,11 @@ def classify(profile, options=None):
         return 'unknown'
     email = profile['email']
     emails = {e.lower() for e in options.get('personal_emails') or []}
-    domains = {d.lower() for d in (options.get('personal_domains') or DEFAULT_PERSONAL_DOMAINS)}
+    # Explicit personal_domains (even []) wins; default only when the key is absent.
+    if 'personal_domains' in options:
+        domains = {d.lower() for d in (options.get('personal_domains') or [])}
+    else:
+        domains = {d.lower() for d in DEFAULT_PERSONAL_DOMAINS}
     if email in emails or email.rsplit('@', 1)[1] in domains:
         return 'personal'
     return 'work'
