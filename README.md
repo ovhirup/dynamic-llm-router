@@ -4,7 +4,7 @@
 
 **Bring any worker. You choose and rank your coding workers; there is no default order.**
 Built-in adapters and config-defined adapters let you use any CLI.
-`llm-router` picks a worker (Codex, Grok Build, Cursor, optionally Claude Code or a local model) based on
+`llm-router` picks a worker (Claude Code, Codex, Grok Build, Cursor or a local model) based on
 each tool's *live* usage meter, runs the task headless in a throwaway git worktree, tests it, leak-checks it,
 commits it on a `router/*` branch and then stops. Nothing is pushed or merged until a human approves the
 exact commit.
@@ -89,9 +89,10 @@ Minimal `config.json`:
 
 ```json
 {
-  "worker_order": ["codex", "grok-build", "cursor"],
-  "never": ["claude"],
+  "worker_order": ["claude", "codex", "grok-build", "cursor"],
+  "never": [],
   "quota": {
+    "claude": {"enabled": true},
     "grok-build": {"enabled": true},
     "cursor": {"enabled": true}
   },
@@ -117,7 +118,7 @@ Examples: [`examples/config.example.json`](examples/config.example.json),
 These flags give the worker autonomous write access inside the worktree. Review them in the config before
 first use. Templates are plain argv lists in `run_task.commands`; placeholders are `{codex}`, `{grok}`,
 `{cursor}`, `{claude}`, `{cwd}`, `{repo}`, `{prompt_file}`, `{prompt_pointer}`.
-Block Claude with `"never": ["claude"]`: this refuses `claude`, `claude-code` and custom workers whose executable basename is either, and shadows both on worker PATHs.
+To block any CLI, list it in `never`. For example, `"never": ["claude"]` refuses `claude`, `claude-code` and custom workers whose executable basename is either, and shadows both on worker PATHs.
 
 ### Quota observers
 
