@@ -83,6 +83,21 @@ Keyed by absolute repo path or by repo directory name:
 }
 ```
 
+#### Tests: `test_cmd`, auto-detection, `allow_no_tests`
+
+run-job never commits untested work. The test command comes from `--test-cmd` (source `cli`), else `test_cmd`
+here (`config`), else it is auto-detected in the job worktree at the base commit (`auto`):
+
+- Python: `pytest.ini`, `[tool.pytest…]` in `pyproject.toml` or `[tool:pytest]` in `setup.cfg` -> `python -m pytest`;
+  otherwise a `tests/` dir -> `python -m unittest discover -s tests` (prefixed `PYTHONPATH=src` when `src/` exists).
+  `python` is the source repo's `.venv/bin/python` when present, else the router's interpreter.
+- Node: `package.json` with a real `test` script -> `npm test --silent`.
+- Swift: `Package.swift` -> `swift test`.
+
+The job JSON records `test_command` and `test_command_source`. If nothing is found the tests status is
+`no_tests`, and the job fails (`ok: false`, `reason: "no test command configured or detected"`, branch and
+worktree kept, no worker run) unless the repo opts in with `"allow_no_tests": true`.
+
 `visibility: "public"` also greps every changed file and the branch name for private terms, and refuses if the
 terms file is missing.
 
