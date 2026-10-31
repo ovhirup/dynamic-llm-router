@@ -95,6 +95,7 @@ Minimal `config.json`:
   "never": [],
   "quota": {
     "claude": {"enabled": true},
+    "codex": {"enabled": true},
     "grok-build": {"enabled": true},
     "cursor": {"enabled": true}
   },
@@ -153,7 +154,7 @@ aider with Ollama, opencode (argv privacy warning), and a custom quota command.
 
 `llm-router init` detects binaries using PATH lookup only; it never runs them. In a terminal it asks for
 preference order, explicit Claude opt-in (default No), and experimental meter opt-in (default No).
-For scripts use `llm-router init --non-interactive --workers codex,aider --never claude --meters codex`.
+For scripts use `llm-router init --non-interactive --workers claude,codex,grok-build,cursor --meters claude,codex,grok-build,cursor`.
 Without `--workers`, non-interactive init fails and lists detected CLIs. `--dry-run` prints configuration
 without writes; `--force` backs up config.json to `config.json.bak-<timestamp>` before replacement.
 Existing repos.json and private_terms.txt are always preserved. Workers without enabled meters are marked
