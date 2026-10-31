@@ -120,3 +120,68 @@ def set_manual(worker, window, percent_used, reset_at=None, path=None, now=None)
     tmp.write_text(_json.dumps(data, indent=2, sort_keys=True))
     tmp.replace(path)
     return row
+
+
+# --- Threshold alerts and daily summary (issue #24) -------------------------------------------------
+WARN_PERCENT = 85
+EXHAUSTED_PERCENT = 100
+
+
+def alert_level(record, warn=WARN_PERCENT):
+    """'exhausted' | 'warn' | 'unknown' | None for one record."""
+    if record.status != 'ok':
+        return 'unknown'
+    if record.percent_used >= EXHAUSTED_PERCENT:
+        return 'exhausted'
+    if record.percent_used >= warn:
+        return 'warn'
+    return None
+
+
+def alerts(records, warn=WARN_PERCENT):
+    """[(level, record)] for records at/above warn, exhausted, or unknown; exhausted first."""
+    order = {'exhausted': 0, 'warn': 1, 'unknown': 2}
+    found = [(alert_level(r, warn), r) for r in records]
+    return sorted([(lvl, r) for lvl, r in found if lvl], key=lambda x: (order[x[0]], x[1].worker, x[1].window))
+
+
+def _when(dt, zone=None):
+    return dt.astimezone(zone).strftime('%d %b %H:%M %Z') if dt else 'unknown'
+
+
+def daily_summary(records, warn=WARN_PERCENT, zone=None):
+    """Plain-text summary: one line per worker/window, then alert lines."""
+    lines = ['Meter summary']
+    for r in sorted(records, key=lambda r: (r.worker, r.window)):
+        pct = f'{r.percent_used:g}%' if r.status == 'ok' else 'unknown'
+        lines.append(f'- {r.worker} {r.window}: {pct} (resets {_when(r.reset_at, zone)}, read {_when(r.read_at, zone)}, {r.source})')
+    flagged = alerts(records, warn)
+    lines.append('Alerts: none' if not flagged else 'Alerts:')
+    for level, r in flagged:
+        what = {'exhausted': 'exhausted', 'warn': f'at or above {warn}%', 'unknown': 'no fresh reading'}[level]
+        lines.append(f'- {level.upper()}: {r.worker} {r.window} {what}; resets {_when(r.reset_at, zone)}')
+    return '\n'.join(lines)
+
+
+def main(argv=None):
+    """python -m llm_router.meters summary [--manual-file PATH] [--warn 85]  (manual meters for now)."""
+    import argparse
+    parser = argparse.ArgumentParser(prog='llm_router.meters')
+    parser.add_argument('command', choices=['summary', 'set'])
+    parser.add_argument('--manual-file')
+    parser.add_argument('--warn', type=float, default=WARN_PERCENT)
+    parser.add_argument('--worker'); parser.add_argument('--window'); parser.add_argument('--percent', type=float)
+    parser.add_argument('--reset-at')
+    args = parser.parse_args(argv)
+    if args.command == 'set':
+        if not (args.worker and args.window and args.percent is not None):
+            parser.error('set needs --worker, --window and --percent')
+        set_manual(args.worker, args.window, args.percent, args.reset_at, path=args.manual_file)
+        return 0
+    records = load_manual(args.manual_file)
+    print(daily_summary(records, args.warn, zone=datetime.now().astimezone().tzinfo))
+    return 1 if any(level == 'exhausted' for level, _ in alerts(records, args.warn)) else 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
