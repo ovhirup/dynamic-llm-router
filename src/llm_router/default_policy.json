@@ -212,6 +212,8 @@
     "branch_prefix": "router/",
     "lock_dir": "logs/locks",
     "jobs_dir": "logs/jobs",
+    "handoffs_dir": "handoffs",
+    "handoff_threshold_percent": 85,
     "repo_config": "repos.json",
     "test_timeout_seconds": 600,
     "test_stall_seconds": 300,

@@ -382,9 +382,10 @@ def run_task(*args, **kwargs):
 def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select=None,
               runner=run_bounded, draft=developer_draft, policy=None, output_root=None,
               extra_prompt=None, stamp=None, meter=None, stackwich_cycle=1, _claude_pinned=False,
-              exclude=(), tried=(), _slots=None):
+              exclude=(), tried=(), _slots=None, handoff=None):
     """exclude: workers that already failed in this job (never re-run); tried: workers this job has
-    already used, counted against MAX_WORKERS."""
+    already used, counted against MAX_WORKERS. handoff(record, next_worker) runs before every
+    failover hop and returns the handoff text the next worker gets in its prompt."""
     from . import selection as selection_module
     _slots = [] if _slots is None else _slots
     policy = policy or config.load_policy()
@@ -483,10 +484,14 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
             warning = f'{name} is unmetered: run not paced'
             if warning not in summary['warnings']:
                 summary['warnings'].append(warning)
+        hop_note = ''
+        if handoff is not None and summary['attempts']:  # a note is written before every failover hop
+            hop_note = handoff(summary['attempts'][-1], name) or ''
+        hop_extra = '\n\n'.join(text for text in (extra_prompt, hop_note) if text)
         env, _ = worker_environment(policy, name)
         protocol = stackwich.status(policy, name)
         record = {'worker': name, 'stackwich': {'status': protocol, 'cycle': stackwich_cycle}}
-        invocation_prompt = prompt
+        invocation_prompt = prompt + ('\n\n' + hop_note if hop_note else '')
         claude_tail = ''
         if name == 'claude':
             claude_tail = stackwich.prompt(stackwich_cycle) if protocol == 'required' else ''
@@ -494,7 +499,7 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                 policy['run_task'].get('claude_allow_raised_effort') is True)
             invocation_prompt = claude_handoff.build_prompt(
                 task, chosen_effort, policy['run_task']['timeouts_seconds'][name],
-                prefix=policy['run_task']['prompt_prefix'], extra=extra_prompt or '', tail=claude_tail)
+                prefix=policy['run_task']['prompt_prefix'], extra=hop_extra, tail=claude_tail)
         if protocol == 'unsupported':
             summary['warnings'].append(f'{name}: Stackwich unsupported; ordinary execution')
         if protocol == 'required' and name != 'claude':
@@ -561,7 +566,7 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                     continuation += 1
                     invocation_prompt = claude_handoff.build_prompt(
                         task, chosen_effort, timeout, elapsed=round(elapsed, 1),
-                        prefix=policy['run_task']['prompt_prefix'], extra=extra_prompt or '',
+                        prefix=policy['run_task']['prompt_prefix'], extra=hop_extra,
                         tail=claude_tail, open_items=final['open_items'])
                 if name == 'claude':
                     record['continuations'] = continuation

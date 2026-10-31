@@ -63,7 +63,7 @@ flowchart TB
 - A **100K-token prompt guard**: larger prompts are split or summarised before dispatch.
 - **Cost per task** is logged (worker, tier, tokens, meter delta) and feeds the Router Brain.
 
-## 5. Switching logic [Partly shipped; handoffs Planned #41–#45]
+## 5. Switching logic [Partly shipped; handoffs shipped #41–#45]
 
 Triggers: quota hit (429 or limit), failure, timeout, output stall, low confidence (the worker says it is unsure, or tests fail twice).
 
@@ -79,7 +79,7 @@ sequenceDiagram
 ```
 
 - [Shipped 0.4.0] Hard timeout, stall watchdog, and one failover that retries with the failure tail.
-- [Planned] **Handoff note:** goal, files touched, current diff summary, test status and last failure, decisions made, next steps, and the meter reason for the switch. Context is preserved by keeping the same worktree and branch.
+- [Shipped #41–#45] **Handoff note** (`src/llm_router/handoff.py`): goal, files touched, current diff summary, test status and last failure, decisions made, next steps, gotchas, meter, and the switch reason. Every worker is told to keep `.llm-router-handoff.md` at the checkout root; the router collects it (never committed) into `<state>/handoffs/<job_id>/<UTC-ts>-<worker>.md`, validates it against the diff, and writes a `source: router` note from git state when it is missing or invalid. A note is written before every failover hop and when the worker's meter reaches `run_job.handoff_threshold_percent` (85). The next worker runs in the same worktree and branch with the latest note in its prompt.
 - Reroute goes to the next *eligible* worker in order. If none is eligible, Grok Bot finishes the job or reports it.
 
 ## 6. Router Brain [Planned #46, #93, #67, #61]

@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import alerts, config, security, stackwich
+from . import alerts, config, handoff, security, stackwich
 from . import task_dispatch as td
 
 Refused = td.Refused
@@ -243,8 +243,9 @@ def _commit_message(task_text, job_id, workers, tests, verified=False):
 
 def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full', worker=None,
             keep=None, policy=None, run_task=td.run_task, select=None, now=None, test_runner=td.run_bounded,
-            popen=subprocess.Popen, notifier=None):
-    """keep: True (--keep), False (--prune) or None (keep on success, prune on failure)."""
+            popen=subprocess.Popen, notifier=None, meter=None):
+    """keep: True (--keep), False (--prune) or None (keep on success, prune on failure).
+    meter(worker) -> percent used or None (default: the cached meter, never a live read)."""
     policy = policy or config.load_policy()
     if worker is not None and config.blocked_worker(policy, worker):
         raise Refused(f'{worker} is in never; remove it from never to use it')
@@ -302,7 +303,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
                'test_command': None, 'test_command_source': None, 'allow_no_tests': allow_no_tests,
                'tests_status': None, 'leak_check': None, 'blocked_by_leak_check': False,
                'attempts': [], 'workers': [], 'worktree_state': None, 'branch_state': None,
-               'main_checkout_untouched': None, 'warnings': []}
+               'main_checkout_untouched': None, 'handoffs': [], 'warnings': []}
     with RepoLock(_path(policy, 'lock_dir', 'logs/locks'), repo), _NoSleep(policy, popen):
         before = main_state(repo)
         worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -315,7 +316,8 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             summary['test_command_source'] = test_source
             if test_cmd or allow_no_tests:
                 _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd,
-                          test_timeout, stamp, out_dir, run_task, select, test_runner, allow_no_tests)
+                          test_timeout, stamp, out_dir, run_task, select, test_runner, allow_no_tests,
+                          meter or handoff.meter_percent)
             else:  # fail before spending a worker run on a change nothing would verify
                 summary.update(status='no_tests', tests_status='no_tests', reason=NO_TESTS_REASON)
                 summary['warnings'].append(NO_TESTS_REASON + ': set test_cmd, pass --test-cmd, or set '
@@ -375,11 +377,30 @@ class _NoSleep:
 
 
 def _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd, test_timeout,
-              stamp, out_dir, run_task, select, test_runner, allow_no_tests=False):
+              stamp, out_dir, run_task, select, test_runner, allow_no_tests=False,
+              meter=handoff.meter_percent):
     # 'no_tests' passes only on the repo's explicit opt-in; anything else ('skipped', 'not_run') never does.
     passing = ('passed', 'no_tests') if allow_no_tests else ('passed',)
-    extra = None
+    extra = handoff.WORKER_INSTRUCTIONS  # every worker writes a handoff note at checkpoints and on stop
     test_artifacts, worker_paths = set(), set()
+
+    def save_note(worker, reason, worker_note=None, tests=None, test_log=None):
+        """Write a handoff note (the worker's if valid, else a router one) into the job's handoffs dir."""
+        note, path = handoff.checkpoint(
+            policy, summary['job_id'], worktree, summary['base_sha'], worker, reason,
+            changed_paths(worktree) - test_artifacts - {handoff.NOTE_FILE}, worker_note=worker_note,
+            goal=task_text[:1500], test_status=(tests or {}).get('status'), test_log=test_log,
+            meter=meter(worker) if worker else None, branch=summary['branch'])
+        summary['handoffs'].append({'path': str(path), 'worker': worker, 'source': note.get('source'),
+                                    'switch_reason': reason})
+        return note
+
+    def hop(record, next_worker):
+        """Called by run_task before it fails over to `next_worker` in this same worktree and branch."""
+        note = save_note(record.get('worker'), record.get('reason') or td.hop_reason(record),
+                         handoff.collect_worker_note(worktree))
+        return handoff.render_for_prompt(note)
+
     required, pinned, evidence = False, None, None
     retries = policy['run_job'].get('max_retries', 1)
     attempt_number = 0
@@ -388,7 +409,7 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         cycle = attempt_number + 1
         kwargs = {'size': size, 'worker': pinned or worker, 'allow_dirty': attempt_number > 0,
                   'policy': policy, 'extra_prompt': extra, 'stamp': f'{stamp}-a{cycle}',
-                  'stackwich_cycle': cycle}
+                  'stackwich_cycle': cycle, 'handoff': hop}
         if pinned == 'claude' and worker is None:
             kwargs['_claude_pinned'] = True
         if not (pinned or worker) and used:
@@ -418,6 +439,16 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
                    if (r.get('stackwich') or {}).get('status') == 'required' and
                    not (r.get('worker') == 'claude' and r.get('quota_error'))]
         selected = result.get('worker')
+        # Collect the worker's note now so it never reaches the diff, tests or commit.
+        worker_note = handoff.collect_worker_note(worktree)
+        percent = meter(selected) if selected else None
+        if handoff.threshold_crossed(policy, percent):
+            # Headroom is low: secure a note before the worker's tokens run out.
+            summary['warnings'].append(f'{selected} meter at {percent:g}% '
+                                       f'(>= {handoff.threshold(policy)}%): handoff note written')
+            save_note(selected, f'meter_threshold {percent:g}%', worker_note)
+        elif worker_note is not None:
+            save_note(selected, 'checkpoint', worker_note)
         if claude_quota and selected != 'claude':
             # The Stackwich-capable replacement owns subsequent corrections; a required cycle stays required.
             pinned, evidence = selected, None
@@ -500,7 +531,13 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
             summary['warnings'].append(f'failover stopped: {td.MAX_WORKERS} workers already tried')
             summary['status'] = 'failed'
             return
-        extra = _retry_note(result, tests) or ''
+        last_run = runs[-1] if runs else {}
+        reason = (last_run.get('reason') or td.hop_reason(last_run) if last_run and not last_run.get('ok')
+                  else f'tests {tests["status"]}' if tests['status'] not in passing else 'retry')
+        log = out_dir / f'{stamp}-a{cycle}-tests.log'
+        note = save_note(selected, reason, worker_note, tests, log if log.exists() else None)
+        extra = '\n\n'.join(filter(None, [handoff.WORKER_INSTRUCTIONS, handoff.render_for_prompt(note),
+                                          _retry_note(result, tests)]))
         if required:
             extra += '\nStackwich errors: ' + '; '.join(evidence['errors'])
         attempt_number += 1

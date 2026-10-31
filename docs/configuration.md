@@ -61,7 +61,8 @@ terms), `max_file_bytes`.
 
 `worktree_root`, `branch_prefix` (`router/`), `lock_dir`, `jobs_dir`, `repo_config` (`repos.json`),
 `test_timeout_seconds`, `test_stall_seconds`, `test_output_tail_chars`, `max_retries` (1), `commit_identity`,
-`caffeinate` (macOS only).
+`caffeinate` (macOS only), `handoffs_dir` (`handoffs`, under the state dir: one folder of handoff notes per
+job), `handoff_threshold_percent` (85: a worker's meter at or above it gets a handoff note written).
 
 ### `repos.json`
 
