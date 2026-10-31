@@ -24,6 +24,9 @@ from . import claude_handoff, config, cooldown, security, stackwich
 
 MAX_WORKERS = 3  # distinct workers one job may hop across before it stops and reports
 LAST_RESORT = 'grok-bot'  # out-of-band last resort (ROUTING_STRATEGY.md section 3): never a failover hop
+# A worker that cannot sign in is unavailable (cooled down), not a task failure; the job fails over.
+AUTH_ERROR = re.compile(r'(?i)(oauth session expired|failed to authenticate|not logged in|please (log|sign) ?in|'
+                        r'authentication (failed|required|error)|invalid api key|session expired|\b401\b|unauthori[sz]ed)')
 
 
 
@@ -365,6 +368,8 @@ def hop_reason(record):
         return 'ok'
     if record.get('quota_error'):
         return 'quota_error'
+    if record.get('auth_error'):
+        return 'auth_error'
     if record.get('stalled'):
         return 'stalled'
     if record.get('timed_out'):
@@ -601,7 +606,9 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                 '$ exit=%s timed_out=%s elapsed=%ss\n--- stdout\n%s\n--- stderr\n%s\n' % (
                     item['returncode'], item['timed_out'], item['elapsed_seconds'],
                     item['stdout'], item['stderr']) for item in logs)))
-            quota = bool(quota_error.search(result['stderr'] + result['stdout'][-4000:])) and result['returncode'] != 0
+            # A timeout is not a quota error even if the transcript happens to contain quota words.
+            quota = (bool(quota_error.search(result['stderr'] + result['stdout'][-4000:])) and
+                     result['returncode'] != 0 and not result['timed_out'])
             success_check = check_success(policy, name, result, before_tree != tree_fingerprint(cwd))
             if name == 'claude':
                 quota = final['failure'] == 'quota'
@@ -615,11 +622,21 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                 reason = failure_reason(result.get('stderr', ''), result.get('stdout', ''))
                 if reason:
                     record['failure_reason'] = reason
+            auth = (not record['ok'] and not quota and record.get('success_check') != 'refusal' and
+                    not result['timed_out'] and
+                    bool(AUTH_ERROR.search(result.get('stderr', '') + result.get('stdout', '')[-4000:])))
+            record['auth_error'] = auth
             if quota:
                 until = cooldown.record(name, text=result.get('stderr', '') + result.get('stdout', '')[-4000:],
                                         zone=config.tz(policy))
                 record['cooldown_until'] = until.isoformat()
                 summary['warnings'].append(f'{name} quota error: cooling down until {until.isoformat()}')
+            elif auth:
+                until = cooldown.record(name, reason='auth_error')
+                record['cooldown_until'] = until.isoformat()
+                record['unavailable'] = True
+                summary['warnings'].append(f'{name} auth error: unavailable until {until.isoformat()} '
+                                           f'(sign the CLI in again)')
         record['reason'] = hop_reason(record)
         record['output_path'] = str(path)
         summary['attempts'].append(record)

@@ -242,6 +242,19 @@ def _commit_message(task_text, job_id, workers, tests, verified=False):
             ('\n\nStackwich: verified' if verified else ''))
 
 
+def hops(summary):
+    """Every worker run in the job, in order: worker, reason (ok, quota_error, auth_error, timeout, ...)."""
+    out = []
+    for attempt in summary.get('attempts') or []:
+        for run in attempt.get('runs') or []:
+            if run.get('worker'):
+                out.append({'cycle': attempt.get('attempt'), 'worker': run['worker'],
+                            'reason': run.get('reason') or td.hop_reason(run), 'ok': bool(run.get('ok')),
+                            'elapsed_seconds': run.get('elapsed_seconds'),
+                            'unavailable': bool(run.get('quota_error') or run.get('auth_error'))})
+    return out
+
+
 def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full', worker=None,
             keep=None, policy=None, run_task=td.run_task, select=None, now=None, test_runner=td.run_bounded,
             popen=subprocess.Popen, notifier=None, meter=None, task_class=None):
@@ -340,6 +353,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             if after != before:
                 summary['ok'] = False
                 summary['warnings'].append('main checkout state changed during the job: review it')
+    summary['hops'] = hops(summary)
     summary['finished_at'] = td.now_local(policy).isoformat(timespec='seconds')
     summary = security.redact_obj(summary)
     jobs_dir = _path(policy, 'jobs_dir', 'logs/jobs')
@@ -433,7 +447,12 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
                 return
             if attempt_number == 0:
                 raise
-            break
+            # Earlier hops used up every eligible worker: report it as exhausted, not as a refusal.
+            summary['attempts'][-1]['refused'] = 'workers_exhausted: ' + str(refusal)
+            summary.update(status='failed', failover='exhausted')
+            summary['warnings'].append('failover exhausted: no untried eligible worker left ('
+                                       + ', '.join(sorted(used)) + ' tried)')
+            return
         if result.get('status') == 'handoff_to_orchestrator':
             # Every worker is out: the job goes back to the orchestrator, not refused.
             summary.update(status='handoff_to_orchestrator', task_file=result.get('task_file'),

@@ -131,6 +131,43 @@ class JobTests(unittest.TestCase):
         self.assertEqual(calls[1]['exclude'], ['codex', 'grok-build'])
         self.assertIn('no eligible worker', result['attempts'][1]['refused'])  # nobody re-runs
 
+    def test_auth_error_marks_worker_unavailable_and_fails_over(self):
+        self.worker("import sys; print('Failed to authenticate: OAuth session expired and could not be "
+                    "refreshed', file=sys.stderr); sys.exit(1)")
+        self.worker("open('out.txt','w').write('hi\\n')", 'grok-build')
+        result = self.job(test_cmd='test -f out.txt')
+        self.assertTrue(result['ok'], result)
+        runs = result['attempts'][0]['runs']
+        self.assertEqual([(r['worker'], r['reason']) for r in runs], [('codex', 'auth_error'), ('grok-build', 'ok')])
+        self.assertTrue(runs[0]['unavailable'])
+        self.assertFalse(runs[0]['quota_error'])
+        self.assertEqual(cooldown.active()['codex']['reason'] if isinstance(cooldown.active().get('codex'), dict)
+                         else 'auth_error', 'auth_error')
+        self.assertEqual([(h['worker'], h['reason'], h['unavailable']) for h in result['hops']],
+                         [('codex', 'auth_error', True), ('grok-build', 'ok', False)])
+
+    def test_live_case_auth_then_timeout_fails_over_to_third_worker(self):
+        # 31 Oct: claude auth failed in 3s, aider timed out, and the router refused the retry.
+        self.worker("import sys; print('OAuth session expired', file=sys.stderr); sys.exit(1)")
+        self.worker("import time, sys; print('quota exhausted? no, just slow'); sys.stdout.flush(); time.sleep(30)",
+                    'grok-build')
+        self.policy['run_task']['timeouts_seconds']['grok-build'] = 1
+        self.worker("open('out.txt','w').write('hi\\n')", 'cursor')
+        result = self.job(test_cmd='test -f out.txt', select=self.select_all)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual([(h['worker'], h['reason']) for h in result['hops']],
+                         [('codex', 'auth_error'), ('grok-build', 'timeout'), ('cursor', 'ok')])
+        self.assertNotIn('grok-bot', [h['worker'] for h in result['hops']])
+        self.assertNotIn('grok-build', cooldown.active())  # a timeout is not a quota cooldown
+
+    def test_exhausted_failover_is_reported_not_refused(self):
+        self.worker("import sys; print('OAuth session expired', file=sys.stderr); sys.exit(1)")
+        result = self.job(test_cmd='true')  # eligible: codex, grok-build (both fail)
+        self.assertFalse(result['ok'])
+        self.assertEqual((result['status'], result['failover']), ('failed', 'exhausted'))
+        self.assertEqual([h['worker'] for h in result['hops']], ['codex', 'grok-build'])
+        self.assertTrue(any('failover exhausted' in w for w in result['warnings']), result['warnings'])
+
     def test_lock_conflict_refused_without_side_effects(self):
         self.worker("open('out.txt','w').write('hi\\n')")
         repo_path = Path(git(self.repo, 'rev-parse', '--show-toplevel')).resolve()
