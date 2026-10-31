@@ -140,6 +140,54 @@ class TaskDispatchTests(unittest.TestCase):
         self.assertEqual(result['diff_stat'], '')
         self.assertEqual(result['untracked'], [])
 
+    def test_local_worker_capped_at_one(self):
+        self.policy['run_task']['slot_dir'] = str(self.out.parent / 'slots')
+        self.assertEqual(td.concurrency_cap(self.policy, 'developer'), 1)
+        self.assertIsNone(td.concurrency_cap(self.policy, 'codex'))
+        self.assertEqual(td.acquire_slot(self.policy, 'codex'), ('uncapped', None))
+        state, held = td.acquire_slot(self.policy, 'developer')
+        self.assertEqual(state, 'held')
+        try:
+            self.assertEqual(td.acquire_slot(self.policy, 'developer'), ('full', None))
+            with self.assertRaisesRegex(td.Refused, 'concurrency cap'):
+                self.run_task(size='draft', select=self.selection(['developer']),
+                              draft=lambda policy, prompt: 'draft text')
+        finally:
+            held.close()
+        result = self.run_task(size='draft', select=self.selection(['developer']),
+                               draft=lambda policy, prompt: 'draft text')
+        self.assertTrue(result['ok'])
+        state, held = td.acquire_slot(self.policy, 'developer')  # the run released its slot
+        self.assertEqual(state, 'held')
+        held.close()
+
+    def test_full_worker_is_skipped_for_next_eligible(self):
+        self.policy['run_task']['slot_dir'] = str(self.out.parent / 'slots')
+        self.policy['run_task']['concurrency']['codex'] = 2
+        held = [td.acquire_slot(self.policy, 'codex')[1] for _ in range(2)]
+        try:
+            calls = []
+            result = self.run_task(select=self.selection(['codex', 'grok-build']),
+                                   runner=self.fake_runner(['edit'], calls))
+            self.assertTrue(result['ok'])
+            self.assertEqual([a['worker'] for a in result['attempts']], ['grok-build'])
+            self.assertTrue(any('codex at its concurrency cap (2)' in w for w in result['warnings']))
+        finally:
+            for handle in held:
+                handle.close()
+
+    def test_slot_released_when_run_raises(self):
+        self.policy['run_task']['slot_dir'] = str(self.out.parent / 'slots')
+        self.policy['run_task']['concurrency']['codex'] = 1
+
+        def boom(*args, **kw):
+            raise RuntimeError('worker crashed')
+        with self.assertRaises(RuntimeError):
+            self.run_task(select=self.selection(['codex']), runner=boom)
+        state, held = td.acquire_slot(self.policy, 'codex')
+        self.assertEqual(state, 'held')
+        held.close()
+
     def test_no_eligible_worker_refuses(self):
         with self.assertRaisesRegex(td.Refused, 'no eligible'):
             self.run_task(select=self.selection([], reason='no_eligible_worker'))

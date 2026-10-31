@@ -92,6 +92,11 @@
     "extra_ledgers": [],
     "output_dir": "logs/task-output",
     "max_prompt_chars": 100000,
+    "concurrency": {
+      "developer": 1,
+      "_why": "Max simultaneous runs per worker across all jobs; unlisted workers are uncapped. The local model holds the whole 16GB machine, so one at a time."
+    },
+    "slot_dir": "state/slots",
     "prompt_prefix": "You are working in a git checkout. Make the requested change in this directory only. Do not run git commit, git push or any remote operation.",
     "quota_error_pattern": "(?i)(usage limit|rate limit|quota|out of credits|limit reached|exhausted)",
     "commands": {
