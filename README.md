@@ -84,8 +84,12 @@ with your config. Nothing personal ships in the package.
 | Config file | `$LLM_ROUTER_CONFIG`, else `<config dir>/config.json` |
 | Config dir | `$LLM_ROUTER_CONFIG_DIR`, else `$XDG_CONFIG_HOME/llm-router`, else `~/.config/llm-router` |
 | State dir (caches, ledger, logs, worktrees) | `$LLM_ROUTER_STATE_DIR`, else `$XDG_STATE_HOME/llm-router`, else `~/.local/state/llm-router` |
-| Per-repo settings (`test_cmd`, remote, required checks…) | `<config dir>/repos.json` |
+| Per-repo settings (`test_cmd`, `allow_no_tests`, remote, required checks…) | `<config dir>/repos.json` |
 | Private terms for the leak gate | `<config dir>/private_terms.txt` (one per line; keep it out of git) |
+
+run-job never commits untested work: without `--test-cmd` or `test_cmd` it auto-detects Python/Node/Swift
+tests, and a repo with none fails unless its `repos.json` entry sets `"allow_no_tests": true`. See
+[docs/configuration.md](docs/configuration.md#tests-test_cmd-auto-detection-allow_no_tests).
 
 Minimal `config.json`:
 

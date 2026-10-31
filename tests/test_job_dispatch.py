@@ -216,6 +216,106 @@ class JobTests(unittest.TestCase):
         with self.assertRaisesRegex(jd.Refused, 'not a git'):
             jd.run_job(self.base, self.task, policy=self.policy)
 
+    def test_config_test_cmd_is_recorded_with_its_source(self):
+        (self.base / 'repos.json').write_text(json.dumps({'main-repo': {'test_cmd': 'test -f out.txt'}}))
+        self.worker("open('out.txt','w').write('hi\\n')")
+        result = self.job()
+        self.assertTrue(result['ok'], result)
+        self.assertEqual((result['test_command'], result['test_command_source']), ('test -f out.txt', 'config'))
+        self.assertEqual(result['tests'][0]['source'], 'config')
+        saved = json.loads((self.base / 'jobs' / f'{result["job_id"]}.json').read_text())
+        self.assertEqual((saved['test_command'], saved['test_command_source']), ('test -f out.txt', 'config'))
+        cli = self.job(test_cmd='true', branch='router/cli-wins')
+        self.assertEqual((cli['test_command'], cli['test_command_source']), ('true', 'cli'))
+
+    def commit_files(self, files):
+        for name, text in files.items():
+            (self.repo / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / name).write_text(text)
+        subprocess.run(['git', '-C', str(self.repo), 'add', *files], check=True)
+        subprocess.run(['git', '-C', str(self.repo), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                        'commit', '-qm', 'project files'], check=True)
+
+    def test_auto_detects_python_unittest(self):
+        self.commit_files({'src/pkg/__init__.py': '', 'tests/test_out.py':
+                           'import os, unittest\nclass T(unittest.TestCase):\n'
+                           '    def test_out(self):\n        self.assertTrue(os.path.exists("out.txt"))\n'})
+        self.worker("open('out.txt','w').write('hi\\n')")
+        result = self.job()
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['test_command_source'], 'auto')
+        self.assertTrue(result['test_command'].startswith('PYTHONPATH=src '), result['test_command'])
+        self.assertTrue(result['test_command'].endswith('-m unittest discover -s tests'))
+        self.assertEqual(result['tests_status'], 'passed')
+
+    def test_detect_prefers_pytest_and_repo_venv(self):
+        root = self.base / 'py'
+        (root / 'tests').mkdir(parents=True)
+        self.assertEqual(jd.detect_test_cmd(root), f'{sys.executable} -m unittest discover -s tests')
+        (root / 'pyproject.toml').write_text('[tool.pytest.ini_options]\n')
+        source = self.base / 'source'
+        (source / '.venv' / 'bin').mkdir(parents=True)
+        (source / '.venv' / 'bin' / 'python').write_text('')
+        self.assertEqual(jd.detect_test_cmd(root, source), f'{source}/.venv/bin/python -m pytest')
+
+    def test_detect_node_and_swift(self):
+        root = self.base / 'proj'
+        root.mkdir()
+        self.assertIsNone(jd.detect_test_cmd(root))
+        (root / 'package.json').write_text(json.dumps({'scripts': {'test': 'echo "Error: no test specified" && exit 1'}}))
+        self.assertIsNone(jd.detect_test_cmd(root))
+        (root / 'Package.swift').write_text('')
+        self.assertEqual(jd.detect_test_cmd(root), 'swift test')
+        (root / 'package.json').write_text(json.dumps({'scripts': {'test': 'node --test'}}))
+        self.assertEqual(jd.detect_test_cmd(root), 'npm test --silent')
+
+    def test_auto_detects_node_in_job(self):
+        self.commit_files({'package.json': json.dumps({'scripts': {'test': 'test -f out.txt'}})})
+        self.worker("open('out.txt','w').write('hi\\n')")
+        calls = []
+
+        def runner(argv, cwd, *a, **kw):
+            calls.append(argv)
+            return {'returncode': 0, 'timed_out': False, 'stdout': '', 'stderr': '', 'elapsed_seconds': 0}
+        result = self.job(test_runner=runner)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual((result['test_command'], result['test_command_source']), ('npm test --silent', 'auto'))
+        self.assertEqual(calls, [['/bin/sh', '-c', 'npm test --silent']])
+
+    def test_no_tests_without_opt_in_fails_and_keeps_branch(self):
+        marker = self.base / 'worker-ran'
+        self.worker(f"open({str(marker)!r},'w').write('x'); open('out.txt','w').write('hi\\n')")
+        result = self.job()
+        self.assertFalse(result['ok'])
+        self.assertEqual((result['status'], result['tests_status']), ('no_tests', 'no_tests'))
+        self.assertEqual(result['reason'], 'no test command configured or detected')
+        self.assertIsNone(result['commit'])
+        self.assertIsNone(result['test_command_source'])
+        self.assertEqual((result['worktree_state'], result['branch_state']), ('kept', 'kept'))
+        self.assertNotEqual(git(self.repo, 'branch', '--list', result['branch']), '')
+        self.assertFalse(marker.exists())  # no worker run is spent on a change nothing would verify
+
+    def test_no_tests_allowed_only_on_opt_in(self):
+        (self.base / 'repos.json').write_text(json.dumps({'main-repo': {'allow_no_tests': True}}))
+        self.worker("open('out.txt','w').write('hi\\n')")
+        result = self.job()
+        self.assertTrue(result['ok'], result)
+        self.assertEqual((result['status'], result['tests_status']), ('committed', 'no_tests'))
+        self.assertIn('Tests: no_tests', git(self.repo, 'log', '-1', '--format=%B', result['commit']))
+
+    def test_skipped_never_counts_as_success(self):
+        self.worker("open('out.txt','w').write('hi\\n')")
+        skipped = lambda *a, **kw: {'status': 'skipped', 'command': None}
+        original = jd.run_tests
+        jd.run_tests = skipped
+        try:
+            result = self.job(test_cmd='true')
+        finally:
+            jd.run_tests = original
+        self.assertFalse(result['ok'])
+        self.assertIsNone(result['commit'])
+        self.assertEqual(result['tests_status'], 'skipped')
+
     def test_branch_beats_same_named_tag(self):
         branch = git(self.repo, 'symbolic-ref', '--short', 'HEAD')
         older = git(self.repo, 'rev-parse', 'HEAD')
@@ -512,11 +612,11 @@ class StackwichJobTests(unittest.TestCase):
         self.assertEqual(result['worktree_state'], 'kept')
 
     def test_missing_or_failing_tests_block(self):
-        for command in (None, 'false'):
+        for command, status in ((None, 'no_tests'), ('false', 'blocked_by_stackwich')):
             with self.subTest(command=command):
                 self.supported()
                 result = self.job(test_cmd=command)
-                self.assertEqual(result['status'], 'blocked_by_stackwich', result)
+                self.assertEqual(result['status'], status, result)
                 self.assertIsNone(result['commit'])
 
     def test_unsupported_fallback_has_no_trailer(self):

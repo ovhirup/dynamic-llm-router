@@ -10,9 +10,11 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 
 from . import alerts, config, security, stackwich
@@ -92,9 +94,47 @@ def repo_settings(policy, repo):
     return data.get(str(repo)) or data.get(repo.name) or {}
 
 
+NO_TESTS_REASON = 'no test command configured or detected'
+_NPM_PLACEHOLDER = 'no test specified'
+
+
+def _pytest_configured(root):
+    if (root / 'pytest.ini').is_file():
+        return True
+    for name, marker in (('pyproject.toml', '[tool.pytest'), ('setup.cfg', '[tool:pytest]')):
+        try:
+            if marker in (root / name).read_text(errors='replace'):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def detect_test_cmd(worktree, source_repo=None):
+    """A test command inferred from the checkout at base (Python, Node, Swift), or None. Python runs with the source
+    repo's .venv interpreter when it has one, else this interpreter."""
+    root = Path(worktree)
+    venv = Path(source_repo or root) / '.venv' / 'bin' / 'python'
+    python = shlex.quote(str(venv) if venv.is_file() else sys.executable)
+    if _pytest_configured(root):
+        return f'{python} -m pytest'
+    if (root / 'tests').is_dir():
+        prefix = 'PYTHONPATH=src ' if (root / 'src').is_dir() else ''
+        return f'{prefix}{python} -m unittest discover -s tests'
+    try:
+        script = (json.loads((root / 'package.json').read_text()).get('scripts') or {}).get('test')
+    except (OSError, ValueError, AttributeError):
+        script = None
+    if isinstance(script, str) and script.strip() and _NPM_PLACEHOLDER not in script:
+        return 'npm test --silent'
+    if (root / 'Package.swift').is_file():
+        return 'swift test'
+    return None
+
+
 def run_tests(policy, cwd, command, timeout, log_path, runner=td.run_bounded):
     if not command:
-        return {'status': 'skipped', 'command': None}
+        return {'status': 'no_tests', 'command': None}
     env, _ = td.worker_environment(policy)
     # Python reads and writes bytecode only under a fresh router-owned prefix, never an in-tree __pycache__
     # (linked or not), so bytecode planted in the worktree or behind a tracked cache link is never executed.
@@ -219,7 +259,13 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
     task_path = Path(task_file).expanduser().resolve()
     task_text = task_path.read_text()
     settings = repo_settings(policy, repo)
-    test_cmd = test_cmd if test_cmd is not None else settings.get('test_cmd')
+    if test_cmd:
+        test_source = 'cli'
+    elif settings.get('test_cmd'):
+        test_cmd, test_source = settings['test_cmd'], 'config'
+    else:
+        test_cmd, test_source = None, None
+    allow_no_tests = settings.get('allow_no_tests') is True
     test_timeout = settings.get('test_timeout_seconds', policy['run_job']['test_timeout_seconds'])
     base_ref = base or 'HEAD'
     base_sha = resolve_base(repo, base_ref)
@@ -253,6 +299,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
                'base_sha': base_sha, 'branch': branch, 'worktree': str(worktree), 'size': size,
                'started_at': started.isoformat(timespec='seconds'), 'finished_at': None,
                'ok': False, 'status': None, 'commit': None, 'diff_stat': '', 'tests': [],
+               'test_command': None, 'test_command_source': None, 'allow_no_tests': allow_no_tests,
                'tests_status': None, 'leak_check': None, 'blocked_by_leak_check': False,
                'attempts': [], 'workers': [], 'worktree_state': None, 'branch_state': None,
                'main_checkout_untouched': None, 'warnings': []}
@@ -261,8 +308,18 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
         worktree.parent.mkdir(parents=True, exist_ok=True)
         _git(repo, 'worktree', 'add', '-q', '-b', branch, str(worktree), base_sha, check=True)
         try:
-            _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd,
-                      test_timeout, stamp, out_dir, run_task, select, test_runner)
+            if not test_cmd:  # detected at base, so the worker cannot choose the command that judges it
+                test_cmd = detect_test_cmd(worktree, repo)
+                test_source = 'auto' if test_cmd else None
+            summary['test_command'] = security.redact(test_cmd) if test_cmd else None
+            summary['test_command_source'] = test_source
+            if test_cmd or allow_no_tests:
+                _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd,
+                          test_timeout, stamp, out_dir, run_task, select, test_runner, allow_no_tests)
+            else:  # fail before spending a worker run on a change nothing would verify
+                summary.update(status='no_tests', tests_status='no_tests', reason=NO_TESTS_REASON)
+                summary['warnings'].append(NO_TESTS_REASON + ': set test_cmd, pass --test-cmd, or set '
+                                           '"allow_no_tests": true in repos.json')
         except Refused as refusal:
             summary['status'] = 'refused'
             summary['warnings'].append(str(refusal))
@@ -318,7 +375,9 @@ class _NoSleep:
 
 
 def _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd, test_timeout,
-              stamp, out_dir, run_task, select, test_runner):
+              stamp, out_dir, run_task, select, test_runner, allow_no_tests=False):
+    # 'no_tests' passes only on the repo's explicit opt-in; anything else ('skipped', 'not_run') never does.
+    passing = ('passed', 'no_tests') if allow_no_tests else ('passed',)
     extra = None
     test_artifacts, worker_paths = set(), set()
     required, pinned, evidence = False, None, None
@@ -394,6 +453,7 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         if result['ok'] and changed:
             tests = run_tests(policy, worktree, test_cmd, test_timeout,
                               out_dir / f'{stamp}-a{cycle}-tests.log', test_runner)
+            tests['source'] = summary.get('test_command_source')
             test_artifacts |= changed_paths(worktree) - worker_paths - {stackwich.REPORT_PATH}
         if required:
             scan = _report_leak_check(policy, worktree, summary['base_sha'])
@@ -430,7 +490,7 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
                                     'warnings': result.get('warnings')})
         if selected and selected not in summary['workers']:
             summary['workers'].append(selected)
-        if result['ok'] and changed and tests['status'] in ('passed', 'skipped') and (
+        if result['ok'] and changed and tests['status'] in passing and (
                 not required or evidence['status'] == 'verified'):
             break
         if claude_refusal or (claude_quota and not result.get('ok')):
@@ -448,7 +508,7 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         summary['status'] = 'blocked_by_stackwich' if required else 'failed'
         return
     last = summary['attempts'][-1]
-    if not (last.get('ok') and last.get('changed') and last.get('tests') in ('passed', 'skipped')):
+    if not (last.get('ok') and last.get('changed') and last.get('tests') in passing):
         summary['status'] = 'blocked_by_stackwich' if required else 'failed'
         return
     if required:
@@ -503,9 +563,9 @@ def _finish(policy, summary, repo, worktree, branch, base_sha, keep):
         summary['status'] = 'failed'
     success = summary['ok']
     leak = summary['blocked_by_leak_check']
-    blocked = summary['status'] == 'blocked_by_stackwich'
+    blocked = summary['status'] in ('blocked_by_stackwich', 'no_tests')
     prune = keep is False or (keep is None and not success and not leak and not blocked)
-    if blocked and keep is None:
+    if summary['status'] == 'blocked_by_stackwich' and keep is None:
         summary['warnings'].append('Stackwich blocked: worktree kept for review')
     if leak and keep is None:
         summary['warnings'].append('leak check hit: worktree kept for review (nothing deleted)')
