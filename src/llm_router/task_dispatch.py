@@ -616,7 +616,8 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                 if reason:
                     record['failure_reason'] = reason
             if quota:
-                until = cooldown.record(name)
+                until = cooldown.record(name, text=result.get('stderr', '') + result.get('stdout', '')[-4000:],
+                                        zone=config.tz(policy))
                 record['cooldown_until'] = until.isoformat()
                 summary['warnings'].append(f'{name} quota error: cooling down until {until.isoformat()}')
         record['reason'] = hop_reason(record)

@@ -72,3 +72,45 @@ class CooldownTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+class ResetTextTests(unittest.TestCase):
+    NOW = datetime(2026, 10, 31, 10, tzinfo=timezone.utc)
+
+    def setUp(self):
+        cooldown.path().unlink(missing_ok=True)
+        self.addCleanup(cooldown.path().unlink, missing_ok=True)
+
+    def test_codex_usage_limit_message(self):
+        text = "You've hit your usage limit. Upgrade or try again later; limit resets Nov 4, 12:17 PM."
+        self.assertEqual(cooldown.reset_from_text(text, self.NOW, IST), datetime(2026, 11, 4, 12, 17, tzinfo=IST))
+
+    def test_retry_after_seconds(self):
+        self.assertEqual(cooldown.reset_from_text('429 Too Many Requests. Retry-After: 120', self.NOW),
+                         self.NOW + timedelta(seconds=120))
+
+    def test_year_rollover_and_no_match(self):
+        now = datetime(2026, 12, 31, 10, tzinfo=timezone.utc)
+        self.assertEqual(cooldown.reset_from_text('resets Jan 2, 9:00 AM', now, IST),
+                         datetime(2027, 1, 2, 9, tzinfo=IST))
+        self.assertIsNone(cooldown.reset_from_text("You're out of usage", now, IST))
+        self.assertIsNone(cooldown.reset_from_text('', now, IST))
+
+    def test_record_prefers_text_then_falls_back(self):
+        until = cooldown.record('codex', now=self.NOW, observation={}, text='usage limit, resets Nov 4, 12:17 PM', zone=IST)
+        self.assertEqual(until, datetime(2026, 11, 4, 12, 17, tzinfo=IST))
+        self.assertIn('codex', cooldown.active(self.NOW + timedelta(days=3)))
+        self.assertNotIn('codex', cooldown.active(datetime(2026, 11, 4, 12, 18, tzinfo=IST)))
+        self.assertEqual(cooldown.record('cursor', now=self.NOW, observation={}, text="You're out of usage"),
+                         self.NOW + timedelta(hours=1))
+
+    def test_quota_pattern_matches_live_messages(self):
+        import re
+        pattern = re.compile(load_policy()['run_task']['quota_error_pattern'])
+        for text in ("You're out of usage. Switch to Auto or upgrade.", 'HTTP 429 Too Many Requests',
+                     'usage limit, resets Nov 4, 12:17 PM'):
+            self.assertTrue(pattern.search(text), text)
+        self.assertFalse(pattern.search('Ran 4290 tests'))

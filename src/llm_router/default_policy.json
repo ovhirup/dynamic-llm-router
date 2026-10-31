@@ -98,7 +98,7 @@
     },
     "slot_dir": "state/slots",
     "prompt_prefix": "You are working in a git checkout. Make the requested change in this directory only. Do not run git commit, git push or any remote operation.",
-    "quota_error_pattern": "(?i)(usage limit|rate limit|quota|out of credits|limit reached|exhausted)",
+    "quota_error_pattern": "(?i)(usage limit|rate limit|quota|out of credits|limit reached|exhausted|out of usage|too many requests|\\b429\\b)",
     "commands": {
       "codex": [
         "{codex}",
