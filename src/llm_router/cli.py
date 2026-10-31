@@ -63,6 +63,22 @@ def build_parser():
     clean.add_argument('--older-than', required=True, help='age like 30m, 12h or 7d')
     clean.add_argument('--dry-run', action='store_true')
 
+    unit_cmd = commands.add_parser('units', help='One worktree + branch per task-DAG unit (parallel isolation)')
+    unit_cmds = unit_cmd.add_subparsers(dest='units_command', required=True)
+    unit_create = unit_cmds.add_parser('create', help='Create a unit batch from a units JSON file')
+    unit_create.add_argument('--repo', required=True)
+    unit_create.add_argument('--units-file', required=True,
+                             help='unit list (one worker per unit in `workers`) or {"units": [...], "assign": {...}}')
+    unit_create.add_argument('--base', default='HEAD')
+    unit_list = unit_cmds.add_parser('list', help='List unit batches')
+    unit_list.add_argument('--repo')
+    unit_remove = unit_cmds.add_parser('remove', help='Remove a batch: worktrees, and branches with no commits')
+    unit_remove.add_argument('--repo', required=True)
+    unit_remove.add_argument('--batch', required=True)
+    branches = unit_remove.add_mutually_exclusive_group()
+    branches.add_argument('--keep-branches', action='store_true', help='delete no branches')
+    branches.add_argument('--all-branches', action='store_true', help='delete branches even with commits')
+
     evaluate = commands.add_parser('eval', help='Evaluation harness: replay past jobs and A/B two routing policies')
     eval_cmds = evaluate.add_subparsers(dest='eval_command', required=True)
     capture = eval_cmds.add_parser('capture', help='Build the replay corpus (JSONL) from run-job logs')
@@ -361,6 +377,22 @@ def main(argv=None):
         if result.get('status') == 'handoff_to_orchestrator':
             return 0
         return 3 if result.get('status') == 'refused' else 0 if result.get('ok', True) else 1
+    if args.command == 'units':
+        from . import unit_worktrees as uw
+        try:
+            if args.units_command == 'create':
+                units, assignment = uw.load_units_file(args.units_file)
+                result = uw.create_batch(args.repo, units, assignment, base=args.base, policy=policy)
+            elif args.units_command == 'list':
+                result = uw.list_batches(policy=policy, repo=args.repo)
+            else:
+                result = uw.remove_batch(args.repo, args.batch, keep_branches=args.keep_branches,
+                                         all_branches=args.all_branches, policy=policy)
+        except uw.Refused as refusal:
+            print(json.dumps({'ok': False, 'refused': str(refusal)}))
+            return 3
+        _print(result)
+        return 0 if result.get('ok', True) else 1
     if args.command == 'run-task':
         from . import task_dispatch
         try:
