@@ -11,7 +11,7 @@ from pathlib import Path
 
 from helpers import load_policy, TERM
 from llm_router import job_dispatch as jd
-from llm_router import task_dispatch as td
+from llm_router import cooldown, task_dispatch as td
 from test_task_dispatch import repo
 
 
@@ -97,6 +97,39 @@ class JobTests(unittest.TestCase):
         second = capture.read_text().split('=====')[1]
         self.assertIn('Previous attempt did not pass', second)
         self.assertRegex(second, r'FAILMARK-lines= *1')
+
+    def select_all(self, chars, **kw):
+        return {'eligible': ['codex', 'grok-bot', 'grok-build', 'cursor'],
+                'meters': {'codex': 10, 'grok-build': 10, 'cursor': 10}, 'reason': 'test'}
+
+    def test_quota_error_fails_over_to_next_worker(self):
+        self.worker("import sys; print('Usage limit reached', file=sys.stderr); sys.exit(1)")
+        self.worker("open('out.txt','w').write('hi\\n')", 'grok-build')
+        result = self.job(test_cmd='test -f out.txt', select=self.select_all)
+        self.assertTrue(result['ok'], result)
+        runs = result['attempts'][0]['runs']
+        self.assertEqual([(r['worker'], r['reason']) for r in runs],
+                         [('codex', 'quota_error'), ('grok-build', 'ok')])
+        self.assertIn('codex', cooldown.active())
+
+    def test_three_failed_workers_end_the_job(self):
+        result = self.job(test_cmd='true', select=self.select_all)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['status'], 'failed')
+        runs = [r for a in result['attempts'] for r in a.get('runs') or []]
+        self.assertEqual([r['worker'] for r in runs], ['codex', 'grok-build', 'cursor'])
+        self.assertTrue(all(r['reason'] not in (None, 'ok') for r in runs), runs)
+
+    def test_failed_worker_is_not_retried_in_the_next_cycle(self):
+        calls = []
+        def run_task(*args, **kwargs):
+            calls.append(kwargs)
+            return td.run_task(*args, **kwargs)
+        result = self.job(test_cmd='true', run_task=run_task)  # eligible: codex, grok-build
+        self.assertFalse(result['ok'])
+        self.assertEqual([r['worker'] for r in result['attempts'][0]['runs']], ['codex', 'grok-build'])
+        self.assertEqual(calls[1]['exclude'], ['codex', 'grok-build'])
+        self.assertIn('no eligible worker', result['attempts'][1]['refused'])  # nobody re-runs
 
     def test_lock_conflict_refused_without_side_effects(self):
         self.worker("open('out.txt','w').write('hi\\n')")

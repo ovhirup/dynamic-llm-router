@@ -177,12 +177,13 @@ class DispatchTests(unittest.TestCase):
                 self.assertEqual(result['attempts'][0]['success_check'], 'refusal')
                 self.assertFalse(result['attempts'][0]['quota_error'])
 
-    def test_quota_failover_is_paced_and_only_once(self):
+    def test_quota_failover_is_paced_and_capped_at_three_workers(self):
         result = self.run_claude([{'stdout': 'Usage limit reached'}], codex_meter=90)
         self.assertEqual(len(result['attempts']), 1)
         self.assertTrue(any('failover skipped' in warning for warning in result['warnings']))
-        result = self.run_claude([{'stdout': "You've hit your session limit"}, {'returncode': 1, 'stdout': 'quota'}])
-        self.assertEqual([r['worker'] for r in result['attempts']], ['claude', 'codex'])
+        result = self.run_claude([{'stdout': "You've hit your session limit"}, {'returncode': 1, 'stdout': 'quota'},
+                                  {'returncode': 1, 'stdout': 'quota'}])
+        self.assertEqual([r['worker'] for r in result['attempts']], ['claude', 'codex', 'cursor'])
         self.assertFalse(result['ok'])
 
     def test_refusal(self):
