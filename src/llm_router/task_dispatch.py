@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.request
 
-from . import claude_handoff, config, security, stackwich
+from . import claude_handoff, config, cooldown, security, stackwich
 
 
 
@@ -566,6 +566,10 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                 reason = failure_reason(result.get('stderr', ''), result.get('stdout', ''))
                 if reason:
                     record['failure_reason'] = reason
+            if quota:
+                until = cooldown.record(name)
+                record['cooldown_until'] = until.isoformat()
+                summary['warnings'].append(f'{name} quota error: cooling down until {until.isoformat()}')
         record['output_path'] = str(path)
         summary['attempts'].append(record)
         summary.update(worker=name, ok=record['ok'], output_path=str(path), stackwich=record['stackwich'])
