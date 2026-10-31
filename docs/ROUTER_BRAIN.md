@@ -86,3 +86,12 @@ Once public, DLR lets users plug in productivity tools over MCP via a simple plu
 (input source / context / notifier / output sink), and how to call it. Reference plugins: Hark (voice dictation and
 meeting transcripts become task files, searchable via hark-mcp; #19), the Obsidian vault (#50), notifiers
 (Slack/email summaries). Per-plugin opt-in consent and permissions; no secrets in logs.
+
+## (i) Notch actionable approvals
+Code lives outside this repo: `~/dev/notch-dashboard` (ovhirup/notch-dashboard; `RouterNotchCore/OrchestrationLogic.swift`
+banners, `ProjectsLogic.swift` counts, `RouterNotch/ActivityWorkspace.swift`, `RequestCenter.swift`) and `~/dev/router-live`
+(DLR Live iPhone; `RouterLiveCore/RejectAction.swift`, `RouterLiveRelayKit/RequestInbox.swift`, `PushPolicy.swift`).
+Plan: approval rows deep-link to the decision owner (Grok Bot chat vs worker job/worktree/log); low-risk items get inline
+Approve/Reject with a one-line summary; high-risk actions (merge, push, PR, config/secrets edits, spend, deletes) are never
+one-tap: full context/diff + confirm; audit log to job log + vault; actionable notices (Grok Bot fallback / wait until
+reset; meter heads-up -> Usage tab); same on iPhone with Face ID; blocked items show reason + one next step; undo/expiry.
