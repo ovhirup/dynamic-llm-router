@@ -78,6 +78,11 @@ def build_parser():
     branches = unit_remove.add_mutually_exclusive_group()
     branches.add_argument('--keep-branches', action='store_true', help='delete no branches')
     branches.add_argument('--all-branches', action='store_true', help='delete branches even with commits')
+    unit_queue = unit_cmds.add_parser('queue', help='Merge queue: gate finished units (tests, diff scope, review); '
+                                      'never pushes or merges')
+    unit_queue.add_argument('--batch', required=True)
+    unit_qstatus = unit_cmds.add_parser('queue-status', help='List merge-queue entries and their gate results')
+    unit_qstatus.add_argument('--batch')
 
     evaluate = commands.add_parser('eval', help='Evaluation harness: replay past jobs and A/B two routing policies')
     eval_cmds = evaluate.add_subparsers(dest='eval_command', required=True)
@@ -378,9 +383,14 @@ def main(argv=None):
             return 0
         return 3 if result.get('status') == 'refused' else 0 if result.get('ok', True) else 1
     if args.command == 'units':
+        from . import merge_queue
         from . import unit_worktrees as uw
         try:
-            if args.units_command == 'create':
+            if args.units_command == 'queue':
+                result = merge_queue.queue_batch(args.batch, policy=policy)
+            elif args.units_command == 'queue-status':
+                result = merge_queue.queue_status(args.batch, policy=policy)
+            elif args.units_command == 'create':
                 units, assignment = uw.load_units_file(args.units_file)
                 result = uw.create_batch(args.repo, units, assignment, base=args.base, policy=policy)
             elif args.units_command == 'list':
