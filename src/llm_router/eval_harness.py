@@ -102,24 +102,26 @@ def fake_outcome(case, spec, profiles, use_recorded=True):
                 hops=hops)
 
 
-def live_outcome(case, spec, base_policy, run_job, meter):
+def live_outcome(case, spec, base_policy, run_job, meter, size=None):
     """Run the case through run-job once under `spec` and turn the job summary into an outcome."""
     policy = config.deep_merge(base_policy, spec.get('config') or {})
     if spec.get('worker_order'):
         policy['worker_order'] = list(spec['worker_order'])
     if spec.get('never') is not None:
         policy['never'] = list(spec['never'])
+    effective_size = size or case.get('size') or 'full'
     with tempfile.TemporaryDirectory(prefix='llm-router-eval-') as tmp:
         task = Path(tmp) / (case.get('task') or f'{case["case_id"]}.md')
         task.write_text(case['task_text'])
         before = {w: meter(w) for w in order_for(spec)}
         job = run_job(case['repo'], str(task), base=case['base_sha'], worker=spec.get('worker'),
-                      size=case.get('size') or 'full', keep=False, policy=policy)
+                      size=effective_size, keep=False, policy=policy)
     workers = job.get('workers') or []
     spent = [meter(w) - before[w] for w in workers
              if type(before.get(w)) in (int, float) and type(meter(w)) in (int, float)]
     observed = eval_corpus.case_from_job(job)['baseline']
     return {'case_id': case['case_id'], 'worker': workers[-1] if workers else None,
+            'size': effective_size,
             'tests_status': job.get('tests_status'), 'changed_paths': observed['changed_paths'],
             'tokens': observed['tokens'], 'quota_percent': round(sum(spent), 2) if spent else None,
             'elapsed_seconds': observed['elapsed_seconds'], 'reviewer_score': job.get('reviewer_score'),
@@ -127,11 +129,13 @@ def live_outcome(case, spec, base_policy, run_job, meter):
 
 
 def run(cases, specs, mode='offline', profiles=None, policy=None, confirm=False, run_job=None, meter=None,
-        use_recorded=True):
+        use_recorded=True, size=None):
     """Replay `cases` under both specs and return the A/B report dict (nothing is written)."""
     specs = validate_specs(specs)
     if mode not in ('offline', 'live'):
         raise Refused('mode must be offline or live')
+    if size is not None and size not in ('draft', 'full'):
+        raise Refused('size override must be draft or full')
     if mode == 'live' and not confirm:
         raise Refused('live mode runs real workers and spends quota: pass --yes to confirm')
     replayable = [c for c in cases if c.get('replayable')]
@@ -143,12 +147,13 @@ def run(cases, specs, mode='offline', profiles=None, policy=None, confirm=False,
             from .job_dispatch import run_job
         if meter is None:
             from .handoff import meter_percent as meter
-    report = {'mode': mode, 'baseline': specs[0]['name'], 'candidate': specs[1]['name'],
+    report = {'mode': mode, 'size_override': size, 'baseline': specs[0]['name'], 'candidate': specs[1]['name'],
               'cases': len(replayable), 'skipped': skipped, 'policies': {}}
     for spec in specs:
-        outcomes = [fake_outcome(c, spec, profiles or {}, use_recorded) if mode == 'offline'
-                    else live_outcome(c, spec, policy, run_job, meter) for c in replayable]
-        scores = [dict(eval_score.score(o, c['baseline'].get('changed_paths')), hops=o.get('hops'))
+        outcomes = [dict(fake_outcome(c, spec, profiles or {}, use_recorded), size=size or c.get('size') or 'full')
+                    if mode == 'offline'
+                    else live_outcome(c, spec, policy, run_job, meter, size=size) for c in replayable]
+        scores = [dict(eval_score.score(o, c['baseline'].get('changed_paths')), hops=o.get('hops'), size=o.get('size'))
                   for o, c in zip(outcomes, replayable)]
         report['policies'][spec['name']] = {'spec': spec, 'metrics': eval_score.aggregate(scores),
                                             'scores': scores}
@@ -161,7 +166,8 @@ def render_markdown(report):
     names = [report['baseline'], report['candidate']]
     keys = ['cases', 'pass_rate', 'quality_mean', 'tokens_total', 'tokens_mean', 'quota_percent_mean',
             'elapsed_seconds_median', 'elapsed_seconds_mean']
-    lines = [f'# Router eval: {names[0]} (baseline) vs {names[1]} ({report["mode"]})', '',
+    size_tag = f', size={report["size_override"]}' if report.get('size_override') else ''
+    lines = [f'# Router eval: {names[0]} (baseline) vs {names[1]} ({report["mode"]}{size_tag})', '',
              f'| metric | {names[0]} | {names[1]} |', '|---|---|---|']
     for key in keys:
         values = [report['policies'][n]['metrics'].get(key) for n in names]
