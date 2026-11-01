@@ -131,6 +131,11 @@ def build_parser():
         agent = commands.add_parser(name, help='macOS LaunchAgent for quota refresh (dry run unless --yes)')
         agent.add_argument('--yes', action='store_true', help='actually write/load the agent')
 
+    wd = commands.add_parser('watchdog', help='Monitor running jobs for stalls, loops, drift, or infra failures')
+    wd.add_argument('--stall-seconds', type=float, default=300, help='seconds without heartbeat/log before stalled')
+    wd.add_argument('--loop-threshold', type=int, default=3, help='repeated identical lines before looping')
+    wd.add_argument('--recover', action='store_true', help='terminate unhealthy workers and reassign to next eligible')
+
     scan = commands.add_parser('scan', help='Leak-scan a git tree (tracked + untracked, not ignored) before publishing')
     scan.add_argument('path', nargs='?', default='.')
     scan.add_argument('--terms', help='private terms file (default: the configured private_terms_file)')
@@ -311,6 +316,12 @@ def main(argv=None):
         report = doctor(policy)
         _print(report)
         return 0 if report['ok'] else 1
+    if args.command == 'watchdog':
+        from . import watchdog
+        report = watchdog.check_all(policy=policy, stall_seconds=args.stall_seconds,
+                                    loop_threshold=args.loop_threshold, recover=args.recover)
+        _print(report)
+        return 0 if report['ok'] or args.recover else 1
     if args.command == 'scan':
         from . import security, task_dispatch
         terms = security.load_terms(args.terms) if args.terms else task_dispatch.private_terms(policy)
