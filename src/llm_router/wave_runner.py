@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
-from . import agent_map, alerts, config, orchestrator as orch_module, security, task_dag, task_dispatch
+from . import agent_map, alerts, config, orchestrator as orch_module, security, task_dag, task_dispatch, traces
 from . import merge_queue
 from . import unit_worktrees as uw
 from .job_dispatch import Refused, _git
@@ -275,6 +275,13 @@ def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=N
             ok = bool(outcome.get('ok'))
             record.update(ok=ok, status=outcome.get('status') or ('ok' if ok else 'failed'),
                           reason=outcome.get('reason'))
+            traces.record_span(
+                policy, manifest['batch_id'], name=f'unit:{uid}', kind='unit',
+                span_id=f"{manifest['batch_id']}-{uid}", parent_span_id=f"{manifest['batch_id']}-wave-{wave_no}",
+                side_effect='mutating', status='ok' if ok else 'failed', worker=entry['worker'],
+                depends_on=[f"{manifest['batch_id']}-{d}" for d in by_id[uid]['deps']],
+                error=outcome.get('reason') if not ok else None,
+            )
             summary['ok'] = summary['ok'] and ok
             if ok:
                 succeeded.add(uid)
