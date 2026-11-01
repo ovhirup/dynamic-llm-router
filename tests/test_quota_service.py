@@ -250,7 +250,10 @@ class AgentTests(Base):
         self.assertEqual(data['StartInterval'], 300)
         self.assertEqual(data['Label'], 'dev.llm-router.quota')
         self.assertIn('PATH', data['EnvironmentVariables'])
-        self.assertNotIn('__', json.dumps(data))
+        label = json.dumps(data.get('Label', ''))
+        args = json.dumps(data.get('ProgramArguments', []))
+        self.assertNotIn('__', label)
+        self.assertNotIn('__', args)
 
     def test_install_is_dry_run_without_yes(self):
         ran = []

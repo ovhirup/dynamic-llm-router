@@ -18,11 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-<<<<<<< HEAD
-from . import agent_map, alerts, brain, config, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, triage
-=======
-from . import agent_map, alerts, brain, config, feedback, handoff, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, triage
->>>>>>> 5fb7d23 (router: Issue #68: Outcome feedback loop updates worker scorecards)
+from . import agent_map, alerts, brain, config, feedback, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, triage
 from . import task_dispatch as td
 
 Refused = td.Refused
