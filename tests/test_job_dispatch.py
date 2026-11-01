@@ -7,11 +7,12 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from helpers import load_policy, TERM
 from llm_router import job_dispatch as jd
-from llm_router import cooldown, task_dispatch as td
+from llm_router import cooldown, selection, task_dispatch as td
 from test_task_dispatch import repo
 
 
@@ -19,7 +20,9 @@ def git(cwd, *args):
     return subprocess.run(['git', '-C', str(cwd), *args], capture_output=True, text=True).stdout.strip()
 
 
-class JobTests(unittest.TestCase):
+class JobFixture(unittest.TestCase):
+    """A main repo with a dirty checkout, a task file and a test policy; every worker starts failing."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name)
@@ -64,6 +67,9 @@ class JobTests(unittest.TestCase):
         self.assertEqual(jd.main_state(self.repo), before)
         self.assertEqual((self.repo / 'local-notes.txt').read_text(), 'user work in progress\n')
         self.assertFalse((self.repo / 'out.txt').exists())
+
+
+class JobTests(JobFixture):
 
     def test_success_commits_on_router_branch_only(self):
         self.worker("open('out.txt','w').write('hi\\n')")
@@ -540,6 +546,91 @@ class JobTests(unittest.TestCase):
         report = jd.cleanup('0m', policy=self.policy)
         self.assertEqual(report['skipped'][0]['why'], 'uncommitted changes')
         self.assertTrue(Path(done['worktree']).exists())
+
+
+class AllWorkersOutNeverIdleTests(JobFixture):
+    """Issue #28: with every cloud worker out, run-job still does work (local) or hands off; never idles."""
+    CLOUD = ('claude', 'codex', 'grok-build', 'cursor')
+    CLASS_ORDER = {
+        'mechanical': ['grok-build', 'codex', 'cursor', 'aider-ollama', 'grok-bot'],
+        'feature': ['claude', 'grok-build', 'cursor', 'codex', 'grok-bot'],
+        'bugfix': ['grok-build', 'codex', 'claude', 'cursor', 'grok-bot'],
+        'review': ['codex', 'claude', 'grok-build', 'grok-bot'],
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.now = datetime.now(timezone.utc).replace(microsecond=0)
+        rt = self.policy['run_task']
+        rt['commands']['aider-ollama'] = ['fake']
+        rt['timeouts_seconds']['aider-ollama'] = 60
+        self.policy['unmetered_workers'] = ['aider-ollama']
+        self.policy['class_order'] = copy.deepcopy(self.CLASS_ORDER)
+        self.worker("import sys; sys.exit(3)", 'claude')  # a cloud run here would be a bug
+        stamp = lambda delta: (self.now + delta).isoformat()
+        # claude and codex read percent_used 100 from their meters; grok-build and cursor are cooling down.
+        self.io = {}
+        for name in ('claude', 'codex'):
+            self.policy['quota'][name]['enabled'] = True
+            windows = {w: {'percent_used': 100, 'observed_at': stamp(timedelta(minutes=-1)),
+                           'expires_at': stamp(timedelta(hours=1)), 'reset_at': stamp(timedelta(hours=5))}
+                       for w in ('primary', 'weekly')}
+            observation = {'evidence': {'source_worker': name, 'required_windows': ['primary', 'weekly'],
+                                        'windows': windows}}
+            self.io[name] = {'load': (lambda o=observation: o), 'save': lambda o: None,
+                             'observe': lambda p: self.fail('no live meter read when the cache is exhausted')}
+        self.cooldowns = {w: {'until': stamp(timedelta(hours=1))} for w in ('grok-build', 'cursor')}
+
+    def select(self, chars, **kw):
+        return selection.select(chars, policy=self.policy, io=self.io, now=self.now,
+                                cooldowns=self.cooldowns, **kw)
+
+    def assert_cloud_skipped(self, result, task_class):
+        for name in self.CLASS_ORDER[task_class]:
+            if name in self.CLOUD:
+                self.assertNotIn(name, result['eligible'], (task_class, result['reasons']))
+                self.assertRegex(result['reasons'][name], r'^(quota_exhausted|cooldown_until_)')
+
+    def test_mechanical_runs_local_worker_and_commits_on_router_branch(self):
+        chosen = self.select(10000, task_class='mechanical')
+        self.assert_cloud_skipped(chosen, 'mechanical')
+        self.assertEqual((chosen['worker'], chosen['reason']), ('aider-ollama', 'preferred_eligible_worker'))
+        self.worker("open('out.txt','w').write('local\\n')", 'aider-ollama')
+        before = jd.main_state(self.repo)
+        result = self.job(test_cmd='test -f out.txt', task_class='mechanical')
+        self.assertTrue(result['ok'], result)
+        self.assertEqual((result['status'], result['tests_status']), ('committed', 'passed'))
+        self.assertEqual(result['workers'], ['aider-ollama'])
+        self.assertEqual([h['worker'] for h in result['hops']], ['aider-ollama'])
+        self.assertTrue(result['branch'].startswith('router/add-feature-'))
+        self.assertEqual(git(self.repo, 'rev-parse', result['branch']), result['commit'])
+        self.assertEqual(git(self.repo, 'rev-parse', 'HEAD'), result['base_sha'])
+        self.assertIs(result['main_checkout_untouched'], True)
+        self.assertEqual(jd.main_state(self.repo), before)
+        self.assertFalse((self.repo / 'out.txt').exists())
+
+    def test_non_mechanical_classes_hand_off_to_orchestrator_not_refused(self):
+        for task_class in ('feature', 'bugfix', 'review'):
+            with self.subTest(task_class=task_class):
+                chosen = self.select(10000, task_class=task_class)
+                self.assert_cloud_skipped(chosen, task_class)
+                self.assertEqual((chosen['worker'], chosen['reason']), ('grok-bot', 'handoff_to_orchestrator'))
+                self.assertEqual(chosen['eligible'], ['grok-bot'])
+                before = jd.main_state(self.repo)
+                branches = git(self.repo, 'branch', '--list')
+                result = self.job(test_cmd='test -f out.txt', task_class=task_class)
+                self.assertEqual(result['status'], 'handoff_to_orchestrator', result)
+                self.assertEqual(result['reason'], 'no_eligible_worker')
+                self.assertEqual(result['task_file'], str(self.task.resolve()))
+                self.assertIsNone(result['commit'])
+                self.assertEqual(result['workers'], [])
+                self.assertFalse(any('refused' in a for a in result['attempts']), result['attempts'])
+                self.assertIs(result['main_checkout_untouched'], True)
+                self.assertEqual(jd.main_state(self.repo), before)
+                self.assertEqual((result['worktree_state'], result['branch_state']), ('pruned', 'deleted'))
+                self.assertFalse(Path(result['worktree']).exists())
+                self.assertEqual(git(self.repo, 'branch', '--list', result['branch']), '')
+                self.assertEqual(git(self.repo, 'branch', '--list'), branches)
 
 
 class WatchdogAndPacingTests(unittest.TestCase):
