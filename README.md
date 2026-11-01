@@ -16,6 +16,7 @@ without babysitting terminals, and without ever leaking a private repo name or k
 > Works with Codex, Grok, Cursor and Claude Code CLIs; not affiliated with or endorsed by any of them.
 
 > **Routing strategy:** see [docs/ROUTING_STRATEGY.md](docs/ROUTING_STRATEGY.md), the master architecture (worker order, selection, parallel dispatch, switching, Router Brain).
+> Worker ranking and fallback rules: see [docs/STRATEGY_WORKERS_FALLBACK.md](docs/STRATEGY_WORKERS_FALLBACK.md).
 
 ![Architecture](docs/architecture.png)
 
