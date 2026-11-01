@@ -119,7 +119,7 @@ def _read_config(path):
     return data
 
 
-TASK_CLASSES = ('feature', 'bugfix', 'review', 'mechanical', 'draft')
+TASK_CLASSES = ('feature', 'bugfix', 'review', 'mechanical', 'draft', 'design')
 ORCHESTRATOR = 'grok-bot'  # hands the job back to Grok Bot; never run, never metered, always last
 
 
