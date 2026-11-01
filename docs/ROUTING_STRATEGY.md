@@ -82,6 +82,16 @@ sequenceDiagram
 - [Shipped #41–#45] **Handoff note** (`src/llm_router/handoff.py`): goal, files touched, current diff summary, test status and last failure, decisions made, next steps, gotchas, meter, and the switch reason. Every worker is told to keep `.llm-router-handoff.md` at the checkout root; the router collects it (never committed) into `<state>/handoffs/<job_id>/<UTC-ts>-<worker>.md`, validates it against the diff, and writes a `source: router` note from git state when it is missing or invalid. A note is written before every failover hop and when the worker's meter reaches `run_job.handoff_threshold_percent` (85). The next worker runs in the same worktree and branch with the latest note in its prompt.
 - Reroute goes to the next *eligible* worker in order. If none is eligible, Grok Bot finishes the job or reports it.
 
+### Mined handoff & token-saver patterns (#97)
+
+Diffed against `grok-bot-token-saver`, `crew-contract`, and `grok-bot-profiles`:
+
+| Source / Pattern | Adopted in DLR (`handoff.py` & routing) | Skipped (and why) |
+|---|---|---|
+| `grok-bot-token-saver`: compact role cards + handoffs instead of full transcript replay | **Adopted:** `handoff.render_for_prompt` injects only the validated handoff note (and `TAIL_CHARS = 2000` test tail), never replaying full worker transcripts; scorecards replace history. | Installing external token-saver wrappers or specialist bots (DLR already strips transcripts in `handoff.py`). |
+| `crew-contract`: mission fields, evidence-based handoff, definition of done, stopping rules | **Adopted:** `Goal` (mission), `Files touched` + `Diff summary` (diff-verified evidence), `Test status` (definition of done: `passed` with 0 skipped), `Switch reason` + `MAX_WORKERS = 3` / `handoff_threshold_percent = 85` (stopping rules), plus optional `Definition of done` / `Stopping rules` metadata. | Standalone crew-contract YAML runner (DLR uses markdown frontmatter + sections in `<state>/handoffs/`). |
+| `grok-bot-profiles`: separate Spec / Implement / Verify roles | **Adopted:** maps directly to DLR's planner / coder / judge split (`unit_review.py` stronger-model review and Stackwich `plan -> execute -> verify -> review` contract). | Adding new specialist bot accounts; template catalogs (`awesome-*`, `rosterroom`, `botteams`), GTM/trading packs, and alternate platforms (`akeru`, `guaca`). |
+
 ## 6. Router Brain [Planned #46, #93, #67, #61]
 
 - **Verified-notes wiki (#93):** `raw/` holds immutable job logs, handoffs and research. `wiki/` holds maintained notes. There are three steps: collect, update, and a **nightly audit** that expires stale or unverified facts. Routing reads only verified notes.
