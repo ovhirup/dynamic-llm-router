@@ -8,13 +8,71 @@ Rules (same safety model for every worker):
   unmetered_workers. `developer` is eligible only for draft-size tasks when enabled with an endpoint.
 """
 from datetime import datetime, timezone
+import http.client
+import json
 import math
 import re
+import urllib.request
 
 from . import claude_account, config, cooldown, quota_service, week_curve
 
-LOCAL_WORKERS = ('developer', 'aider-ollama', config.ORCHESTRATOR)  # never displaced by week-curve pacing
+LOCAL_WORKERS = ('developer', 'aider-ollama', 'nativ', config.ORCHESTRATOR)  # never displaced by week-curve pacing
 NAME = re.compile(r'[a-z][a-z0-9_-]{0,31}')
+HEALTH_TIMEOUT_SECONDS = 2
+HEALTH_MAX_BYTES = 1 << 20
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _default_opener(url, timeout):
+    """GET url without proxies or redirects; return (status, body bytes)."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+    with opener.open(urllib.request.Request(url, headers={'Accept': 'application/json'}), timeout=timeout) as response:
+        return response.status, response.read(HEALTH_MAX_BYTES + 1)
+
+
+def local_model_config(policy, worker):
+    """{'base_url', 'model'} for a worker from workers.<name> or run_task.local_models.<name>."""
+    found = dict((policy.get('run_task') or {}).get('local_models', {}).get(worker) or {})
+    opts = (policy.get('workers') or {}).get(worker) or {}
+    if isinstance(opts, dict):
+        found.update({k: opts[k] for k in ('base_url', 'model') if k in opts})
+    return found
+
+
+def check_local_worker(policy, worker, opener=None):
+    """(True, None) when the worker's local server lists its model at <base_url>/v1/models.
+
+    opener(url, timeout) -> (status, body bytes); raising means unreachable. Workers without a
+    base_url are not probed. Returns (False, 'server_not_running') for an unreachable server,
+    non-200 or invalid JSON, and (False, 'model_not_present') when the configured model is absent.
+    """
+    local = local_model_config(policy, worker)
+    base_url = local.get('base_url')
+    if not base_url:
+        return True, None
+    if not config.valid_base_url(base_url):
+        return False, 'invalid_base_url'
+    try:
+        status, body = (opener or _default_opener)(base_url.rstrip('/') + '/v1/models', HEALTH_TIMEOUT_SECONDS)
+        if status != 200 or len(body) > HEALTH_MAX_BYTES:
+            return False, 'server_not_running'
+        data = json.loads(body)
+    except (OSError, ValueError, http.client.HTTPException):
+        return False, 'server_not_running'
+    model = local.get('model')
+    if not model:
+        return True, None
+    listed = data.get('data') if isinstance(data, dict) else None
+    if not isinstance(listed, list):
+        return False, 'server_not_running'
+    ids = [entry.get('id') for entry in listed if isinstance(entry, dict) and isinstance(entry.get('id'), str)]
+    if any(i == model or i.endswith('/' + model) or model.endswith('/' + i) for i in ids):
+        return True, None
+    return False, 'model_not_present'
 
 
 class SelectionError(ValueError):
@@ -115,7 +173,7 @@ def developer_ready(policy, task_chars):
 
 def select(task_chars, policy=None, cached_only=False, now=None, io=None, consult_all=False,
            consult_cursor=False, threshold_overrides=None, claude_profile_loader=None, cooldowns=None,
-           task_class=None, grok_bot_evidence=None):
+           task_class=None, grok_bot_evidence=None, health_opener=None):
     """Return {'worker', 'reason', 'eligible', 'meters', 'reasons', 'sources', 'versions', ...}.
 
     Workers cooling down after a quota error (see cooldown.py) are skipped until their reset.
@@ -123,6 +181,8 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
     order and is never quota-gated, so a class job is handed back to the orchestrator, not refused.
     Workers sharing the grok-bot pool are paced by week_curve.gate(): an unknown pool is tried last
     among cloud workers and ahead-of-curve drops one rank; neither bans.
+    Workers with a local base_url (e.g. nativ) are eligible only when check_local_worker() passes;
+    health_opener replaces the HTTP GET in tests.
     """
     policy = policy or config.load_policy()
     clock_injected = now is not None
@@ -165,6 +225,9 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
         if quota is None or worker not in io:
             ok = worker in unmetered
             reasons[worker] = 'unmetered' if ok else ('observer_disabled' if quota is not None else 'no_meter')
+            if ok and local_model_config(policy, worker).get('base_url'):
+                ok, why = check_local_worker(policy, worker, health_opener)
+                reasons[worker] = 'unmetered' if ok else why
             eligible += [worker] if ok else []
             continue
         consult = quota.get('consult', 'always')

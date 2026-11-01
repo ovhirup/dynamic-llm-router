@@ -170,7 +170,8 @@ def init_config(force=False, workers=None, never='', meters='', non_interactive=
                 dry_run=False, input_fn=input, output_fn=print, which=shutil.which, is_tty=None):
     from importlib import resources
     known = {'codex': 'codex', 'grok-build': 'grok', 'cursor': 'cursor-agent',
-             'claude': 'claude', 'aider': 'aider', 'opencode': 'opencode', 'aider-ollama': 'ollama'}
+             'claude': 'claude', 'aider': 'aider', 'opencode': 'opencode', 'aider-ollama': 'ollama',
+             'nativ': 'nativ'}
     detected = [name for name, binary in known.items() if which(binary)]
     interactive = (sys.stdin.isatty() if is_tty is None else is_tty) and not non_interactive
     split = lambda value: [v.strip() for v in value.split(',') if v.strip()] if isinstance(value, str) else list(value)
@@ -206,7 +207,7 @@ def init_config(force=False, workers=None, never='', meters='', non_interactive=
     examples = resources.files('llm_router').joinpath('examples')
     warnings = []
     for name in chosen:
-        if name in ('aider', 'aider-ollama', 'opencode'):
+        if name in ('aider', 'aider-ollama', 'opencode', 'nativ'):
             preset = json.loads(examples.joinpath('workers', name + '.json').read_text())
             fragment['workers'].update(preset['workers'])
         if name in ('codex', 'grok-build', 'cursor', 'claude'):
