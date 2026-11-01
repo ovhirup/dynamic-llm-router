@@ -13,9 +13,12 @@ Modes:
 
 Gate (eval_score.gate): a routing/config change is adopted only if it beats the baseline here.
 """
+import copy
 import hashlib
 import json
+import os
 import re
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -155,6 +158,67 @@ def run(cases, specs, mode='offline', profiles=None, policy=None, confirm=False,
     report['gate'] = eval_score.gate(report['policies'][specs[0]['name']]['metrics'],
                                      report['policies'][specs[1]['name']]['metrics'])
     return security.redact_obj(report)
+
+
+def spec_from_policy(name, policy, override=None):
+    """A harness policy spec describing how `policy` routes (live mode also carries the config override)."""
+    spec = {'name': name, 'worker_order': list(policy.get('worker_order') or []),
+            'never': list(policy.get('never') or [])}
+    if override:
+        spec['config'] = copy.deepcopy(override)
+    return spec
+
+
+def gate_config_change(cases, baseline_policy, candidate_override, mode='offline', profiles=None, confirm=False,
+                       use_recorded=True, **kwargs):
+    """Gate (#66): replay `cases` under the current policy and under it with `candidate_override` merged in.
+
+    Returns {'adopted', 'gate', 'report', 'merged_policy'}; merged_policy is None unless the candidate
+    strictly beats the baseline (report['gate']['adopt'])."""
+    if not isinstance(candidate_override, dict) or not candidate_override:
+        raise Refused('candidate config must be a non-empty JSON object')
+    merged = config.deep_merge(baseline_policy, candidate_override)
+    specs = [spec_from_policy('baseline', baseline_policy), spec_from_policy('candidate', merged, candidate_override)]
+    kwargs.setdefault('policy', baseline_policy)
+    report = run(cases, specs, mode=mode, profiles=profiles, confirm=confirm, use_recorded=use_recorded, **kwargs)
+    adopt = bool(report['gate']['adopt'])
+    return {'adopted': adopt, 'gate': report['gate'], 'report': report, 'merged_policy': merged if adopt else None}
+
+
+def apply_if_beats_baseline(config_path, candidate_override, cases, mode='offline', profiles=None, confirm=False,
+                            use_recorded=True, **kwargs):
+    """Merge `candidate_override` into the user config at `config_path` only if it beats the baseline.
+
+    Raises Refused (with .result set to the gate result) and leaves the file untouched otherwise. On
+    adoption the old file is backed up next to it and the new one is written atomically."""
+    path = Path(config_path) if config_path else config.config_file()
+    user = config.load_user_config(path)
+    baseline_policy = config.load_policy(path)
+    result = gate_config_change(cases, baseline_policy, candidate_override, mode=mode, profiles=profiles,
+                                confirm=confirm, use_recorded=use_recorded, **kwargs)
+    if not result['adopted']:
+        refusal = Refused('candidate does not beat the baseline: ' + '; '.join(result['gate']['reasons']))
+        refusal.result = result
+        raise refusal
+    updated = config.deep_merge(user, candidate_override)
+    config.validate(config.deep_merge(config.defaults(), updated))  # never write a config that will not load
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backup = None
+    if path.exists():
+        stamp = config.now_local(baseline_policy).strftime('%Y%m%d-%H%M%S')
+        backup = path.with_name(f'{path.name}.bak-{stamp}')
+        shutil.copy2(path, backup)
+    fd, tmp = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(json.dumps(updated, indent=2) + '\n')
+        if backup:
+            shutil.copymode(backup, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return dict(result, config_path=str(path), backup=str(backup) if backup else None)
 
 
 def render_markdown(report):
