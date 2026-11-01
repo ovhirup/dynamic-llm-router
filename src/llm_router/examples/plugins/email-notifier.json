@@ -1,0 +1,15 @@
+{
+  "name": "email-notifier",
+  "capabilities": [
+    "notifier"
+  ],
+  "transport": "mcp_stdio",
+  "command": [
+    "email-mcp"
+  ],
+  "description": "Opt-in email summary notifier for finished router jobs and daily meter digests.",
+  "enabled": false,
+  "permissions": [
+    "send_summary"
+  ]
+}

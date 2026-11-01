@@ -1,0 +1,15 @@
+{
+  "name": "slack-notifier",
+  "capabilities": [
+    "notifier"
+  ],
+  "transport": "mcp_stdio",
+  "command": [
+    "slack-mcp"
+  ],
+  "description": "Opt-in Slack summary notifier for finished router jobs and daily meter digests.",
+  "enabled": false,
+  "permissions": [
+    "post_summary"
+  ]
+}
