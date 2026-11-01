@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import alerts, config, handoff, security, stackwich
+from . import alerts, brain, config, handoff, security, stackwich
 from . import task_dispatch as td
 
 Refused = td.Refused
@@ -358,6 +358,13 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
     summary = security.redact_obj(summary)
     jobs_dir = _path(policy, 'jobs_dir', 'logs/jobs')
     jobs_dir.mkdir(parents=True, exist_ok=True)
+    (jobs_dir / f'{job_id}.json').write_text(json.dumps(summary, indent=2))
+    try:  # the vault note is a by-product: never fail the job over it
+        note_path = brain.write_job_outcome(policy, summary)
+    except OSError as error:
+        note_path = None
+        summary['warnings'].append(f'vault note not written: {security.redact(str(error))[:200]}')
+    summary['vault_note'] = str(note_path) if note_path else None
     (jobs_dir / f'{job_id}.json').write_text(json.dumps(summary, indent=2))
     td.append_ledger(td._router_path(policy, 'ledger', 'logs/ledger.csv'),
                      [started.strftime('%Y-%m-%d %H:%M'), 'run-job', f'run-job {job_id} {task_path.name}',

@@ -87,6 +87,34 @@ class JobTests(unittest.TestCase):
         self.assertTrue((self.base / 'jobs' / f'{result["job_id"]}.json').exists())
         self.assertIn(',run-job,', (self.base / 'ledger.csv').read_text())
 
+    def test_run_job_writes_redacted_vault_outcome_and_mirrors_handoffs(self):
+        self.policy['run_job']['vault_dir'] = str(self.base / 'vault')
+        self.policy['run_job']['handoffs_dir'] = str(self.base / 'handoffs')
+        secret = 'sk-' + 'Q9w8E7r6T5y4U3i2O1p0A9s8D7f6'
+        note = ('## Goal\nAdd out.txt for %s\n## Files touched\nout.txt\n## Diff summary\nadd\n'
+                '## Test status\npassed\n## Decisions\nkey=%s\n## Next steps\nnone\n## Gotchas\nnone\n'
+                % (TERM, secret))
+        self.worker("open('out.txt','w').write('hi\\n'); open('.llm-router-handoff.md','w').write(%r)" % note)
+        before = jd.main_state(self.repo)
+        result = self.job(test_cmd='test -f out.txt')
+        self.assertTrue(result['ok'], result)
+        path = self.base / 'vault' / 'jobs' / f'{result["job_id"]}.md'
+        self.assertEqual(result['vault_note'], str(path))
+        text = path.read_text()
+        self.assertIn(f'job_id: "{result["job_id"]}"', text)
+        self.assertIn('status: "committed"', text)
+        self.assertIn('## Hops', text)
+        self.assertTrue(result['handoffs'])
+        mirrored = list((self.base / 'vault' / 'handoffs' / result['job_id']).glob('*.md'))
+        self.assertEqual(len(mirrored), len({Path(h['path']).name for h in result['handoffs']}))
+        for written in [text] + [p.read_text() for p in mirrored]:
+            self.assertNotIn(secret, written)
+            self.assertNotIn(TERM.lower(), written.lower())
+        saved = json.loads((self.base / 'jobs' / f'{result["job_id"]}.json').read_text())
+        self.assertEqual(saved['vault_note'], str(path))
+        self.assert_main_untouched(before)
+        self.assertFalse(any(p.name in ('vault', 'jobs', 'handoffs') for p in self.repo.iterdir()))
+
     def test_retry_with_test_output_then_pass(self):
         capture = self.base / 'prompts.txt'
         self.worker("import sys; p=sys.stdin.read(); open(%r,'a').write(p+'\\n=====\\n'); "
