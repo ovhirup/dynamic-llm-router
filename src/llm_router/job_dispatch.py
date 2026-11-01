@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import alerts, config, handoff, security, stackwich
+from . import alerts, config, handoff, retry_feedback, security, stackwich
 from . import task_dispatch as td
 
 Refused = td.Refused
@@ -222,16 +222,11 @@ def _report_leak_check(policy, worktree, base_sha):
                                **td.leak_options(policy))
 
 
-def _retry_note(attempt, tests):
+def _retry_note(attempt, tests, fence_paths=(), dead_ends=(), task_goal=''):
     if attempt.get('refused'):
         return None
-    lines = ['## Previous attempt did not pass', 'Your earlier changes are still in this checkout. Fix them.']
-    if not attempt.get('ok'):
-        lines.append('The worker run failed or made no usable change.')
-    if tests.get('status') in ('failed', 'timeout'):
-        lines += [f'The test command `{tests["command"]}` {tests["status"]}. Output tail:', '```',
-                  tests.get('tail', ''), '```']
-    return '\n'.join(lines)
+    return retry_feedback.build_retry_prompt(
+        tests, attempt=attempt, fence_paths=fence_paths, dead_ends=dead_ends, task_goal=task_goal)
 
 
 def _commit_message(task_text, job_id, workers, tests, verified=False):
@@ -424,6 +419,9 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
     retries = policy['run_job'].get('max_retries', 1)
     attempt_number = 0
     used, failed = set(), set()
+    fingerprints, dead_ends = [], []
+    summary['failure_fingerprints'] = fingerprints
+    summary['dead_ends'] = dead_ends
     while attempt_number <= (1 if required else retries):
         cycle = attempt_number + 1
         kwargs = {'size': size, 'worker': pinned or worker, 'allow_dirty': attempt_number > 0,
@@ -564,10 +562,24 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         last_run = runs[-1] if runs else {}
         reason = (last_run.get('reason') or td.hop_reason(last_run) if last_run and not last_run.get('ok')
                   else f'tests {tests["status"]}' if tests['status'] not in passing else 'retry')
+        fp = retry_feedback.failure_fingerprint(tests, {'ok': result.get('ok'), 'runs': runs})
+        fingerprints.append(fp)
+        summary['attempts'][-1]['failure_fingerprint'] = fp['id']
+        dead_ends.append(f'attempt {cycle} ({selected or "none"}): {reason} — {fp["error_line"]}')
+        retry_feedback.save_retry_state(
+            _path(policy, 'handoffs_dir', 'handoffs'), summary['job_id'], fingerprints, dead_ends)
+        if retry_feedback.same_failure_twice(fingerprints):
+            summary['warnings'].append(f'same_failure_twice ({fp["id"]}): stopping retries after identical failure')
+            summary.update(status='blocked_by_stackwich' if required else 'failed',
+                           reason='same_failure_twice', same_failure_twice=True)
+            return
         log = out_dir / f'{stamp}-a{cycle}-tests.log'
         note = save_note(selected, reason, worker_note, tests, log if log.exists() else None)
-        extra = '\n\n'.join(filter(None, [handoff.WORKER_INSTRUCTIONS, handoff.render_for_prompt(note),
-                                          _retry_note(result, tests)]))
+        extra = '\n\n'.join(filter(None, [
+            handoff.WORKER_INSTRUCTIONS,
+            handoff.render_for_prompt(note),
+            _retry_note(result, tests, fence_paths=worker_paths, dead_ends=dead_ends, task_goal=task_text[:500]),
+        ]))
         if required:
             extra += '\nStackwich errors: ' + '; '.join(evidence['errors'])
         attempt_number += 1
