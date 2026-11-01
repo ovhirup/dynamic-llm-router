@@ -91,10 +91,10 @@ class JobTests(unittest.TestCase):
         self.policy['run_job']['vault_dir'] = str(self.base / 'vault')
         self.policy['run_job']['handoffs_dir'] = str(self.base / 'handoffs')
         secret = 'sk-' + 'Q9w8E7r6T5y4U3i2O1p0A9s8D7f6'
-        note = ('## Goal\nAdd out.txt for %s\n## Files touched\nout.txt\n## Diff summary\nadd\n'
-                '## Test status\npassed\n## Decisions\nkey=%s\n## Next steps\nnone\n## Gotchas\nnone\n'
-                % (TERM, secret))
-        self.worker("open('out.txt','w').write('hi\\n'); open('.llm-router-handoff.md','w').write(%r)" % note)
+        note = ('## Goal\nAdd out.txt\n## Files touched\nout.txt\n## Diff summary\nadd\n'
+                '## Test status\npassed\n## Decisions\nclean\n## Next steps\nnone\n## Gotchas\nnone\n')
+        self.worker("import sys; print(%r, file=sys.stderr); open('out.txt','w').write('hi\\n'); "
+                    "open('.llm-router-handoff.md','w').write(%r)" % (f'{TERM} {secret}', note))
         before = jd.main_state(self.repo)
         result = self.job(test_cmd='test -f out.txt')
         self.assertTrue(result['ok'], result)
