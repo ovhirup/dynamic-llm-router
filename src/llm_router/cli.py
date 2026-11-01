@@ -216,6 +216,17 @@ def build_parser():
     wd.add_argument('--loop-threshold', type=int, default=3, help='repeated identical lines before looping')
     wd.add_argument('--recover', action='store_true', help='terminate unhealthy workers and reassign to next eligible')
 
+    tr = commands.add_parser('trace', help='Structured job/wave traces, replay, and root-cause analysis')
+    tr_cmds = tr.add_subparsers(dest='trace_command', required=True)
+    tr_show = tr_cmds.add_parser('show', help='Show spans for a job/wave trace')
+    tr_show.add_argument('job_id')
+    tr_show.add_argument('--json', action='store_true', dest='as_json')
+    tr_why = tr_cmds.add_parser('why', help='Walk back from a failed span to find the root cause')
+    tr_why.add_argument('job_id')
+    tr_replay = tr_cmds.add_parser('replay', help='Serve cached earlier spans and re-run only --until step live')
+    tr_replay.add_argument('job_id')
+    tr_replay.add_argument('--until', required=True, help='target span id or name to re-run live')
+
     scan = commands.add_parser('scan', help='Leak-scan a git tree (tracked + untracked, not ignored) before publishing')
     scan.add_argument('path', nargs='?', default='.')
     scan.add_argument('--terms', help='private terms file (default: the configured private_terms_file)')
@@ -497,6 +508,22 @@ def main(argv=None):
                                     loop_threshold=args.loop_threshold, recover=args.recover)
         _print(report)
         return 0 if report['ok'] or args.recover else 1
+    if args.command == 'trace':
+        from . import traces
+        if args.trace_command == 'show':
+            spans = traces.load_trace(policy, args.job_id)
+            _print({'trace_id': args.job_id, 'spans': spans})
+            return 0
+        if args.trace_command == 'why':
+            spans = traces.load_trace(policy, args.job_id)
+            _print(traces.root_cause(spans))
+            return 0
+        try:
+            _print(traces.replay_trace(policy, args.job_id, args.until))
+            return 0
+        except ValueError as error:
+            print(json.dumps({'ok': False, 'refused': str(error)}))
+            return 3
     if args.command == 'scan':
         from . import security, task_dispatch
         terms = security.load_terms(args.terms) if args.terms else task_dispatch.private_terms(policy)

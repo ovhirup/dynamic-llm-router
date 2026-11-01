@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import agent_map, alerts, brain, config, context_navigator, fail_first, feedback, forget_restart, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, tool_gateway, triage
+from . import agent_map, alerts, brain, config, context_navigator, fail_first, feedback, forget_restart, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, tool_gateway, traces, triage
 from . import task_dispatch as td
 
 Refused = td.Refused
@@ -473,6 +473,17 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
     if learned is not None:
         summary['lesson_learned'] = learned
     summary['finished_at'] = td.now_local(policy).isoformat(timespec='seconds')
+    root_span = traces.record_span(
+        policy, job_id, name=f'job:{job_id}', kind='job', span_id=f'{job_id}-root',
+        side_effect='mutating' if summary.get('commit') else 'read_only',
+        status='ok' if summary.get('ok') else 'failed',
+        worker=(summary.get('workers') or [None])[-1],
+        inputs={'task': summary.get('task'), 'base_sha': summary.get('base_sha')},
+        outputs={'commit': summary.get('commit'), 'tests_status': summary.get('tests_status')},
+        error=None if summary.get('ok') else (summary.get('status') or 'failed'),
+        started_at=summary.get('started_at'), finished_at=summary.get('finished_at'),
+    )
+    summary['trace_id'] = root_span['trace_id']
     summary = security.redact_obj(summary)
     try:  # outcome feedback: a scorecard write never fails the job
         feedback.record_job_feedback(policy, summary, task_class)
