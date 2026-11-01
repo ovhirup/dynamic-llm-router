@@ -20,9 +20,7 @@ def git(cwd, *args):
     return subprocess.run(['git', '-C', str(cwd), *args], capture_output=True, text=True).stdout.strip()
 
 
-class JobFixture(unittest.TestCase):
-    """A main repo with a dirty checkout, a task file and a test policy; every worker starts failing."""
-
+class JobTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name)
@@ -67,9 +65,6 @@ class JobFixture(unittest.TestCase):
         self.assertEqual(jd.main_state(self.repo), before)
         self.assertEqual((self.repo / 'local-notes.txt').read_text(), 'user work in progress\n')
         self.assertFalse((self.repo / 'out.txt').exists())
-
-
-class JobTests(JobFixture):
 
     def test_success_commits_on_router_branch_only(self):
         self.worker("open('out.txt','w').write('hi\\n')")
@@ -548,8 +543,12 @@ class JobTests(JobFixture):
         self.assertTrue(Path(done['worktree']).exists())
 
 
-class AllWorkersOutNeverIdleTests(JobFixture):
+class AllWorkersOutNeverIdleTests(unittest.TestCase):
     """Issue #28: with every cloud worker out, run-job still does work (local) or hands off; never idles."""
+    tearDown = JobTests.tearDown
+    worker = JobTests.worker
+    job = JobTests.job
+    assert_main_untouched = JobTests.assert_main_untouched
     CLOUD = ('claude', 'codex', 'grok-build', 'cursor')
     CLASS_ORDER = {
         'mechanical': ['grok-build', 'codex', 'cursor', 'aider-ollama', 'grok-bot'],
@@ -559,7 +558,7 @@ class AllWorkersOutNeverIdleTests(JobFixture):
     }
 
     def setUp(self):
-        super().setUp()
+        JobTests.setUp(self)
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
         rt = self.policy['run_task']
         rt['commands']['aider-ollama'] = ['fake']
