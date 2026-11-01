@@ -356,6 +356,8 @@ def approve(job_id, action, sha=None, hours=None, note=None, policy=None, now=No
     if action not in ACTIONS:
         raise Refused(f'action must be one of {ACTIONS}')
     job = load_job(policy, job_id)
+    if job.get('review_required') is True and (job.get('review') or {}).get('verdict') != 'approve':
+        raise Refused('stronger-model review required before approving Codex/Cursor/local output')
     guard_branch(policy, job, settings_for(policy, job))
     head = head_sha(job)
     _match_sha(head, sha)

@@ -23,6 +23,50 @@ from . import task_dispatch as td
 
 Refused = td.Refused
 
+# Output from these (weaker or local) workers needs a stronger-model review before the owner sees it.
+REVIEWED_WORKERS = ('codex', 'cursor', 'local', 'developer', 'nativ')
+REVIEW_PROMPT_FILE = '.llm-router-review-prompt.md'
+DEFAULT_REVIEWER = 'grok-bot'
+
+
+def review_required(worker):
+    return worker in REVIEWED_WORKERS or str(worker or '').startswith('aider')
+
+
+def build_review_prompt(summary, diff, paths, tests_status):
+    scope = '\n'.join(f'- {path}' for path in sorted(paths)) or '- (none)'
+    return (f'# Stronger-model review: job {summary["job_id"]}\n\n'
+            f'Workers: {", ".join(summary.get("workers") or []) or "unknown"}\n'
+            f'Branch: {summary.get("branch")}\nBase: {summary.get("base_sha")}\n'
+            f'Commit: {summary.get("commit")}\n\n'
+            f'## Declared scope / changed paths\n{scope}\n\n'
+            f'## Test status\n{tests_status}\n\n'
+            '## Instructions\nReview the diff for correctness, scope creep, leaked secrets and missing tests. '
+            'Answer with a verdict of `approve` or `reject` and short notes.\n\n'
+            f'## Diff\n```diff\n{diff}\n```\n')
+
+
+def _stronger_review(summary, worktree, paths, reviewer):
+    """Write the review prompt into the worktree's git dir and record the review (or mark it pending)."""
+    git_dir = Path(_git(worktree, 'rev-parse', '--absolute-git-dir', check=True).stdout.strip())
+    diff = _git(worktree, 'diff', f'{summary["base_sha"]}..{summary["commit"]}').stdout
+    prompt_path = git_dir / REVIEW_PROMPT_FILE
+    prompt_path.unlink(missing_ok=True)
+    fd = os.open(prompt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w') as handle:
+        handle.write(build_review_prompt(summary, diff, paths, summary.get('tests_status')))
+    os.chmod(prompt_path, 0o600)
+    if reviewer is None:
+        return {'status': 'pending', 'reviewer': DEFAULT_REVIEWER, 'prompt_file': str(prompt_path)}
+    try:
+        review = dict(reviewer(summary, diff, prompt_path) or {})
+    except Exception as error:  # an unreviewed change is never treated as approved
+        return {'status': 'error', 'reviewer': getattr(reviewer, '__name__', 'reviewer'),
+                'prompt_file': str(prompt_path),
+                'notes': f'{type(error).__name__}: {security.redact(str(error))[:300]}'}
+    review.setdefault('prompt_file', str(prompt_path))
+    return review
+
 
 def _git(cwd, *args, check=False):
     done = subprocess.run(['git', '-C', str(cwd), *args], stdin=subprocess.DEVNULL,
@@ -257,7 +301,7 @@ def hops(summary):
 
 def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full', worker=None,
             keep=None, policy=None, run_task=td.run_task, select=None, now=None, test_runner=td.run_bounded,
-            popen=subprocess.Popen, notifier=None, meter=None, task_class=None):
+            popen=subprocess.Popen, notifier=None, meter=None, task_class=None, reviewer=None):
     """keep: True (--keep), False (--prune) or None (keep on success, prune on failure).
     meter(worker) -> percent used or None (default: the cached meter, never a live read).
     task_class ranks workers by class_order.<task_class> (see selection.select)."""
@@ -321,7 +365,8 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
                'test_command': None, 'test_command_source': None, 'allow_no_tests': allow_no_tests,
                'tests_status': None, 'leak_check': None, 'blocked_by_leak_check': False,
                'attempts': [], 'workers': [], 'worktree_state': None, 'branch_state': None,
-               'main_checkout_untouched': None, 'handoffs': [], 'warnings': []}
+               'main_checkout_untouched': None, 'handoffs': [], 'warnings': [],
+               'review_required': False, 'review': None}
     with RepoLock(_path(policy, 'lock_dir', 'logs/locks'), repo), _NoSleep(policy, popen):
         before = main_state(repo)
         worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -335,7 +380,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             if test_cmd or allow_no_tests:
                 _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd,
                           test_timeout, stamp, out_dir, run_task, select, test_runner, allow_no_tests,
-                          meter or handoff.meter_percent)
+                          meter or handoff.meter_percent, reviewer)
             else:  # fail before spending a worker run on a change nothing would verify
                 summary.update(status='no_tests', tests_status='no_tests', reason=NO_TESTS_REASON)
                 summary['warnings'].append(NO_TESTS_REASON + ': set test_cmd, pass --test-cmd, or set '
@@ -397,7 +442,7 @@ class _NoSleep:
 
 def _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd, test_timeout,
               stamp, out_dir, run_task, select, test_runner, allow_no_tests=False,
-              meter=handoff.meter_percent):
+              meter=handoff.meter_percent, reviewer=None):
     # 'no_tests' passes only on the repo's explicit opt-in; anything else ('skipped', 'not_run') never does.
     passing = ('passed', 'no_tests') if allow_no_tests else ('passed',)
     extra = handoff.WORKER_INSTRUCTIONS  # every worker writes a handoff note at checkpoints and on stop
@@ -623,6 +668,13 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
     summary['diff_stat'] = _git(worktree, 'diff', '--stat', summary['base_sha'], sha).stdout.strip()
     summary['ok'] = True
     summary['status'] = 'committed'
+    producer = last.get('worker')
+    summary['review_required'] = any(review_required(w) for w in [producer, *summary['workers']] if w)
+    if summary['review_required']:
+        summary['review'] = _stronger_review(summary, worktree, worker_paths, reviewer)
+        if summary['review'].get('verdict') == 'reject':
+            summary['ok'] = False
+            summary['status'] = 'review_rejected'
 
 
 def _finish(policy, summary, repo, worktree, branch, base_sha, keep):
@@ -630,7 +682,7 @@ def _finish(policy, summary, repo, worktree, branch, base_sha, keep):
         summary['status'] = 'failed'
     success = summary['ok']
     leak = summary['blocked_by_leak_check']
-    blocked = summary['status'] in ('blocked_by_stackwich', 'no_tests')
+    blocked = summary['status'] in ('blocked_by_stackwich', 'no_tests', 'review_rejected')
     prune = keep is False or (keep is None and not success and not leak and not blocked)
     if summary['status'] == 'blocked_by_stackwich' and keep is None:
         summary['warnings'].append('Stackwich blocked: worktree kept for review')
