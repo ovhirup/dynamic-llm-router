@@ -68,7 +68,11 @@ def _lower(a, b):
 
 
 def gate(baseline, candidate):
-    """Adoption verdict for candidate vs baseline aggregate metrics."""
+    """Adoption verdict for candidate vs baseline aggregate metrics.
+
+    If candidate pass rate is 0 (or there are no passing cases), the gate returns no-adopt /
+    inconclusive (`adopt: False`); speed and token cost only break ties when candidate passes.
+    """
     reasons = []
     if candidate['cases'] == 0 or candidate['cases'] != baseline['cases']:
         return {'adopt': False, 'reasons': ['case counts differ or are empty: no comparison']}
@@ -78,6 +82,9 @@ def gate(baseline, candidate):
         reasons.append('quality regressed')
     if reasons:
         return {'adopt': False, 'reasons': reasons}
+    if candidate['pass_rate'] <= EPSILON:
+        return {'adopt': False, 'verdict': 'inconclusive',
+                'reasons': ['candidate has 0% pass rate (no passing cases): inconclusive']}
     wins = []
     if candidate['pass_rate'] > baseline['pass_rate'] + EPSILON:
         wins.append('higher pass rate')
