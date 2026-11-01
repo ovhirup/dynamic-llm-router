@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import agent_map, alerts, brain, config, fail_first, feedback, forget_restart, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, tool_gateway, triage
+from . import agent_map, alerts, brain, config, context_navigator, fail_first, feedback, forget_restart, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, tool_gateway, triage
 from . import task_dispatch as td
 
 Refused = td.Refused
@@ -587,7 +587,27 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
     passing = ('passed', 'no_tests') if allow_no_tests else ('passed',)
     repo_map = agent_map.load_repo_map(worktree)
     repo_lessons = lessons.render_for_prompt(policy, summary.get('repo') or worktree)
-    base_instructions = '\n\n'.join(filter(None, [handoff.WORKER_INSTRUCTIONS, repo_map, repo_lessons]))
+    nav_result = None
+    nav_cfg = (policy.get('run_job') or {}).get('context_navigator') or {}
+    if nav_cfg is True or (isinstance(nav_cfg, dict) and nav_cfg.get('enabled')):
+        opts = nav_cfg if isinstance(nav_cfg, dict) else {}
+        nav_result = context_navigator.navigate(
+            worktree,
+            task_text,
+            top_folders=opts.get('top_folders', 2),
+            top_files=opts.get('top_files', 5),
+            top_chunks=opts.get('top_chunks', 5),
+            fallback_limit=opts.get('fallback_limit', 2),
+        )
+        summary['context_navigator'] = {
+            'enabled': True,
+            'selected_folders': nav_result['selected_folders'],
+            'selected_files': nav_result['selected_files'],
+            'recovered_files': nav_result['recovered_files'],
+            'recall': None,
+        }
+    nav_block = context_navigator.format_for_prompt(nav_result) if nav_result else ''
+    base_instructions = '\n\n'.join(filter(None, [handoff.WORKER_INSTRUCTIONS, repo_map, repo_lessons, nav_block]))
     require_fail_first = fail_first.is_bug_task(task_text, task_class=task_class, policy=policy)
     if require_fail_first:
         summary['fail_first'] = {'required': True, 'status': 'pending'}
@@ -703,6 +723,9 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         worker_paths = changed_paths(worktree) - test_artifacts
         if required:
             worker_paths.discard(stackwich.REPORT_PATH)
+        if nav_result is not None and 'context_navigator' in summary:
+            summary['context_navigator']['recall'] = context_navigator.compute_recall(
+                nav_result['selected_files'], worker_paths)
         changed = bool(worker_paths)
         if scope:
             outside = out_of_scope(worker_paths, scope)
