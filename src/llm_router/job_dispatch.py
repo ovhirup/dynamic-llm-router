@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import alerts, config, handoff, security, stackwich
+from . import agent_map, alerts, config, handoff, security, stackwich
 from . import task_dispatch as td
 
 Refused = td.Refused
@@ -400,7 +400,9 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
               meter=handoff.meter_percent):
     # 'no_tests' passes only on the repo's explicit opt-in; anything else ('skipped', 'not_run') never does.
     passing = ('passed', 'no_tests') if allow_no_tests else ('passed',)
-    extra = handoff.WORKER_INSTRUCTIONS  # every worker writes a handoff note at checkpoints and on stop
+    repo_map = agent_map.load_repo_map(worktree)
+    base_instructions = '\n\n'.join(filter(None, [handoff.WORKER_INSTRUCTIONS, repo_map]))
+    extra = base_instructions  # every worker writes a handoff note at checkpoints and on stop
     test_artifacts, worker_paths = set(), set()
 
     def save_note(worker, reason, worker_note=None, tests=None, test_log=None):
@@ -566,7 +568,7 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
                   else f'tests {tests["status"]}' if tests['status'] not in passing else 'retry')
         log = out_dir / f'{stamp}-a{cycle}-tests.log'
         note = save_note(selected, reason, worker_note, tests, log if log.exists() else None)
-        extra = '\n\n'.join(filter(None, [handoff.WORKER_INSTRUCTIONS, handoff.render_for_prompt(note),
+        extra = '\n\n'.join(filter(None, [base_instructions, handoff.render_for_prompt(note),
                                           _retry_note(result, tests)]))
         if required:
             extra += '\nStackwich errors: ' + '; '.join(evidence['errors'])
