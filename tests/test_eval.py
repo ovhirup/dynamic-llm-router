@@ -141,6 +141,47 @@ class OfflineHarnessTests(EvalFixture):
         hops = [s['hops'] for s in report['policies']['baseline']['scores']]
         self.assertEqual(hops, [['grok-build', 'codex'], ['grok-build', 'codex']])
 
+    def test_report_includes_per_case_comparison(self):
+        report = eval_harness.run(self.cases, self.specs, profiles=self.profiles)
+        comparison = report['comparison']
+        self.assertEqual([row['case_id'] for row in comparison['cases']], [FIRST, SECOND])
+        self.assertEqual(comparison['wins'] + comparison['losses'] + comparison['ties'], 2)
+        self.assertEqual(comparison['deltas']['tokens'], 18000 - 57000)
+        self.assertEqual(comparison['deltas']['passed'], 0)
+        for row in comparison['cases']:
+            self.assertTrue(row['baseline_passed'] and row['candidate_passed'])
+            self.assertEqual(row['baseline_worker'], 'codex')
+            self.assertEqual(row['candidate_worker'], 'cursor')
+            self.assertEqual(row['tokens_delta'], row['candidate_tokens'] - row['baseline_tokens'])
+            self.assertIn(row['winner'], ('candidate', 'baseline', 'tie'))
+        markdown = eval_harness.render_markdown(report)
+        self.assertIn('## Per-case comparison', markdown)
+        self.assertIn('| metric | baseline | cursor-first | Delta |', markdown)
+        self.assertIn('| tokens_total | 57000 | 18000 | -39000 |', markdown)
+        self.assertIn(f'| {FIRST} | codex | yes |', markdown)
+        self.assertIn(f'Candidate wins {comparison["wins"]}, losses {comparison["losses"]}', markdown)
+
+    def test_compare_cases_counts_wins_losses_ties(self):
+        def row(case_id, worker, passed, quality, tokens, elapsed):
+            return {'case_id': case_id, 'worker': worker, 'passed': passed, 'quality': quality,
+                    'tokens': tokens, 'elapsed_seconds': elapsed}
+
+        base = [row('a', 'codex', False, 0.3, 100, 10.0), row('b', 'codex', True, 0.9, 100, 10.0),
+                row('c', 'codex', True, 0.8, 100, 10.0), row('d', 'codex', True, 0.8, 100, 10.0),
+                row('e', 'codex', True, 0.8, None, 10.0)]
+        cand = [row('a', 'cursor', True, 0.8, 300, 20.0), row('b', 'cursor', True, 0.7, 50, 5.0),
+                row('c', 'cursor', True, 0.8, 60, 10.0), row('d', 'cursor', True, 0.8, 100, 10.0),
+                row('e', 'cursor', True, 0.8, 500, 12.5)]
+        result = eval_harness.compare_cases(base, cand)
+        self.assertEqual([r['winner'] for r in result['cases']],
+                         ['candidate', 'baseline', 'candidate', 'tie', 'baseline'])
+        self.assertEqual((result['wins'], result['losses'], result['ties']), (2, 2, 1))
+        first = result['cases'][0]
+        self.assertEqual((first['baseline_worker'], first['candidate_worker']), ('codex', 'cursor'))
+        self.assertEqual((first['quality_delta'], first['tokens_delta'], first['elapsed_delta']), (0.5, 200, 10.0))
+        self.assertIsNone(result['cases'][4]['tokens_delta'])  # unknown baseline tokens: no delta
+        self.assertEqual(result['deltas'], {'passed': 1, 'quality': 0.3, 'tokens': 110, 'elapsed_seconds': 7.5})
+
     def test_reversed_comparison_keeps_baseline(self):
         report = eval_harness.run(self.cases, list(reversed(self.specs)), profiles=self.profiles)
         self.assertFalse(report['gate']['adopt'])
