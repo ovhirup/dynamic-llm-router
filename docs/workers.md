@@ -13,6 +13,15 @@ Flags must be checked against your installed CLI version before use.
 - [custom quota command](../examples/workers/custom-with-quota.json): made-up sample-worker usage command,
   named percent regex, monthly window, timeouts and freshness. Replace it with your own CLI.
 
+## Role-based routing & direct Claude Code tips (#135)
+
+DLR can split work by role (`--role {planner,coder,searcher,judge,advisor}`):
+- `planner`, `judge`, and `advisor` route to the strongest available worker (`claude > grok-build > codex`).
+- `coder` routes to the next worker with budget (`codex > grok-build > cursor > claude > aider-ollama`).
+- `searcher` routes to local/cheaper workers first (`aider-ollama > developer > cursor`).
+- When a `coder` hits repeated identical errors or a loop, DLR escalates a transcript summary to the `advisor` role and feeds its guidance back to the `coder`.
+- For direct interactive Claude Code sessions, use `/model opusplan` (Opus plans, Sonnet executes), delegate file/codebase searches to a Haiku subagent (`CLAUDE_CODE_SUBAGENT_MODEL=haiku`), and keep autocompact enabled so long transcripts never burn Opus quota.
+
 `llm-router init --workers aider,opencode --non-interactive` installs the selected presets and marks workers
 without enabled meters unmetered (not paced). An installed Ollama CLI offers the aider-ollama preset;
 it still requires aider and a configured local model. No detection step executes a CLI.
