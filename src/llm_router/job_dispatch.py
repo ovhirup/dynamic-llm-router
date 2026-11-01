@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import agent_map, alerts, brain, config, handoff, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, triage
+from . import agent_map, alerts, brain, config, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, triage
 from . import task_dispatch as td
 
 Refused = td.Refused
@@ -459,6 +459,9 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             if cause.get(key) and not summary.get(key):
                 summary[key] = cause[key]
     summary['hops'] = hops(summary)
+    learned = lessons.learn_from_fixed_job(policy, summary)
+    if learned is not None:
+        summary['lesson_learned'] = learned
     summary['finished_at'] = td.now_local(policy).isoformat(timespec='seconds')
     summary = security.redact_obj(summary)
     jobs_dir = _path(policy, 'jobs_dir', 'logs/jobs')
@@ -568,7 +571,8 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
     # 'no_tests' passes only on the repo's explicit opt-in; anything else ('skipped', 'not_run') never does.
     passing = ('passed', 'no_tests') if allow_no_tests else ('passed',)
     repo_map = agent_map.load_repo_map(worktree)
-    base_instructions = '\n\n'.join(filter(None, [handoff.WORKER_INSTRUCTIONS, repo_map]))
+    repo_lessons = lessons.render_for_prompt(policy, summary.get('repo') or worktree)
+    base_instructions = '\n\n'.join(filter(None, [handoff.WORKER_INSTRUCTIONS, repo_map, repo_lessons]))
     extra = base_instructions  # every worker writes a handoff note at checkpoints and on stop
     test_artifacts, worker_paths = set(), set()
 
