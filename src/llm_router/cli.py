@@ -131,6 +131,10 @@ def build_parser():
         agent = commands.add_parser(name, help='macOS LaunchAgent for quota refresh (dry run unless --yes)')
         agent.add_argument('--yes', action='store_true', help='actually write/load the agent')
 
+    trig = commands.add_parser('triggers', help='Proactive event triggers from GitHub issues, CI failures, and PR comments')
+    trig_cmds = trig.add_subparsers(dest='triggers_command', required=True)
+    trig_cmds.add_parser('status', help='Show trigger configuration, seen event count, and recent dispatches')
+
     scan = commands.add_parser('scan', help='Leak-scan a git tree (tracked + untracked, not ignored) before publishing')
     scan.add_argument('path', nargs='?', default='.')
     scan.add_argument('--terms', help='private terms file (default: the configured private_terms_file)')
@@ -311,6 +315,10 @@ def main(argv=None):
         report = doctor(policy)
         _print(report)
         return 0 if report['ok'] else 1
+    if args.command == 'triggers':
+        from . import triggers
+        _print(triggers.status_report(policy))
+        return 0
     if args.command == 'scan':
         from . import security, task_dispatch
         terms = security.load_terms(args.terms) if args.terms else task_dispatch.private_terms(policy)
