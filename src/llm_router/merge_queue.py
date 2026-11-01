@@ -133,8 +133,9 @@ def queue_batch(batch_id, policy=None, test_runner=None):
             'ok': all(e['status'] == 'ready_for_human' for e in entries)}
 
 
-def record_review(batch_id, unit_id, verdict, notes='', policy=None, reviewer=None):
-    """Record a review verdict (approve|reject) for a queued unit at its current head; returns the entry."""
+def record_review(batch_id, unit_id, verdict, notes='', policy=None, reviewer=None, head=None):
+    """Record a review verdict (approve|reject) for a queued unit at its current head; returns the entry.
+    head: the head that was reviewed; refused when the queued head has moved since (stale review)."""
     policy = policy or config.load_policy()
     if verdict not in VERDICTS:
         raise Refused(f'verdict must be one of {VERDICTS}')
@@ -147,6 +148,9 @@ def record_review(batch_id, unit_id, verdict, notes='', policy=None, reviewer=No
             raise Refused(f'unit {unit_id!r} is not in the merge queue for {batch_id}')
         if not record['review_required']:
             raise Refused(f'unit {unit_id!r} does not need review (worker {record["worker"]})')
+        if head is not None and head != record['head']:
+            raise Refused(f'unit {unit_id!r} head moved since review ({head[:12]} != {record["head"][:12]}); '
+                          're-queue and review again')
         record['review'] = {'status': 'recorded', 'verdict': verdict, 'notes': notes, 'reviewer': reviewer,
                             'head': record['head'], 'recorded_at': _now()}
         _status(record)

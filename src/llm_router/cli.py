@@ -81,6 +81,16 @@ def build_parser():
     unit_queue = unit_cmds.add_parser('queue', help='Merge queue: gate finished units (tests, diff scope, review); '
                                       'never pushes or merges')
     unit_queue.add_argument('--batch', required=True)
+    unit_review = unit_cmds.add_parser('review', help='Live stronger-model review (claude, else grok-bot handoff) '
+                                       'of needs_review queue entries; records the verdict; never pushes or merges')
+    unit_review.add_argument('--batch', required=True)
+    unit_review.add_argument('--unit', help='review only this unit (default: every needs_review entry)')
+    unit_review.add_argument('--reviewer', choices=('claude', 'grok-bot'),
+                             help='use only this reviewer (default: claude, then grok-bot handoff)')
+    unit_review.add_argument('--verdict', choices=('approve', 'reject'),
+                             help='record a verdict from an out-of-band review (e.g. grok-bot) instead of '
+                                  'dispatching one; needs --unit')
+    unit_review.add_argument('--notes', default='')
     unit_qstatus = unit_cmds.add_parser('queue-status', help='List merge-queue entries and their gate results')
     unit_qstatus.add_argument('--batch')
     unit_run = unit_cmds.add_parser('run', help='Assign units, create worktrees, run them in DAG waves and gate '
@@ -396,6 +406,17 @@ def main(argv=None):
         try:
             if args.units_command == 'queue':
                 result = merge_queue.queue_batch(args.batch, policy=policy)
+            elif args.units_command == 'review':
+                from . import unit_review
+                if args.verdict:
+                    if not args.unit:
+                        raise uw.Refused('--verdict needs --unit')
+                    entry = merge_queue.record_review(args.batch, args.unit, args.verdict, notes=args.notes,
+                                                      policy=policy, reviewer=args.reviewer or 'manual')
+                    result = {'ok': entry['status'] == 'ready_for_human', 'entry': entry}
+                else:
+                    reviewers = (args.reviewer,) if args.reviewer else unit_review.REVIEWERS
+                    result = unit_review.review_batch(args.batch, args.unit, policy=policy, reviewers=reviewers)
             elif args.units_command == 'queue-status':
                 result = merge_queue.queue_status(args.batch, policy=policy)
             elif args.units_command == 'create':

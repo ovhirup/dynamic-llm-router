@@ -5,6 +5,11 @@ versions follow [SemVer](https://semver.org/) (0.x: minor versions may break con
 
 ## [Unreleased]
 
+- Add live stronger-model review for merge-queue units (#113): `llm-router units review --batch B [--unit U]`
+  sends each `needs_review` entry's diff, scope and test evidence to claude (else a grok-bot handoff
+  prompt) and records the verdict, bound to the head that was reviewed. `--verdict approve|reject` records an
+  out-of-band verdict. Never pushes or merges.
+
 - Add the evaluation harness (#61): `llm-router eval capture` builds a redacted replay corpus from
   run-job logs (#62); a scoring rubric covers tests, diff scope, reviewer score, tokens, quota % and time,
   with an adoption gate that never adopts on a tie or a regression (#63); `llm-router eval run` replays
