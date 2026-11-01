@@ -204,7 +204,37 @@ class LiveHarnessTests(EvalFixture):
         self.assertEqual(self.policy['run_job'].get('max_retries', 1), load_policy()['run_job'].get('max_retries', 1))
         first = report['policies']['pinned']['scores'][0]
         self.assertEqual((first['tokens'], first['elapsed_seconds'], first['quota_percent']), (700, 60.0, 2.5))
+        self.assertEqual(first['quota_delta_status'], 'ok')
         self.assertEqual(report['policies']['pinned']['metrics']['pass_rate'], 1.0)
+
+    def test_extracts_claude_stream_json_tokens_and_records_unknown_meter_delta_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / 'claude.log'
+            log_path.write_text(
+                '$ exit=0 timed_out=False elapsed=12.0s\n--- stdout\n'
+                + json.dumps({'type': 'result', 'result': 'done', 'usage': {
+                    'input_tokens': 100, 'output_tokens': 250,
+                    'cache_read_input_tokens': 1000, 'cache_creation_input_tokens': 400,
+                }}) + '\n--- stderr\n\n'
+            )
+
+            def fake_run_job(repo, task_file, **kwargs):
+                return {
+                    'job_id': 'claude-live-1', 'workers': ['claude'], 'tests_status': 'passed',
+                    'status': 'committed', 'diff_stat': ' out.txt | 1 +\n 1 file changed',
+                    'started_at': '2026-10-31T10:00:00+00:00', 'finished_at': '2026-10-31T10:00:12+00:00',
+                    'attempts': [{'worker': 'claude', 'runs': [{'worker': 'claude', 'output_path': str(log_path)}]}],
+                }
+
+            specs = [{'name': 'claude', 'worker': 'claude'}, {'name': 'claude-2', 'worker': 'claude'}]
+            report = eval_harness.run(self.cases, specs, mode='live', confirm=True, policy=self.policy,
+                                      run_job=fake_run_job, meter=lambda w: None)
+            first = report['policies']['claude']['scores'][0]
+            self.assertEqual(first['tokens'], 1750)
+            self.assertIsNone(first['quota_percent'])
+            self.assertEqual(first['quota_delta_status'], 'unknown')
+            self.assertIn('meter stale or unknown for claude', first['quota_delta_reason'])
+            self.assertEqual(report['policies']['claude']['metrics']['tokens_total'], 3500)
 
 
 class CliTests(EvalFixture):

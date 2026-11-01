@@ -594,6 +594,11 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                 if name == 'claude':
                     record['continuations'] = continuation
                     result['elapsed_seconds'] = elapsed
+                from . import eval_corpus
+                extracted_tokens = eval_corpus.extract_tokens_from_text(
+                    '\n'.join(item.get('stdout', '') for item in logs))
+                if extracted_tokens is not None:
+                    record['tokens'] = extracted_tokens
             finally:
                 if prompt_file is not None:
                     prompt_file.unlink(missing_ok=True)
