@@ -435,7 +435,8 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             if test_cmd or allow_no_tests:
                 _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd,
                           test_timeout, stamp, out_dir, run_task, select, test_runner, allow_no_tests,
-                          meter or handoff.meter_percent, reviewer=reviewer, scope=scope)
+                          meter or (lambda w: handoff.meter_percent(w, policy=policy)),
+                          reviewer=reviewer, scope=scope)
             else:  # fail before spending a worker run on a change nothing would verify
                 summary.update(status='no_tests', tests_status='no_tests', reason=NO_TESTS_REASON)
                 summary['warnings'].append(NO_TESTS_REASON + ': set test_cmd, pass --test-cmd, or set '
