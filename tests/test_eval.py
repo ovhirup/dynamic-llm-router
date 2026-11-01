@@ -206,6 +206,36 @@ class LiveHarnessTests(EvalFixture):
         self.assertEqual((first['tokens'], first['elapsed_seconds'], first['quota_percent']), (700, 60.0, 2.5))
         self.assertEqual(report['policies']['pinned']['metrics']['pass_rate'], 1.0)
 
+    def test_unavailable_workers_excluded_from_pass_rate_and_gate_and_listed_in_report(self):
+        def fake_run_job(repo, task_file, **kwargs):
+            if kwargs.get('worker') == 'codex':
+                return {
+                    'job_id': 'unavail-1', 'workers': [], 'tests_status': None,
+                    'status': 'refused', 'ok': False,
+                    'warnings': ['codex meter unknown or stale: forced full-size work must be paced'],
+                    'attempts': [{'attempt': 1, 'refused': 'codex meter unknown or stale'}],
+                    'hops': [{'cycle': 1, 'worker': 'codex', 'reason': 'quota_error', 'ok': False, 'unavailable': True}],
+                }
+            return {
+                'job_id': 'ok-1', 'workers': ['claude'], 'tests_status': 'passed',
+                'status': 'committed', 'ok': True, 'diff_stat': ' out.txt | 1 +\n 1 file changed',
+                'started_at': '2026-10-31T10:00:00+00:00', 'finished_at': '2026-10-31T10:01:00+00:00',
+                'attempts': [{'worker': 'claude', 'runs': [{'worker': 'claude', 'tokens': 500}]}],
+            }
+
+        specs = [{'name': 'claude', 'worker': 'claude'}, {'name': 'codex', 'worker': 'codex'}]
+        report = eval_harness.run(self.cases, specs, mode='live', confirm=True, policy=self.policy,
+                                  run_job=fake_run_job, meter=lambda w: 10.0)
+        codex_entry = report['policies']['codex']
+        self.assertEqual(codex_entry['metrics']['cases'], 0)
+        self.assertEqual(codex_entry['metrics']['unavailable'], 2)
+        self.assertEqual(len(codex_entry['unavailable']), 2)
+        self.assertTrue(all(s['status'] == 'unavailable' and s['quality'] is None for s in codex_entry['scores']))
+        self.assertFalse(report['gate']['adopt'])
+        md = eval_harness.render_markdown(report)
+        self.assertIn('Unavailable workers (excluded from pass rate and gate)', md)
+        self.assertIn('quota_error', md)
+
 
 class CliTests(EvalFixture):
     def test_eval_capture_and_run_write_the_ab_report(self):

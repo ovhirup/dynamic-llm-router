@@ -26,9 +26,26 @@ def scope_score(changed, expected=None, max_files=MAX_FILES):
     return 1.0 if len(changed) <= max_files else max_files / len(changed)
 
 
+def is_unavailable(outcome):
+    """True when the worker was out of quota, auth-failed, or refused rather than failing a real task run."""
+    if not isinstance(outcome, dict):
+        return False
+    if outcome.get('unavailable') or outcome.get('quota_error') or outcome.get('auth_error'):
+        return True
+    if outcome.get('status') in ('unavailable', 'refused', 'handoff_to_orchestrator'):
+        return True
+    return outcome.get('tests_status') == 'unavailable'
+
+
 def score(outcome, expected_paths=None, weights=None):
-    """Score one outcome dict. Returns the outcome's metrics plus `quality` in [0, 1]."""
+    """Score one outcome dict. Returns the outcome's metrics plus `quality` in [0, 1] (or None if unavailable)."""
     weights = weights or WEIGHTS
+    if is_unavailable(outcome):
+        return {'case_id': outcome.get('case_id'), 'worker': outcome.get('worker'), 'status': 'unavailable',
+                'unavailable': True, 'reason': outcome.get('reason') or outcome.get('status') or 'unavailable',
+                'passed': False, 'quality': None, 'parts': {'tests': None, 'scope': None, 'reviewer': None},
+                'tokens': outcome.get('tokens'), 'quota_percent': outcome.get('quota_percent'),
+                'elapsed_seconds': outcome.get('elapsed_seconds')}
     passed = outcome.get('tests_status') == 'passed'
     parts = {'tests': 1.0 if passed else 0.0,
              'scope': scope_score(outcome.get('changed_paths'), expected_paths),
@@ -40,7 +57,8 @@ def score(outcome, expected_paths=None, weights=None):
     used = {k: v for k, v in parts.items() if v is not None}
     total = sum(weights[k] for k in used)
     quality = sum(weights[k] * v for k, v in used.items()) / total if total else 0.0
-    return {'case_id': outcome.get('case_id'), 'worker': outcome.get('worker'), 'passed': passed,
+    return {'case_id': outcome.get('case_id'), 'worker': outcome.get('worker'), 'status': 'passed' if passed else 'failed',
+            'unavailable': False, 'passed': passed,
             'quality': round(quality, 4), 'parts': parts, 'tokens': outcome.get('tokens'),
             'quota_percent': outcome.get('quota_percent'), 'elapsed_seconds': outcome.get('elapsed_seconds')}
 
@@ -50,11 +68,17 @@ def _numbers(rows, key):
 
 
 def aggregate(scores):
-    """Per-policy metrics over a list of score() results."""
-    tokens, quota, times = _numbers(scores, 'tokens'), _numbers(scores, 'quota_percent'), _numbers(scores, 'elapsed_seconds')
-    return {'cases': len(scores),
-            'pass_rate': round(sum(s['passed'] for s in scores) / len(scores), 4) if scores else 0.0,
-            'quality_mean': round(mean(s['quality'] for s in scores), 4) if scores else 0.0,
+    """Per-policy metrics over a list of score() results; unavailable outcomes are excluded from rates/means."""
+    available = [s for s in scores if not s.get('unavailable')]
+    unavailable = [s for s in scores if s.get('unavailable')]
+    tokens = _numbers(available, 'tokens')
+    quota = _numbers(available, 'quota_percent')
+    times = _numbers(available, 'elapsed_seconds')
+    qualities = [s['quality'] for s in available if type(s.get('quality')) in (int, float)]
+    return {'cases': len(available),
+            'unavailable': len(unavailable),
+            'pass_rate': round(sum(s['passed'] for s in available) / len(available), 4) if available else 0.0,
+            'quality_mean': round(mean(qualities), 4) if qualities else 0.0,
             'tokens_total': sum(tokens) if tokens else None,
             'tokens_mean': round(mean(tokens), 1) if tokens else None,
             'quota_percent_mean': round(mean(quota), 2) if quota else None,
