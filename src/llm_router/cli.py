@@ -53,6 +53,8 @@ def build_parser():
     job.add_argument('--size', choices=('draft', 'full'), default='full')
     job.add_argument('--worker')
     job.add_argument('--class', dest='task_class', choices=config.TASK_CLASSES)
+    job.add_argument('--orchestrator', choices=('cursor', 'claude', 'codex', 'grok-build', 'grok-bot'),
+                     help='calling orchestrator tool (default: auto-detected from environment)')
     keep = job.add_mutually_exclusive_group()
     keep.add_argument('--keep', action='store_true', help='keep the worktree even on failure')
     keep.add_argument('--prune', action='store_true', help='remove the worktree even on success')
@@ -101,6 +103,13 @@ def build_parser():
                                'workers are picked from current meter evidence')
     unit_run.add_argument('--base', default='HEAD')
     unit_run.add_argument('--assign-file', help='JSON {unit id: worker}; overrides any inline assign')
+    unit_run.add_argument('--orchestrator', choices=('cursor', 'claude', 'codex', 'grok-build', 'grok-bot'),
+                          help='calling orchestrator tool (default: auto-detected from environment)')
+
+    orch = commands.add_parser('orchestrator', help='Dynamic orchestrator detection and budget-aware handoff')
+    orch_cmds = orch.add_subparsers(dest='orchestrator_command', required=True)
+    orch_status = orch_cmds.add_parser('status', help='Show current orchestrator, why it was chosen, and fallback chain')
+    orch_status.add_argument('--orchestrator', choices=('cursor', 'claude', 'codex', 'grok-build', 'grok-bot'))
 
     evaluate = commands.add_parser('eval', help='Evaluation harness: replay past jobs and A/B two routing policies')
     eval_cmds = evaluate.add_subparsers(dest='eval_command', required=True)
@@ -381,6 +390,10 @@ def main(argv=None):
             result = quota_service.uninstall_agent(policy, yes=args.yes)
         _print(result)
         return 0
+    if args.command == 'orchestrator':
+        from . import orchestrator as orch_module
+        _print(orch_module.status_report(policy=policy, explicit=args.orchestrator))
+        return 0
     if args.command in ('run-job', 'jobs', 'cleanup'):
         from . import job_dispatch
         try:
@@ -388,7 +401,8 @@ def main(argv=None):
                 result = job_dispatch.run_job(args.repo, args.task_file, base=args.base, branch=args.branch,
                                               test_cmd=args.test_cmd, size=args.size, worker=args.worker,
                                               keep=True if args.keep else False if args.prune else None,
-                                              policy=policy, task_class=args.task_class)
+                                              policy=policy, task_class=args.task_class,
+                                              orchestrator=args.orchestrator)
             elif args.command == 'jobs':
                 result = job_dispatch.list_jobs(policy=policy, limit=args.limit)
             else:
@@ -425,7 +439,8 @@ def main(argv=None):
             elif args.units_command == 'run':
                 from . import wave_runner
                 units, assignment = wave_runner.load_run_files(args.units_file, args.assign_file)
-                result = wave_runner.run_batch(args.repo, units, assignment, base=args.base, policy=policy)
+                result = wave_runner.run_batch(args.repo, units, assignment, base=args.base, policy=policy,
+                                               orchestrator=args.orchestrator)
             elif args.units_command == 'list':
                 result = uw.list_batches(policy=policy, repo=args.repo)
             else:

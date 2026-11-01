@@ -16,7 +16,7 @@ Decisions (v1):
 import json
 from pathlib import Path
 
-from . import config, task_dag, task_dispatch
+from . import config, orchestrator as orch_module, task_dag, task_dispatch
 from . import merge_queue
 from . import unit_worktrees as uw
 from .job_dispatch import Refused
@@ -70,7 +70,7 @@ def load_run_files(units_file, assign_file=None):
 
 
 def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=None, quota_left=None,
-              assign=None, unit_runner=None, acquire_slot=None, test_runner=None):
+              assign=None, unit_runner=None, acquire_slot=None, test_runner=None, orchestrator=None):
     """Assign, create worktrees, run waves, gate after each wave; returns a JSON-serialisable summary.
 
     quota_left: {worker: n} or callable(units, policy) -> {worker: n} (default: current meter evidence).
@@ -78,6 +78,7 @@ def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=N
     unit_runner(entry, prompt, policy) -> {'ok', 'status'?, 'reason'?} (default runs the real worker).
     """
     policy = policy or config.load_policy()
+    detected_orch = orch_module.detect_orchestrator(explicit=orchestrator)
     try:
         units = task_dag.parse_units(units)
     except task_dag.DagError as error:
@@ -104,7 +105,9 @@ def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=N
             f'worker {worker!r} is not in the parallel pool (orchestrator handles it)'
         deferred.append({'id': unit['id'], 'worker': worker, 'status': 'deferred_to_orchestrator', 'reason': why})
 
-    summary = {'batch_id': None, 'waves': [], 'deferred': deferred, 'queue': None, 'ok': True}
+    summary = {'batch_id': None, 'orchestrator': detected_orch['orchestrator'],
+               'orchestrator_reason': detected_orch['reason'], 'waves': [], 'deferred': deferred,
+               'queue': None, 'ok': True}
     if not runnable:
         return summary
     # deps on deferred units are dropped for worktree creation only; the run below still honours them
