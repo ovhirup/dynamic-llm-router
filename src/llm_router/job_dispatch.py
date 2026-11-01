@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import agent_map, alerts, brain, config, feedback, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, triage
+from . import agent_map, alerts, brain, config, feedback, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, tool_gateway, triage
 from . import task_dispatch as td
 
 Refused = td.Refused
@@ -423,6 +423,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
                'tests_status': None, 'leak_check': None, 'blocked_by_leak_check': False, 'triage': None,
                'allowed_paths': scope, 'diff_scope': None,
                'risk_tier': 'medium', 'approval_required': True,
+               'permission_ladder': tool_gateway.ladder_for(policy), 'worker_permissions': {},
                'attempts': [], 'workers': [], 'worktree_state': None, 'branch_state': None,
                'main_checkout_untouched': None, 'handoffs': [], 'warnings': [],
                'review_required': False, 'review': None, 'task_class': task_class}
@@ -756,9 +757,17 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
             summary['stackwich'] = evidence
         summary['tests'].append(tests)
         summary['tests_status'] = tests['status']
+        if selected:
+            summary['worker_permissions'][selected] = tool_gateway.resolve_worker_permission_level(policy, selected)
+        last_run_rec = runs[-1] if runs else {}
+        passed_attempt = bool(result.get('ok') and changed and tests['status'] in passing)
+        failure_info = None if passed_attempt else tool_gateway.classify_failure(last_run_rec, tests)
         summary['attempts'].append({'attempt': cycle, 'worker': selected, 'ok': result.get('ok'),
                                     'changed': changed, 'runs': result.get('attempts'),
                                     'triage': parsed_triage,
+                                    'permission_level': (summary['worker_permissions'].get(selected) or {}).get('level'),
+                                    'failure_class': failure_info['failure_class'] if failure_info else None,
+                                    'recovery': failure_info['recovery'] if failure_info else None,
                                     'tests': tests['status'], 'stackwich': evidence,
                                     'leak_check': (result.get('leak_check') or {}).get('status'),
                                     'warnings': result.get('warnings')})
