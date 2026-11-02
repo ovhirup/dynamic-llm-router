@@ -200,6 +200,63 @@ class WaveRunnerTests(unittest.TestCase):
         source = Path(wr.__file__).read_text()
         self.assertIsNone(re.search(r'\b(push|merge)\s*\(|pr_gate|[\'"]push[\'"]|[\'"]merge[\'"]', source))
 
+    def test_continuation_brief_written_and_read_and_skill_file_has_attribution(self):
+        skill = Path(__file__).resolve().parents[1] / 'src/llm_router/templates/supervisor_skill.md'
+        self.assertTrue(skill.is_file())
+        self.assertIn('swyxio/skills', skill.read_text())
+        self.assertIn('MIT', skill.read_text())
+
+        result = self.run_batch(assignment={'api': 'claude', 'ui': 'claude', 'docs': 'claude'})
+        brief = wr.read_continuation_brief(self.policy, 'b1')
+        self.assertIsNotNone(brief)
+        self.assertEqual(brief['batch_id'], 'b1')
+        self.assertEqual(brief['mode'], 'wave')
+        self.assertEqual(brief['retry_state']['succeeded'], ['api', 'docs', 'ui'])
+        self.assertEqual(result['continuation_brief'], brief)
+        self.assertIsNone(result['stall_notice'])
+
+    def test_timeout_with_retained_output_is_adopted_and_not_redispatched(self):
+        calls = []
+
+        def timeout_after_commit(entry, prompt, policy):
+            calls.append(entry['id'])
+            wt = Path(entry['worktree'])
+            rel = FILES[entry['id']]
+            (wt / rel).parent.mkdir(parents=True, exist_ok=True)
+            commit(wt, rel)
+            return {'ok': False, 'status': 'timeout', 'timed_out': True, 'reason': 'client timeout'}
+
+        result = self.run_batch(
+            assignment={'api': 'claude', 'ui': 'claude', 'docs': 'claude'},
+            unit_runner=timeout_after_commit,
+        )
+        self.assertTrue(result['ok'], result)
+        wave0 = {r['id']: r for r in result['waves'][0]}
+        self.assertEqual(wave0['api']['status'], 'retained_after_timeout')
+        self.assertTrue(wave0['api']['ok'])
+        # Dependent unit `docs` still runs because `api` retained output was adopted
+        self.assertEqual(result['waves'][1][0]['id'], 'docs')
+        self.assertEqual(calls, ['api', 'ui', 'docs'])
+
+    def test_all_workers_stopped_emits_stall_notice(self):
+        self.policy['alerts'] = {
+            'file': str(self.base / 'alerts.jsonl'),
+            'summary': str(self.base / 'ALERTS.md'),
+            'macos_notification': False,
+        }
+        result = self.run_batch(
+            assignment={'api': 'claude', 'ui': 'claude', 'docs': 'claude'},
+            unit_runner=FakeRunner(fail={'api', 'ui', 'docs'}),
+        )
+        self.assertFalse(result['ok'])
+        self.assertIsNotNone(result['stall_notice'])
+        self.assertTrue(result['stall_notice']['stalled'])
+        self.assertEqual(result['stall_notice']['cause'], 'all_workers_stopped_or_blocked')
+
+        no_worker = wr.run_batch(self.repo, UNITS[:1], assignment={'api': None}, policy=self.policy)
+        self.assertIsNotNone(no_worker['stall_notice'])
+        self.assertEqual(no_worker['stall_notice']['cause'], 'all_units_deferred_no_eligible_worker')
+
 
 if __name__ == '__main__':
     unittest.main()

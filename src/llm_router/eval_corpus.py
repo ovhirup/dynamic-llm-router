@@ -7,6 +7,7 @@ recorded outcome as the baseline observation. The corpus is JSONL, redacted, and
 import json
 import re
 from datetime import datetime
+from importlib import resources
 from pathlib import Path
 
 from . import config, handoff, security
@@ -46,12 +47,58 @@ def _elapsed(job):
     return float(sum(times)) if times else None
 
 
+def _usage_tokens(usage):
+    """Total tokens from a usage dict (`total_tokens`, or sum of input/output/cache tokens), else None."""
+    if not isinstance(usage, dict):
+        return None
+    if type(usage.get('total_tokens')) in (int, float):
+        return int(usage['total_tokens'])
+    parts = [usage.get(k) for k in ('input_tokens', 'output_tokens',
+                                    'cache_read_input_tokens', 'cache_creation_input_tokens')
+             if type(usage.get(k)) in (int, float)]
+    return int(sum(parts)) if parts else None
+
+
+def extract_tokens_from_text(text):
+    """Extract total token usage from a worker output log (e.g. Claude/Grok stream-json lines), or None."""
+    total, seen = 0, False
+    for line in (text or '').splitlines():
+        line = line.strip()
+        if not line or '{' not in line:
+            continue
+        start = line.find('{')
+        try:
+            obj = json.loads(line[start:])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if type(obj.get('tokens')) in (int, float):
+            total, seen = total + int(obj['tokens']), True
+            continue
+        u = _usage_tokens(obj.get('usage'))
+        if u is None and isinstance(obj.get('message'), dict):
+            u = _usage_tokens(obj['message'].get('usage'))
+        if u is not None:
+            total, seen = total + u, True
+    return total if seen else None
+
+
 def _tokens(job):
-    """Total tokens if any worker run recorded them (`tokens` or `usage.total_tokens`), else None."""
+    """Total tokens if any worker run recorded them (`tokens`, `usage`, or output log stream-json), else None."""
+    if type(job.get('tokens')) in (int, float):
+        return job['tokens']
     total, seen = 0, False
     for attempt in job.get('attempts') or []:
         for run in attempt.get('runs') or []:
-            value = run.get('tokens', (run.get('usage') or {}).get('total_tokens'))
+            value = run.get('tokens')
+            if type(value) not in (int, float):
+                value = _usage_tokens(run.get('usage'))
+            if type(value) not in (int, float) and run.get('output_path'):
+                try:
+                    value = extract_tokens_from_text(Path(run['output_path']).read_text(errors='replace'))
+                except OSError:
+                    value = None
             if type(value) in (int, float):
                 total, seen = total + value, True
     return total if seen else None
@@ -78,7 +125,8 @@ def case_from_job(job):
     attempts = [a for a in job.get('attempts') or [] if a.get('worker')]
     case = {
         'version': CORPUS_VERSION, 'case_id': job.get('job_id'), 'repo': job.get('repo'),
-        'base_sha': job.get('base_sha'), 'task': job.get('task'), 'task_text': task_text,
+        'base_sha': job.get('base_sha'), 'task': job.get('task'), 'task_class': job.get('task_class'),
+        'task_text': task_text,
         'test_command': job.get('test_command'), 'size': job.get('size') or 'full',
         'started_at': job.get('started_at'),
         'baseline': {
@@ -126,3 +174,16 @@ def capture(policy=None, source=None, out=None, limit=None):
 def load(path):
     """Cases from a corpus JSONL file (blank lines ignored)."""
     return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
+
+
+def default_eval_set():
+    """The packaged DLR benchmark eval set (examples/eval_set.jsonl): fixed replayable cases per task class."""
+    text = resources.files('llm_router').joinpath('examples', 'eval_set.jsonl').read_text()
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def filter_by_class(cases, task_class=None):
+    """Cases whose `task_class` matches (all cases when task_class is None)."""
+    if task_class is None:
+        return list(cases)
+    return [case for case in cases if case.get('task_class') == task_class]

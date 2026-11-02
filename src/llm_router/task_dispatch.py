@@ -44,6 +44,28 @@ def failure_reason(stderr, stdout='', limit=300):
         return line if len(line) <= limit else line[:limit - 1] + '\u2026'
     return None
 
+
+def stderr_tail(stderr, stdout='', limit=2000):
+    """Redacted last `limit` chars of a failed worker's stderr (stdout tail when stderr is empty), or None."""
+    for text in (stderr or '', stdout or ''):
+        if text.strip():
+            return security.redact(text.rstrip()[-limit:])
+    return None
+
+
+def failure_fields(attempts):
+    """failure_reason/stderr_tail/error of the last failed attempt that recorded a cause, or {}."""
+    for record in reversed(attempts or []):
+        if record.get('ok') or not (record.get('failure_reason') or record.get('stderr_tail')):
+            continue
+        reason = record.get('failure_reason')
+        tail = record.get('stderr_tail')
+        error = reason or tail.strip().splitlines()[-1]
+        worker = record.get('worker')
+        return {'failure_reason': reason, 'stderr_tail': tail,
+                'error': f'{worker}: {error}' if worker else error}
+    return {}
+
 def coding_workers(policy):
     return tuple(k for k in policy['run_task']['commands'] if not k.startswith('_'))
 
@@ -238,6 +260,12 @@ def build_argv(policy, worker, cwd, prompt_file=None, prompt=None, repo=None, en
                    if '{' + name + '}' in template})
     if worker == 'claude':
         values['{claude_effort}'] = chosen_effort
+    local = (policy['run_task'].get('local_models') or {}).get(worker) or {}
+    for field in ('base_url', 'model'):
+        if any('{' + field + '}' in arg for arg in template):
+            if not local.get(field):
+                raise Refused(f'{worker}: template uses {{{field}}} but no {field} is configured')
+            values['{' + field + '}'] = str(local[field]).rstrip('/') if field == 'base_url' else str(local[field])
     argv = []
     for arg in template:
         for key, value in values.items():
@@ -330,22 +358,64 @@ def concurrency_cap(policy, worker):
     return (policy['run_task'].get('concurrency') or {}).get(worker)
 
 
+# Workers that load a large model into this machine's RAM. 16 GB cannot hold two >=14B models,
+# so at most one of them runs at a time across all router processes (the shared local_model.lock).
+LOCAL_MODEL_WORKERS = ('developer', 'aider-ollama', 'nativ', 'local')
+LOCAL_MODEL_LOCK = 'local_model.lock'
+
+
+def is_local_model_worker(worker):
+    return worker in LOCAL_MODEL_WORKERS or worker.startswith(('aider-ollama', 'nativ'))
+
+
+class _SlotHandles:
+    """Several flock handles released together; close() frees every one."""
+
+    def __init__(self, handles):
+        self.handles = list(handles)
+
+    def close(self):
+        while self.handles:
+            self.handles.pop().close()
+
+
+def _try_lock(path):
+    handle = path.open('a')
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)  # held until close or process exit
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
 def acquire_slot(policy, worker):
-    """('uncapped', None), ('held', handle) or ('full', None); closing handle frees the slot."""
+    """('uncapped', None), ('held', handle), ('full', None) or ('local_busy', None).
+
+    Closing handle frees the slot. A local model worker also takes the shared local_model.lock;
+    if another local model job holds it the result is ('local_busy', None)."""
     cap = concurrency_cap(policy, worker)
-    if cap is None:
+    local = is_local_model_worker(worker)
+    if cap is None and not local:
         return 'uncapped', None
     slot_dir = config.policy_path(policy, 'run_task', 'slot_dir', 'state/slots')
     slot_dir.mkdir(parents=True, exist_ok=True)
-    for index in range(cap):
-        handle = (slot_dir / f'{worker}.{index}.lock').open('a')
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)  # held until close or process exit
-        except BlockingIOError:
-            handle.close()
-            continue
-        return 'held', handle
-    return 'full', None
+    held = None
+    if cap is not None:
+        for index in range(cap):
+            held = _try_lock(slot_dir / f'{worker}.{index}.lock')
+            if held:
+                break
+        else:
+            return 'full', None
+    if not local:
+        return 'held', held
+    local_handle = _try_lock(slot_dir / LOCAL_MODEL_LOCK)
+    if local_handle is None:
+        if held:
+            held.close()
+        return 'local_busy', None
+    return 'held', _SlotHandles([h for h in (held, local_handle) if h])
 
 
 def check_prompt_size(policy, prompt):
@@ -491,6 +561,10 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
         if state == 'full':
             summary['warnings'].append(f'{name} at its concurrency cap ({concurrency_cap(policy, name)}): skipped')
             continue
+        if state == 'local_busy':
+            summary['warnings'].append(f'{name} skipped: local_busy (another local model job is running)')
+            summary.setdefault('skip_reasons', {})[name] = 'local_busy'
+            continue
         # A failover from a Stackwich-required attempt keeps the requirement: only a Stackwich-capable worker.
         if (summary['attempts'] and summary['attempts'][-1]['stackwich']['status'] == 'required' and
                 stackwich.status(policy, name) != 'required'):
@@ -594,6 +668,11 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                 if name == 'claude':
                     record['continuations'] = continuation
                     result['elapsed_seconds'] = elapsed
+                from . import eval_corpus
+                extracted_tokens = eval_corpus.extract_tokens_from_text(
+                    '\n'.join(item.get('stdout', '') for item in logs))
+                if extracted_tokens is not None:
+                    record['tokens'] = extracted_tokens
             finally:
                 if prompt_file is not None:
                     prompt_file.unlink(missing_ok=True)
@@ -622,6 +701,9 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                 reason = failure_reason(result.get('stderr', ''), result.get('stdout', ''))
                 if reason:
                     record['failure_reason'] = reason
+                tail = stderr_tail(result.get('stderr', ''), result.get('stdout', ''))
+                if tail:
+                    record['stderr_tail'] = tail
             auth = (not record['ok'] and not quota and record.get('success_check') != 'refusal' and
                     not result['timed_out'] and
                     bool(AUTH_ERROR.search(result.get('stderr', '') + result.get('stdout', '')[-4000:])))
@@ -645,6 +727,9 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                 (protocol == 'required' and not (name == 'claude' and record.get('quota_error')))):
             break
     _release(_slots)
+    if not summary['attempts'] and 'local_busy' in summary.get('skip_reasons', {}).values():
+        summary['reason'] = 'local_busy'
+        raise Refused('local_busy: another local model job is already running; ' + '; '.join(summary['warnings']))
     if not summary['attempts']:
         raise Refused('every eligible worker is at its concurrency cap: ' + '; '.join(summary['warnings']))
     head_after = _git(cwd, 'rev-parse', '--verify', '-q', 'HEAD').stdout.strip() or None
@@ -661,6 +746,8 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
     summary['blocked_worker_attempts'] = security.count_lines(block_log) - blocks_before
     if summary['blocked_worker_attempts']:
         summary['warnings'].append('a worker tried to start a denylisted CLI; the shim refused it')
+    if not summary.get('ok'):
+        summary.update(failure_fields(summary['attempts']))
     summary['finished_at'] = now_local(policy).isoformat(timespec='seconds')
     for record in summary['attempts']:
         used = meters.get(record['worker'], '') if record['worker'] in metered else ''
