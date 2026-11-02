@@ -14,7 +14,7 @@ capable and has headroom left.
 """
 from datetime import timedelta
 
-from . import adaptive, config, selection
+from . import adaptive, config, scorecards, selection
 
 FALLBACK = 'grok-bot'
 WEEK = timedelta(days=7)
@@ -25,7 +25,8 @@ def capability(policy, worker, unit_kind):
     sched = (policy.get('scheduler') or {})
     table = (sched.get('capabilities') or {})
     if worker not in table:
-        base = 1.0
+        empirical = scorecards.class_score(policy, worker, unit_kind)
+        base = 1.0 if empirical is None else empirical
     else:
         value = (table[worker] or {}).get(unit_kind, 0)
         base = min(max(float(value), 0.0), 1.0) if type(value) in (int, float) else 0.0
