@@ -626,6 +626,8 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
             summary['warnings'].append('failover exhausted: no untried eligible worker left ('
                                        + ', '.join(sorted(used)) + ' tried)')
             return
+        from . import allocation_dispatch
+        allocation_dispatch.merge_result(summary, result)
         if result.get('status') == 'handoff_to_orchestrator':
             # Every worker is out: the job goes back to the orchestrator, not refused.
             summary.update(status='handoff_to_orchestrator', task_file=result.get('task_file'),

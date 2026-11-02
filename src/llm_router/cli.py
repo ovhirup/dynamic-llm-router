@@ -20,6 +20,8 @@ def build_parser():
     parser.add_argument('--version', action='version', version=f'llm-router {__version__}')
     parser.add_argument('--config', help='config JSON file (default: $LLM_ROUTER_CONFIG or <config dir>/config.json)')
     commands = parser.add_subparsers(dest='command', required=True)
+    from . import allocation_cli
+    allocation_cli.register(commands)
 
     commands.add_parser('paths', help='Show config/state locations and which binaries resolve')
     init = commands.add_parser('init', help='Write example config files into the config dir (never overwrites)')
@@ -347,6 +349,9 @@ def doctor(policy):
 def main(argv=None):
     parser, gate_help = build_parser()
     args = parser.parse_args(argv)
+    if args.command == 'plan':
+        from . import allocation_cli
+        return allocation_cli.run(args)
     if args.command == 'init':
         try:
             _print(init_config(force=args.force, workers=args.workers, never=args.never, meters=args.meters,
@@ -555,13 +560,8 @@ def main(argv=None):
         _print(result)
         return 0 if result['ok'] or result.get('status') == 'handoff_to_orchestrator' else 1
     if args.command == 'select':
-        from . import roles, selection
-        chars = 0 if args.size == 'draft' else (policy.get('developer') or {}).get('draft_max_chars', 4000) + 1
-        base_sel = selection.select(chars, policy=policy, cached_only=args.cached_only, task_class=args.task_class)
-        if args.role:
-            role_pick = roles.select_for_role(
-                args.role, policy=policy, eligible=base_sel.get('eligible'), meters=base_sel.get('meters'))
-            base_sel.update(worker=role_pick['worker'], role=args.role, role_pick=role_pick)
+        from . import allocation_cli
+        base_sel = allocation_cli.select_result(args, policy)
         _print(base_sel)
         return 0
     parser.error('unknown command')

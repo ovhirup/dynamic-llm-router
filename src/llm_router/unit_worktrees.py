@@ -47,6 +47,30 @@ def load_manifest(batch_id, policy=None):
         raise Refused(f'no such unit batch: {batch_id}')
 
 
+
+def update_worker(batch_id, unit_id, worker, policy=None, allocation=None):
+    """Persist an automatic reassignment under the existing repository lock."""
+    from . import allocation_dispatch
+    policy = policy or config.load_policy()
+    if worker not in task_dag.PARALLEL_POOL:
+        raise Refused('unit worker must belong to the parallel pool')
+    fields = allocation_dispatch.allocation_fields(
+        {'allocation': allocation, 'allocation_history': []}) if allocation is not None else {}
+    if allocation is not None and not fields:
+        raise Refused('invalid unit allocation')
+    manifest = load_manifest(batch_id, policy)
+    with RepoLock(_path(policy, 'lock_dir', 'logs/locks'), Path(manifest['repo'])):
+        manifest = load_manifest(batch_id, policy)
+        entry = next((item for item in manifest['units'] if item['id'] == unit_id), None)
+        if entry is None:
+            raise Refused(f'no such unit: {unit_id}')
+        entry['worker'] = worker
+        if fields:
+            entry['allocation'] = fields['allocation']
+        _save(_manifest_path(policy, batch_id), manifest)
+    return entry
+
+
 def _branch_exists(repo, branch):
     return bool(_git(repo, 'rev-parse', '-q', '--verify', f'refs/heads/{branch}').stdout.strip())
 

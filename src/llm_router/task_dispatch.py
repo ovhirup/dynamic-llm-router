@@ -453,6 +453,8 @@ def orchestrator_handoff(policy, summary, task_path, why, selection=None):
                    task_file=str(task_path), ok=False,
                    finished_at=now_local(policy).isoformat(timespec='seconds'))
     if selection is not None:
+        from . import allocation_dispatch
+        allocation_dispatch.remember(summary, selection.get('allocation'))
         summary['selection_reasons'] = selection.get('reasons', {})
     return summary
 
@@ -474,7 +476,7 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
     failover hop and returns the handoff text the next worker gets in its prompt.
     task_class ranks workers by class_order.<task_class>; when only grok-bot is left the run returns
     status handoff_to_orchestrator with the task file path instead of being refused."""
-    from . import selection as selection_module
+    from . import allocation_dispatch, selection as selection_module
     _slots = [] if _slots is None else _slots
     policy = policy or config.load_policy()
     if role is not None:
@@ -482,6 +484,8 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
         roles.role_order(policy, role)
     injected_select = select is not None
     select = select or (lambda chars, **kw: selection_module.select(chars, policy=policy, **kw))
+    if role is not None:
+        select = functools.partial(select, role=role)
     if task_class is not None:
         config.worker_order(policy, task_class)  # unknown class -> ConfigError before any work
         select = functools.partial(select, task_class=task_class)
@@ -520,8 +524,8 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
         selection = (meter or (lambda name: selection_module.read_meter(policy, name)))(worker)
     else:
         selection = select(chars, consult_cursor=True) if worker == 'cursor' else select(chars)
-    meters = selection.get('meters', {})
-    if role is not None:
+    meters = dict(selection.get('meters', {}))
+    if role is not None and 'allocation' not in selection:
         role_pick = roles.select_for_role(role, policy, selection.get('eligible', []), meters)
         selected = set(selection.get('eligible', []))
         candidates = [name for name in role_pick['candidates'] if name in selected]
@@ -562,7 +566,12 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
     _, block_log = worker_environment(policy)
     blocks_before = security.count_lines(block_log)
     used = set(tried)
-    for attempt, name in enumerate(order):  # one run per worker, MAX_WORKERS distinct workers per job
+    dispatches = allocation_dispatch.choices(
+        selection, lambda: select(chars), order, forced=worker, pinned=_claude_pinned,
+        exclude=exclude, allowed=forceable(policy), as_of=started.isoformat(),
+        on_plan=lambda plan: allocation_dispatch.remember(summary, plan))
+    for attempt, (name, current_selection) in enumerate(dispatches):
+        meters.update(current_selection.get('meters') or {})
         if name not in used and len(used) >= MAX_WORKERS:
             summary['warnings'].append(f'failover stopped: {MAX_WORKERS} workers already tried')
             break
@@ -599,6 +608,8 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
         env, _ = worker_environment(policy, name)
         protocol = stackwich.status(policy, name)
         record = {'worker': name, 'stackwich': {'status': protocol, 'cycle': stackwich_cycle}}
+        if current_selection.get('allocation') is not None:
+            record['allocation'] = current_selection['allocation']
         invocation_prompt = prompt + ('\n\n' + hop_note if hop_note else '')
         claude_tail = ''
         if name == 'claude':
@@ -624,6 +635,8 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                 summary.update(worker=name, ok=False, stackwich=record['stackwich'])
                 summary['warnings'].append(str(error))
                 break
+        if summary.get('allocation') is not None:
+            summary['allocation_path'] = allocation_dispatch.write_sidecar(out_dir, stamp, summary)
         used.add(name)
         if name == 'developer':
             path = out_dir / f'{stamp}-developer.md'

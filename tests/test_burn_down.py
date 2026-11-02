@@ -75,7 +75,8 @@ class BurnDownTests(unittest.TestCase):
             now=NOW - timedelta(hours=5),
         )
         report = burn_down.usage_report(self.policy, now=NOW, io=io)
-        self.assertEqual(report['next_worker'], 'claude')
+        # Equal expiry: allocation prefers Cursor's greater headroom over configured first-fit.
+        self.assertEqual(report['next_worker'], 'cursor')
         by_worker = {w['worker']: w for w in report['workers']}
         self.assertEqual(by_worker['claude']['used_percent'], 30.0)
         self.assertEqual(by_worker['claude']['remaining_percent'], 70.0)
@@ -85,7 +86,7 @@ class BurnDownTests(unittest.TestCase):
         self.assertFalse(by_worker['codex']['eligible'])
 
         table = burn_down.render_usage_table(report)
-        self.assertIn('Next worker: claude', table)
+        self.assertIn('Next worker: cursor', table)
         self.assertIn('30%', table)
         self.assertIn('2%/h', table)
 
