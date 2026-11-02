@@ -155,6 +155,8 @@ def build_parser():
     replay.add_argument('--fake-workers', help='offline: JSON file of per-worker fake profiles')
     replay.add_argument('--no-recorded', action='store_true',
                         help='offline: never replay recorded outcomes, use fake profiles for every worker')
+    replay.add_argument('--size', choices=('draft', 'full'), default=None,
+                        help='override task size (e.g. --size draft for stale-meter runs); recorded in report')
     replay.add_argument('--yes', action='store_true', help='live: confirm running real workers')
 
     quota = commands.add_parser('quota', help='Quota meter refresh')
@@ -424,12 +426,13 @@ def main(argv=None):
                 cases = eval_corpus.load(args.corpus or eval_corpus.corpus_path(policy))
             report = eval_harness.run(cases, specs, mode=args.mode, profiles=profiles, policy=policy,
                                       confirm=args.yes, use_recorded=not args.no_recorded,
-                                      task_class=args.task_class)
+                                      task_class=args.task_class, size=args.size)
         except (eval_harness.Refused, OSError, json.JSONDecodeError) as refusal:
             print(json.dumps({'ok': False, 'refused': str(refusal)}))
             return 3
         stamp = config.now_local(policy).strftime('%Y%m%d-%H%M%S')
         _print({'gate': report['gate'], 'task_class': args.task_class, 'cases': report['cases'],
+                'size_override': report.get('size_override'),
                 'metrics': {name: entry['metrics'] for name, entry in report['policies'].items()},
                 'by_class': {name: entry['by_class'] for name, entry in report['policies'].items()},
                 'skipped': len(report['skipped']), 'report': eval_harness.write_report(report, policy, stamp)})
