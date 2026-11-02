@@ -57,6 +57,22 @@ def build_parser():
     keep.add_argument('--keep', action='store_true', help='keep the worktree even on failure')
     keep.add_argument('--prune', action='store_true', help='remove the worktree even on success')
 
+    dispatch = commands.add_parser('bot-dispatch',
+                                   help='Map --class and --size to class_order, call run-job and print one JSON verdict')
+    dispatch.add_argument('--repo', required=True)
+    dispatch.add_argument('--task-file', required=True)
+    dispatch.add_argument('--class', dest='task_class', default='feature',
+                          help='task class (' + ', '.join(config.TASK_CLASSES) + '; research is refused)')
+    dispatch.add_argument('--size', choices=('draft', 'full'), default=None,
+                          help='task size (default: draft for --class draft, else full)')
+    dispatch.add_argument('--base', help='base ref (default: current HEAD of --repo)')
+    dispatch.add_argument('--branch', help='new branch name (default router/<slug>-<stamp>)')
+    dispatch.add_argument('--test-cmd', help='shell test command (default: test_cmd from repos.json)')
+    dispatch.add_argument('--worker')
+    dispatch_keep = dispatch.add_mutually_exclusive_group()
+    dispatch_keep.add_argument('--keep', action='store_true', help='keep the worktree even on failure')
+    dispatch_keep.add_argument('--prune', action='store_true', help='remove the worktree even on success')
+
     jobs = commands.add_parser('jobs', help='List recent run-job jobs and worktrees')
     jobs.add_argument('--limit', type=int, default=20)
     clean = commands.add_parser('cleanup', help='Remove old router worktrees')
@@ -384,6 +400,16 @@ def main(argv=None):
             result = quota_service.uninstall_agent(policy, yes=args.yes)
         _print(result)
         return 0
+    if args.command == 'bot-dispatch':
+        from . import job_dispatch
+        result = job_dispatch.bot_dispatch(
+            args.repo, args.task_file, task_class=args.task_class, size=args.size,
+            base=args.base, branch=args.branch, test_cmd=args.test_cmd, worker=args.worker,
+            keep=True if args.keep else False if args.prune else None, policy=policy)
+        _print(result)
+        if result['action'] == 'refused':
+            return 3
+        return 0 if result['action'] in ('dispatched', 'handoff_to_orchestrator') else 1
     if args.command in ('run-job', 'jobs', 'cleanup'):
         from . import job_dispatch
         try:

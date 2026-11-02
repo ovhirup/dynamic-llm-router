@@ -15,7 +15,7 @@ import re
 import subprocess
 import time
 
-from . import alerts, config, security
+from . import alerts, approval_audit, config, security
 from . import task_dispatch as td
 ACTIONS = ('push', 'merge')
 MERGE_METHODS = ('merge', 'squash', 'rebase')
@@ -364,6 +364,8 @@ def approve(job_id, action, sha=None, hours=None, note=None, policy=None, now=No
     if action not in ACTIONS:
         raise Refused(f'action must be one of {ACTIONS}')
     job = load_job(policy, job_id)
+    if job.get('review_required') is True and (job.get('review') or {}).get('verdict') != 'approve':
+        raise Refused('stronger-model review required before approving Codex/Cursor/local output')
     guard_branch(policy, job, settings_for(policy, job))
     head = head_sha(job)
     _match_sha(head, sha)
@@ -383,7 +385,9 @@ def approve(job_id, action, sha=None, hours=None, note=None, policy=None, now=No
               'undo_until': (stamp + timedelta(seconds=max(0.0, undo_window))).isoformat(timespec='seconds'),
               'note': security.redact(note or ''), 'review_dir': gate['review'].get('dir')}
     record['id'] = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()[:12]
-    return _append_approval(policy, record)
+    saved = _append_approval(policy, record)
+    approval_audit.record_approval_audit(policy, saved, actor='owner', now=stamp)
+    return saved
 
 
 def undo(job_id, action, note=None, policy=None, now=None):
@@ -413,9 +417,12 @@ def deny(job_id, action, note=None, policy=None, now=None):
         raise Refused(f'action must be one of {ACTIONS}')
     job = load_job(policy, job_id)
     head = head_sha(job)
+    stamp = now_local(now)
     record = {'type': 'denial', 'job': job_id, 'action': action, 'sha': head, 'branch': job['branch'],
-              'at': now_local(now).isoformat(timespec='seconds'), 'note': security.redact(note or '')}
-    return _append_approval(policy, record)
+              'at': stamp.isoformat(timespec='seconds'), 'note': security.redact(note or '')}
+    saved = _append_approval(policy, record)
+    approval_audit.record_approval_audit(policy, saved, actor='owner', now=stamp)
+    return saved
 
 
 def _mark_used(policy, approval, now=None):
