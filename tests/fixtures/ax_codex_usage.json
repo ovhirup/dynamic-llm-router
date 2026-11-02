@@ -1,0 +1,24 @@
+{
+  "app": "com.openai.codex",
+  "role": "AXApplication",
+  "title": "Codex",
+  "children": [
+    {
+      "ref": "@e1",
+      "role": "AXWindow",
+      "title": "Usage & Limits",
+      "children": [
+        {
+          "ref": "@e2",
+          "role": "AXStaticText",
+          "value": "Weekly allowance: 42.5% used"
+        },
+        {
+          "ref": "@e3",
+          "role": "AXStaticText",
+          "value": "Resets: 2026-11-04T06:47:00+00:00"
+        }
+      ]
+    }
+  ]
+}

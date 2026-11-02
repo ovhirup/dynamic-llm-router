@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import http.client
 import json
 import math
+import os
 import re
 import urllib.request
 
@@ -171,6 +172,86 @@ def developer_ready(policy, task_chars):
     return bool(options.get('enabled') and options.get('endpoint')) and task_chars <= options.get('draft_max_chars', 0)
 
 
+HEALTH_WORKERS = ('aider-ollama', 'nativ')
+OLLAMA_DEFAULT = 'http://127.0.0.1:11434'
+
+
+def _worker_cfg(policy, worker):
+    cfg = (policy.get('workers') or {}).get(worker)
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def configured_model(policy, worker):
+    """The local model from workers.<w>.model, else `--model [ollama_chat/]<m>` in its command."""
+    model = _worker_cfg(policy, worker).get('model')
+    if not isinstance(model, str) or not model:
+        argv = ((policy.get('run_task') or {}).get('commands') or {}).get(worker) or []
+        model = None
+        for i, arg in enumerate(argv):
+            if arg == '--model' and i + 1 < len(argv) and isinstance(argv[i + 1], str):
+                model = argv[i + 1]
+            elif isinstance(arg, str) and arg.startswith('--model='):
+                model = arg.split('=', 1)[1]
+        if not model:
+            return None
+    if worker == 'aider-ollama':
+        for prefix in ('ollama_chat/', 'ollama/'):
+            if model.startswith(prefix):
+                return model[len(prefix):]
+    return model
+
+
+def health_url(policy, worker):
+    base = _worker_cfg(policy, worker).get('base_url')
+    if worker == 'aider-ollama':
+        base = base or os.environ.get('OLLAMA_API_BASE') or OLLAMA_DEFAULT
+        return base.rstrip('/') + '/api/tags'
+    base = (base or '').rstrip('/')
+    base = base[:-3] if base.endswith('/v1') else base
+    return base + '/v1/models' if base else None
+
+
+def wants_health_check(policy, worker, health_opener):
+    """Probe only when asked: an injected opener, health_check: true, or a configured base_url."""
+    if worker not in HEALTH_WORKERS:
+        return False
+    cfg = _worker_cfg(policy, worker)
+    return health_opener is not None or cfg.get('health_check') is True or bool(cfg.get('base_url'))
+
+
+def health_reason(policy, worker, health_opener=None, timeout=3):
+    """None when the local server lists the configured model, else 'server_unreachable' / 'model_not_present'.
+
+    health_opener(url, timeout) returns (status, body); body is bytes, str or already-parsed JSON.
+    """
+    if worker == 'nativ':
+        ok, why = check_local_worker(policy, worker, health_opener)
+        if ok:
+            return None
+        return 'server_unreachable' if why in ('server_not_running', 'invalid_base_url') else why
+    url = health_url(policy, worker)
+    if not url:
+        return 'server_unreachable'
+    try:
+        status, body = (health_opener or _default_opener)(url, timeout)
+        if status != 200:
+            return 'server_unreachable'
+        payload = json.loads(body) if isinstance(body, (bytes, str)) else body
+    except Exception:
+        return 'server_unreachable'
+    if not isinstance(payload, dict):
+        return 'server_unreachable'
+    key, field = ('models', 'name') if worker == 'aider-ollama' else ('data', 'id')
+    rows = payload.get(key)
+    names = {row.get(field) for row in rows if isinstance(row, dict)} if isinstance(rows, list) else set()
+    model = configured_model(policy, worker)
+    if model is None:
+        return None if names else 'model_not_present'
+    if worker == 'aider-ollama' and ':' not in model:
+        names |= {n.split(':', 1)[0] for n in names if isinstance(n, str) and n.endswith(':latest')}
+    return None if model in names else 'model_not_present'
+
+
 def select(task_chars, policy=None, cached_only=False, now=None, io=None, consult_all=False,
            consult_cursor=False, threshold_overrides=None, claude_profile_loader=None, cooldowns=None,
            task_class=None, grok_bot_evidence=None, health_opener=None):
@@ -181,8 +262,9 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
     order and is never quota-gated, so a class job is handed back to the orchestrator, not refused.
     Workers sharing the grok-bot pool are paced by week_curve.gate(): an unknown pool is tried last
     among cloud workers and ahead-of-curve drops one rank; neither bans.
-    Workers with a local base_url (e.g. nativ) are eligible only when check_local_worker() passes;
-    health_opener replaces the HTTP GET in tests.
+    Local aider-ollama / nativ workers are probed (health_reason) when health_opener is given or the
+    worker sets health_check: true or base_url; Nativ also uses check_local_worker() for OpenAI-style
+    /v1/models probes. A down server or a missing model makes them ineligible.
     """
     policy = policy or config.load_policy()
     clock_injected = now is not None
@@ -216,6 +298,11 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
             if account is not None and account != 'personal':
                 reasons[worker] = f'claude_account_{account}'
                 continue
+        if wants_health_check(policy, worker, health_opener):
+            unhealthy = health_reason(policy, worker, health_opener)
+            if unhealthy is not None:
+                reasons[worker] = unhealthy
+                continue
         if worker == 'developer':
             ok = developer_ready(policy, task_chars)
             reasons[worker] = 'draft_fallback' if ok else 'developer_disabled_or_task_too_large'
@@ -225,9 +312,6 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
         if quota is None or worker not in io:
             ok = worker in unmetered
             reasons[worker] = 'unmetered' if ok else ('observer_disabled' if quota is not None else 'no_meter')
-            if ok and local_model_config(policy, worker).get('base_url'):
-                ok, why = check_local_worker(policy, worker, health_opener)
-                reasons[worker] = 'unmetered' if ok else why
             eligible += [worker] if ok else []
             continue
         consult = quota.get('consult', 'always')
