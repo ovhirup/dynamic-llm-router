@@ -36,4 +36,5 @@ llm-router = "llm_router.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-llm_router = ["default_policy.json", "templates/*", "examples/*", "examples/workers/*", "examples/plugins/*", "examples/*.jsonl"]
+llm_router = ["default_policy.json", "templates/*", "examples/*", "examples/workers/*", "examples/plugins/*", "examples/*.jsonl", "capabilities.json"]
+

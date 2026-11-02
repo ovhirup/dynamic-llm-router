@@ -122,7 +122,13 @@ def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=N
         units = task_dag.parse_units(units)
     except task_dag.DagError as error:
         raise Refused(f'bad units: {error}')
-    if assignment is None:
+    automatic = assignment is None and assign is None and quota_left is None
+    allocations = {}
+    if automatic:
+        from . import allocation_dispatch
+        allocations = {unit['id']: allocation_dispatch.plan_unit(unit, policy) for unit in units}
+        assignment = {uid: plan['worker'] for uid, plan in allocations.items()}
+    elif assignment is None:
         left = quota_left(units, policy) if callable(quota_left) else \
             quota_left if quota_left is not None else default_quota_left(units, policy)
         assignment = (assign or task_dag.assign)(units, left)
@@ -147,6 +153,8 @@ def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=N
     summary = {'batch_id': None, 'orchestrator': detected_orch['orchestrator'],
                'orchestrator_reason': detected_orch['reason'], 'waves': [], 'deferred': deferred,
                'queue': None, 'continuation_brief': None, 'stall_notice': None, 'ok': True}
+    if automatic:
+        summary['allocations'] = allocations
     if not runnable:
         stall = {
             'stalled': True,
@@ -196,6 +204,21 @@ def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=N
                 succeeded.add(uid)
                 results.append(record)
                 continue
+            if automatic:
+                plan = allocation_dispatch.plan_unit(by_id[uid], policy)
+                summary['allocations'][uid] = plan
+                record['allocation'] = plan
+                if plan['worker'] is None:
+                    record.update(ok=False, status='deferred_allocation',
+                                  reason='no eligible parallel worker in refreshed allocation')
+                    summary['deferred'].append(dict(record))
+                    results.append(record)
+                    continue
+                entry = uw.update_worker(manifest['batch_id'], uid, plan['worker'],
+                                         policy=policy, allocation=plan)
+                entries[uid] = entry
+                record['worker'] = entry['worker']
+                brief['workers'][uid] = entry['worker']
             state, handle = acquire_slot(policy, entry['worker'])
             if state in ('full', 'local_busy'):
                 record.update(ok=False, status='deferred_slot_full',
