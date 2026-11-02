@@ -231,6 +231,65 @@ class WorkerTests(unittest.TestCase):
             load_policy(worker_order=['sample'], workers={'sample': {'command': ['fake-worker']}})
 
 
+class LocalModelHealthTests(unittest.TestCase):
+    """Issue #17: local model servers are probed (mocked HTTP only) before a worker is eligible."""
+
+    def policy(self, worker, opts):
+        return load_policy(worker_order=[worker], workers={worker: opts}, unmetered_workers=[worker])
+
+    def opener(self, payload, status=200):
+        seen = []
+        def health_opener(url, timeout):
+            seen.append(url)
+            return status, json.dumps(payload).encode()
+        return health_opener, seen
+
+    def ollama(self):
+        return self.policy('aider-ollama', {'command': ['aider', '--model', 'ollama_chat/qwen2.5-coder:14b']})
+
+    def nativ(self):
+        return self.policy('nativ', {'command': ['nativ-worker'], 'base_url': 'http://127.0.0.1:8080',
+                                     'model': 'local-coder-7b'})
+
+    def test_ollama_model_missing_is_ineligible(self):
+        opener, seen = self.opener({'models': [{'name': 'llama3:8b'}]})
+        with patch.dict(os.environ, {'OLLAMA_API_BASE': ''}):
+            result = selection.select(10000, policy=self.ollama(), io={}, health_opener=opener)
+        self.assertIsNone(result['worker'])
+        self.assertEqual(result['reasons']['aider-ollama'], 'model_not_present')
+        self.assertEqual(seen,['http://127.0.0.1:11434/api/tags'])
+
+    def test_ollama_model_present_is_eligible(self):
+        opener, _ = self.opener({'models': [{'name': 'qwen2.5-coder:14b'}]})
+        result = selection.select(10000, policy=self.ollama(), io={}, health_opener=opener)
+        self.assertEqual(result['worker'], 'aider-ollama')
+        self.assertEqual(result['reasons']['aider-ollama'], 'unmetered')
+
+    def test_ollama_unreachable(self):
+        def down(url, timeout):
+            raise OSError('connection refused')
+        result = selection.select(10000, policy=self.ollama(), io={}, health_opener=down)
+        self.assertEqual(result['reasons']['aider-ollama'], 'server_unreachable')
+        self.assertNotIn('aider-ollama', result['eligible'])
+
+    def test_nativ_model_missing_is_ineligible(self):
+        opener, seen = self.opener({'object': 'list', 'data': [{'id': 'other-model'}]})
+        result = selection.select(10000, policy=self.nativ(), io={}, health_opener=opener)
+        self.assertIsNone(result['worker'])
+        self.assertEqual(result['reasons']['nativ'], 'model_not_present')
+        self.assertEqual(seen,['http://127.0.0.1:8080/v1/models'])
+
+    def test_nativ_model_present_is_eligible(self):
+        opener, _ = self.opener({'object': 'list', 'data': [{'id': 'local-coder-7b'}]})
+        result = selection.select(10000, policy=self.nativ(), io={}, health_opener=opener)
+        self.assertEqual(result['worker'], 'nativ')
+
+    def test_no_probe_without_opener_or_config(self):
+        with patch('llm_router.selection._default_opener', side_effect=AssertionError('probed')):
+            result = selection.select(10000, policy=self.ollama(), io={})
+        self.assertEqual(result['worker'], 'aider-ollama')
+
+
 class ObserverTests(unittest.TestCase):
     def policy(self):
         return load_policy(worker_order=['sample'], workers={'sample': {'command': ['fake-worker'], 'quota': {
