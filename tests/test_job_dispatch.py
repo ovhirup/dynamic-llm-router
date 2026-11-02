@@ -90,6 +90,28 @@ class JobTests(unittest.TestCase):
         self.assertTrue((self.base / 'jobs' / f'{result["job_id"]}.json').exists())
         self.assertIn(',run-job,', (self.base / 'ledger.csv').read_text())
 
+    def test_diff_scope_gate_blocks_extra_file_and_allows_in_scope_edits(self):
+        self.task.write_text('# Scoped task\nCreate out.txt only.\n\n## Allowed paths\n- out.txt\n- docs/\n')
+        self.worker("open('out.txt','w').write('ok\\n'); open('rogue.txt','w').write('extra\\n')")
+        before = jd.main_state(self.repo)
+        result = self.job(test_cmd='test -f out.txt')
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['status'], 'diff_out_of_scope')
+        self.assertEqual(result['reason'], 'diff_out_of_scope')
+        self.assertIsNone(result['commit'])
+        self.assertEqual(result['diff_scope']['out_of_scope'], ['rogue.txt'])
+        self.assertEqual(result['allowed_paths'], ['docs/', 'out.txt'])
+        self.assert_main_untouched(before)
+
+        # In-scope edit (including inside a declared directory) passes and commits.
+        self.worker("import pathlib; pathlib.Path('docs').mkdir(exist_ok=True); "
+                    "open('out.txt','w').write('ok\\n'); open('docs/guide.md','w').write('hi\\n')")
+        ok_res = self.job(test_cmd='test -f out.txt')
+        self.assertTrue(ok_res['ok'], ok_res)
+        self.assertEqual(ok_res['status'], 'committed')
+        self.assertEqual(ok_res['diff_scope']['status'], 'ok')
+        self.assertEqual(ok_res['diff_scope']['out_of_scope'], [])
+
     def test_retry_with_test_output_then_pass(self):
         capture = self.base / 'prompts.txt'
         self.worker("import sys; p=sys.stdin.read(); open(%r,'a').write(p+'\\n=====\\n'); "
@@ -122,6 +144,24 @@ class JobTests(unittest.TestCase):
         runs = [r for a in result['attempts'] for r in a.get('runs') or []]
         self.assertEqual([r['worker'] for r in runs], ['codex', 'grok-build', 'cursor'])
         self.assertTrue(all(r['reason'] not in (None, 'ok') for r in runs), runs)
+
+    def test_failed_worker_exit_1_saves_root_cause_in_job_json(self):
+        # Issue #14: an exit-1 worker with stderr must not leave the job log without a reason.
+        for name in ('codex', 'grok-build'):
+            self.worker("import sys; print('loading model', file=sys.stderr); "
+                        "print('Error: model qwen2.5-coder:14b not found', file=sys.stderr); sys.exit(1)", name)
+        result = self.job(test_cmd='true')
+        self.assertFalse(result['ok'])
+        saved = json.loads((self.base / 'jobs' / f'{result["job_id"]}.json').read_text())
+        for doc in (result, saved):
+            self.assertEqual(doc['failure_reason'], 'Error: model qwen2.5-coder:14b not found')
+            self.assertIn('loading model', doc['stderr_tail'])
+            self.assertIn('not found', doc['error'])
+            for attempt in [a for a in doc['attempts'] if a.get('runs')]:
+                self.assertEqual(attempt['failure_reason'], 'Error: model qwen2.5-coder:14b not found')
+                self.assertIn('not found', attempt['stderr_tail'])
+                self.assertTrue(all(r['returncode'] == 1 and 'not found' in r['stderr_tail']
+                                    for r in attempt['runs']))
 
     def test_failed_worker_is_not_retried_in_the_next_cycle(self):
         calls = []
@@ -541,6 +581,83 @@ class JobTests(unittest.TestCase):
         report = jd.cleanup('0m', policy=self.policy)
         self.assertEqual(report['skipped'][0]['why'], 'uncommitted changes')
         self.assertTrue(Path(done['worktree']).exists())
+
+    # ---- stronger-model review (#13) ----
+
+    def test_review_required_for_weaker_and_local_workers_only(self):
+        for name in ('codex', 'cursor', 'aider-ollama', 'local', 'developer', 'nativ'):
+            self.assertTrue(jd.review_required(name), name)
+        for name in ('claude', 'grok-build', None, ''):
+            self.assertFalse(jd.review_required(name), name)
+
+    def test_codex_commit_writes_review_prompt_and_stays_pending_for_grok_bot(self):
+        self.worker("open('out.txt','w').write('hi\\n')")
+        result = self.job(test_cmd='test -f out.txt')
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(result['review_required'])
+        review = result['review']
+        self.assertEqual((review['status'], review['reviewer']), ('pending', 'grok-bot'))
+        prompt = Path(review['prompt_file'])
+        self.assertEqual(prompt.name, '.llm-router-review-prompt.md')
+        self.assertEqual(stat_mode(prompt), 0o600)
+        text = prompt.read_text()
+        self.assertIn('+hi', text)
+        self.assertIn('- out.txt', text)
+        self.assertIn('passed', text)
+        self.assertFalse(Path(result['worktree'], prompt.name).exists())  # never in the work tree
+        saved = json.loads((self.base / 'jobs' / f'{result["job_id"]}.json').read_text())
+        self.assertTrue(saved['review_required'])
+        self.assertEqual(saved['review']['status'], 'pending')
+
+    def test_reviewer_gets_diff_and_reject_fails_the_job(self):
+        self.worker("open('out.txt','w').write('hi\\n')")
+        seen = []
+        def reviewer(summary, diff, prompt_path):
+            seen.append((summary['commit'], diff, Path(prompt_path).read_text()))
+            return {'status': 'recorded', 'reviewer': 'claude', 'verdict': 'reject', 'notes': 'no'}
+        result = self.job(test_cmd='test -f out.txt', reviewer=reviewer)
+        self.assertEqual(len(seen), 1)
+        commit, diff, prompt = seen[0]
+        self.assertEqual(commit, result['commit'])
+        self.assertIn('+hi', diff)
+        self.assertIn(diff.strip(), prompt)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['status'], 'review_rejected')
+        self.assertEqual((result['review']['reviewer'], result['review']['verdict']), ('claude', 'reject'))
+        self.assertEqual(result['worktree_state'], 'kept')
+
+    def test_stronger_worker_output_needs_no_review(self):
+        self.worker("open('out.txt','w').write('hi\\n')", 'grok-build')
+        called = []
+        result = self.job(test_cmd='test -f out.txt', worker='grok-build',
+                          reviewer=lambda *a: called.append(a))
+        self.assertTrue(result['ok'], result)
+        self.assertFalse(result['review_required'])
+        self.assertIsNone(result['review'])
+        self.assertEqual(called, [])
+
+    def test_pr_gate_refuses_unreviewed_weaker_output_until_approved(self):
+        from llm_router import pr_gate as pg
+        self.worker("open('out.txt','w').write('hi\\n')")
+        result = self.job(test_cmd='test -f out.txt')
+        self.assertTrue(result['review_required'])
+        path = self.base / 'jobs' / f'{result["job_id"]}.json'
+        with self.assertRaisesRegex(pg.Refused, 'stronger-model review required'):
+            pg.approve(result['job_id'], 'push', policy=self.policy)
+        job = json.loads(path.read_text())
+        job['review'] = {'status': 'recorded', 'reviewer': 'claude', 'verdict': 'reject', 'notes': ''}
+        path.write_text(json.dumps(job))
+        with self.assertRaisesRegex(pg.Refused, 'stronger-model review required'):
+            pg.approve(result['job_id'], 'push', policy=self.policy)
+        job['review']['verdict'] = 'approve'
+        path.write_text(json.dumps(job))
+        with self.assertRaises(pg.Refused) as caught:  # next gate: the review bundle, not the model review
+            pg.approve(result['job_id'], 'push', policy=self.policy)
+        self.assertNotIn('stronger-model review', str(caught.exception))
+
+
+def stat_mode(path):
+    return os.stat(path).st_mode & 0o777
 
 
 class WatchdogAndPacingTests(unittest.TestCase):

@@ -1,5 +1,6 @@
 {
   "_why": "Check flags against your CLI version before use.",
+  "_note": "macOS 27: aider exits 1 with an ImportError from scipy (_spropack dlopen) unless scipy>=1.16 is installed; reinstall with `uv tool install --force aider-chat --with 'scipy>=1.16'`. Also confirm the model is pulled and reachable: `ollama list | grep qwen2.5-coder:14b` (pull with `ollama pull qwen2.5-coder:14b`). A failed run's root cause is saved as failure_reason/stderr_tail in logs/jobs/<job_id>.json.",
   "workers": {
     "aider-ollama": {
       "command": [
