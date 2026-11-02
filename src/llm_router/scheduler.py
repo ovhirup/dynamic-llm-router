@@ -1,8 +1,9 @@
 """Unit scheduler: score each parallel worker by capability x quota headroom x week-curve pace.
 
 score = capability * headroom * pace
-- capability: policy scheduler.capabilities[worker][unit_kind] in [0, 1]. A worker with no entry is
-  capable of every kind (1.0); a listed worker is capable only of the kinds it lists.
+- capability: policy scheduler.capabilities[worker][unit_kind] in [0, 1]. A worker with no entry
+  falls back to the sourced claim in capabilities.json for that kind, else 1.0; a listed worker is
+  capable only of the kinds it lists.
 - headroom: smallest (threshold - used) / threshold over the required windows, clamped to [0, 1].
   Evidence that is not quota_available (unknown, stale, exhausted, ...) means 0. Unmetered workers get 1.
 - pace: on the weekly window with a reset_at, remaining budget / budget a linear week curve leaves for
@@ -14,7 +15,7 @@ capable and has headroom left.
 """
 from datetime import timedelta
 
-from . import adaptive, config, scorecards, selection
+from . import adaptive, capabilities, config, scorecards, selection
 
 FALLBACK = 'grok-bot'
 WEEK = timedelta(days=7)
@@ -26,7 +27,11 @@ def capability(policy, worker, unit_kind):
     table = (sched.get('capabilities') or {})
     if worker not in table:
         empirical = scorecards.class_score(policy, worker, unit_kind)
-        base = 1.0 if empirical is None else empirical
+        if empirical is not None:
+            base = empirical
+        else:
+            sourced = capabilities.score_for(worker, unit_kind)
+            base = 1.0 if sourced is None else sourced
     else:
         value = (table[worker] or {}).get(unit_kind, 0)
         base = min(max(float(value), 0.0), 1.0) if type(value) in (int, float) else 0.0
