@@ -224,11 +224,192 @@ class WorkerTests(unittest.TestCase):
             rows = list(csv.DictReader(handle))
         self.assertEqual(rows[-1]['used_percent'], '10')
 
+    def local_policy(self):
+        policy = load_policy(worker_order=['aider-ollama'], workers={'aider-ollama': {'command': ['fake-worker']}},
+                             unmetered_workers=['aider-ollama'],
+                             run_task={'ledger': str(self.base / 'ledger.csv'), 'shim_dir': str(self.base / 'shims'),
+                                       'block_log': str(self.base / 'blocked.log'),
+                                       'slot_dir': str(self.base / 'slots')})
+        return policy
+
+    def test_local_model_workers_detected(self):
+        for name in ('developer', 'aider-ollama', 'aider-ollama-qwen', 'nativ', 'nativ-14b', 'local'):
+            self.assertTrue(td.is_local_model_worker(name), name)
+        for name in ('codex', 'claude', 'sample'):
+            self.assertFalse(td.is_local_model_worker(name), name)
+
+    def test_second_local_model_job_refused_local_busy(self):
+        policy = self.local_policy()
+        self.assertEqual(td.acquire_slot(policy, 'codex'), ('uncapped', None))
+        state, held = td.acquire_slot(policy, 'aider-ollama')
+        self.assertEqual(state, 'held')
+        try:
+            self.assertEqual(td.acquire_slot(policy, 'aider-ollama'), ('local_busy', None))
+            self.assertEqual(td.acquire_slot(policy, 'developer'), ('local_busy', None))
+            self.assertEqual(td.acquire_slot(policy, 'codex'), ('uncapped', None))  # remote workers unaffected
+            runner = lambda *a, **k: {'returncode': 0, 'timed_out': False, 'stdout': 'done', 'stderr': '',
+                                      'elapsed_seconds': 0}
+            with self.assertRaisesRegex(td.Refused, 'local_busy'):
+                td.run_task(self.task, self.repo, policy=policy, runner=runner, worker='aider-ollama',
+                            output_root=self.base / 'out')
+        finally:
+            held.close()
+        # Released: the developer slot (cap 1) and the local lock are both free again.
+        state, held = td.acquire_slot(policy, 'developer')
+        self.assertEqual(state, 'held')
+        held.close()
+        result = td.run_task(self.task, self.repo, policy=policy, runner=runner, worker='aider-ollama',
+                             output_root=self.base / 'out')
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['worker'], 'aider-ollama')
+        state, held = td.acquire_slot(policy, 'aider-ollama')  # the run released the local lock
+        self.assertEqual(state, 'held')
+        held.close()
+
+    def test_local_busy_releases_per_worker_slot(self):
+        policy = self.local_policy()
+        state, held = td.acquire_slot(policy, 'aider-ollama')
+        try:
+            self.assertEqual(td.acquire_slot(policy, 'developer'), ('local_busy', None))
+        finally:
+            held.close()
+        # developer's own cap-1 slot was not leaked by the local_busy refusal.
+        state, held = td.acquire_slot(policy, 'developer')
+        self.assertEqual(state, 'held')
+        held.close()
+
     def test_auto_ineligible_and_generic_requires_unmetered(self):
         policy = self.policy(ineligible={'sample': 'fixture'})
         self.assertIsNone(selection.select(10000, policy=policy, io={})['worker'])
         with self.assertRaisesRegex(config.ConfigError, 'unmetered_workers'):
             load_policy(worker_order=['sample'], workers={'sample': {'command': ['fake-worker']}})
+
+
+class NativWorkerTests(unittest.TestCase):
+    MODEL = 'mlx-community/Qwen2.5-Coder-14B-Instruct-4bit'
+
+    def policy(self, **opts):
+        from importlib import resources
+        preset = json.loads(resources.files('llm_router').joinpath('examples/workers/nativ.json').read_text())
+        preset['workers']['nativ'].update(opts)
+        return load_policy(worker_order=['nativ'], workers=preset['workers'],
+                           unmetered_workers=preset['unmetered_workers'])
+
+    def opener(self, status=200, ids=None, error=None):
+        calls = []
+        def opener(url, timeout):
+            calls.append((url, timeout))
+            if error:
+                raise error
+            return status, json.dumps({'object': 'list', 'data': [{'id': i} for i in (ids or [])]}).encode()
+        opener.calls = calls
+        return opener
+
+    def test_preset_materialises_local_model_and_argv(self):
+        policy = self.policy()
+        self.assertEqual(policy['run_task']['local_models']['nativ'],
+                         {'base_url': 'http://127.0.0.1:8080', 'model': self.MODEL})
+        self.assertEqual(policy['run_task']['prompt_delivery']['nativ'], 'file')
+        self.assertEqual(policy['run_task']['concurrency']['nativ'], 1)
+        self.assertIn('nativ', selection.LOCAL_WORKERS)
+        argv = td.build_argv(policy, 'nativ', Path('/tmp'), prompt_file='/tmp/p.md')
+        self.assertIn('http://127.0.0.1:8080/v1', argv)
+        self.assertIn('openai/' + self.MODEL, argv)
+        self.assertEqual(argv[-1], '/tmp/p.md')
+
+    def test_invalid_fields_rejected(self):
+        for opts in ({'base_url': 'ftp://host'}, {'base_url': 'localhost:8080'}, {'base_url': 7},
+                     {'model': ''}, {'model': 3}):
+            with self.subTest(opts=opts), self.assertRaises(config.ConfigError):
+                self.policy(**opts)
+
+    def test_eligible_when_models_lists_model(self):
+        policy = self.policy()
+        opener = self.opener(ids=[self.MODEL])
+        result = selection.select(100, policy=policy, io={}, health_opener=opener)
+        self.assertEqual(result['worker'], 'nativ')
+        self.assertEqual(result['reasons']['nativ'], 'unmetered')
+        self.assertEqual(opener.calls, [('http://127.0.0.1:8080/v1/models', 2)])
+        self.assertEqual(selection.check_local_worker(policy, 'nativ', self.opener(ids=['Qwen2.5-Coder-14B-Instruct-4bit'])),
+                         (True, None))
+
+    def test_ineligible_when_server_not_running(self):
+        policy = self.policy()
+        for opener in (self.opener(error=ConnectionRefusedError(61, 'refused')), self.opener(status=503),
+                       lambda url, timeout: (200, b'not json')):
+            with self.subTest(opener=opener):
+                result = selection.select(100, policy=policy, io={}, health_opener=opener)
+                self.assertIsNone(result['worker'])
+                self.assertNotIn('nativ', result['eligible'])
+                self.assertEqual(result['reasons']['nativ'], 'server_unreachable')
+
+    def test_ineligible_when_model_missing(self):
+        result = selection.select(100, policy=self.policy(), io={}, health_opener=self.opener(ids=['other/model']))
+        self.assertEqual(result['reasons']['nativ'], 'model_not_present')
+        self.assertEqual(result['eligible'], [])
+
+    def test_default_opener_unreachable(self):
+        policy = self.policy(base_url='http://127.0.0.1:9')
+        self.assertEqual(selection.check_local_worker(policy, 'nativ'), (False, 'server_not_running'))
+
+
+class LocalModelHealthTests(unittest.TestCase):
+    """Issue #17: local model servers are probed (mocked HTTP only) before a worker is eligible."""
+
+    def policy(self, worker, opts):
+        return load_policy(worker_order=[worker], workers={worker: opts}, unmetered_workers=[worker])
+
+    def opener(self, payload, status=200):
+        seen = []
+        def health_opener(url, timeout):
+            seen.append(url)
+            return status, json.dumps(payload).encode()
+        return health_opener, seen
+
+    def ollama(self):
+        return self.policy('aider-ollama', {'command': ['aider', '--model', 'ollama_chat/qwen2.5-coder:14b']})
+
+    def nativ(self):
+        return self.policy('nativ', {'command': ['nativ-worker'], 'base_url': 'http://127.0.0.1:8080',
+                                     'model': 'local-coder-7b'})
+
+    def test_ollama_model_missing_is_ineligible(self):
+        opener, seen = self.opener({'models': [{'name': 'llama3:8b'}]})
+        with patch.dict(os.environ, {'OLLAMA_API_BASE': ''}):
+            result = selection.select(10000, policy=self.ollama(), io={}, health_opener=opener)
+        self.assertIsNone(result['worker'])
+        self.assertEqual(result['reasons']['aider-ollama'], 'model_not_present')
+        self.assertEqual(seen,['http://127.0.0.1:11434/api/tags'])
+
+    def test_ollama_model_present_is_eligible(self):
+        opener, _ = self.opener({'models': [{'name': 'qwen2.5-coder:14b'}]})
+        result = selection.select(10000, policy=self.ollama(), io={}, health_opener=opener)
+        self.assertEqual(result['worker'], 'aider-ollama')
+        self.assertEqual(result['reasons']['aider-ollama'], 'unmetered')
+
+    def test_ollama_unreachable(self):
+        def down(url, timeout):
+            raise OSError('connection refused')
+        result = selection.select(10000, policy=self.ollama(), io={}, health_opener=down)
+        self.assertEqual(result['reasons']['aider-ollama'], 'server_unreachable')
+        self.assertNotIn('aider-ollama', result['eligible'])
+
+    def test_nativ_model_missing_is_ineligible(self):
+        opener, seen = self.opener({'object': 'list', 'data': [{'id': 'other-model'}]})
+        result = selection.select(10000, policy=self.nativ(), io={}, health_opener=opener)
+        self.assertIsNone(result['worker'])
+        self.assertEqual(result['reasons']['nativ'], 'model_not_present')
+        self.assertEqual(seen,['http://127.0.0.1:8080/v1/models'])
+
+    def test_nativ_model_present_is_eligible(self):
+        opener, _ = self.opener({'object': 'list', 'data': [{'id': 'local-coder-7b'}]})
+        result = selection.select(10000, policy=self.nativ(), io={}, health_opener=opener)
+        self.assertEqual(result['worker'], 'nativ')
+
+    def test_no_probe_without_opener_or_config(self):
+        with patch('llm_router.selection._default_opener', side_effect=AssertionError('probed')):
+            result = selection.select(10000, policy=self.ollama(), io={})
+        self.assertEqual(result['worker'], 'aider-ollama')
 
 
 class ObserverTests(unittest.TestCase):
@@ -290,6 +471,9 @@ class InitTests(unittest.TestCase):
         self.assertFalse(self.target.exists())
         self.assertEqual(report['config']['worker_order'], ['aider', 'opencode'])
         self.assertIn('process list', ' '.join(report['warnings']))
+        report = self.init(workers='nativ', dry_run=True)
+        self.assertEqual(report['config']['workers']['nativ']['base_url'], 'http://127.0.0.1:8080')
+        self.assertEqual(report['config']['unmetered_workers'], ['nativ'])
         report = self.init(workers='codex,aider', non_interactive=True)
         self.assertEqual(len(report['written']), 3)
         self.assertEqual((self.target / 'config.json').stat().st_mode & 0o777, 0o600)

@@ -15,7 +15,7 @@ capable and has headroom left.
 """
 from datetime import timedelta
 
-from . import capabilities, config, selection
+from . import adaptive, capabilities, config, scorecards, selection
 
 FALLBACK = 'grok-bot'
 WEEK = timedelta(days=7)
@@ -23,12 +23,36 @@ WEEKLY = 'weekly'
 
 
 def capability(policy, worker, unit_kind):
-    table = ((policy.get('scheduler') or {}).get('capabilities') or {})
+    sched = (policy.get('scheduler') or {})
+    table = (sched.get('capabilities') or {})
     if worker not in table:
-        sourced = capabilities.score_for(worker, unit_kind)
-        return 1.0 if sourced is None else sourced
-    value = (table[worker] or {}).get(unit_kind, 0)
-    return min(max(float(value), 0.0), 1.0) if type(value) in (int, float) else 0.0
+        empirical = scorecards.class_score(policy, worker, unit_kind)
+        if empirical is not None:
+            base = empirical
+        else:
+            sourced = capabilities.score_for(worker, unit_kind)
+            base = 1.0 if sourced is None else sourced
+    else:
+        value = (table[worker] or {}).get(unit_kind, 0)
+        base = min(max(float(value), 0.0), 1.0) if type(value) in (int, float) else 0.0
+    adapt = sched.get('adaptive') or {}
+    if not adapt.get('enabled') or base <= 0:
+        return base
+    stats_table = (adapt.get('stats') or {}).get(unit_kind) or (adapt.get('stats') or {})
+    entry = stats_table.get(worker) if isinstance(stats_table, dict) else None
+    if not isinstance(entry, dict) or 'runs' not in entry:
+        entry = {}
+    total = sum(int(v.get('runs', 0)) for v in stats_table.values()
+                if isinstance(v, dict) and 'runs' in v) if isinstance(stats_table, dict) else 0
+    return adaptive.compute_weight(
+        prior=base,
+        runs=entry.get('runs', 0),
+        passed=entry.get('passed', 0),
+        total_runs=total,
+        safety_floor=adapt.get('safety_floor', adaptive.SAFETY_FLOOR),
+        c=adapt.get('exploration_c', adaptive.EXPLORATION_C),
+        min_runs=adapt.get('min_runs', adaptive.MIN_RUNS),
+    )['weight']
 
 
 def headroom(policy, worker, evidence, now):
