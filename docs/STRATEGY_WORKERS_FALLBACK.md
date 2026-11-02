@@ -1,6 +1,6 @@
 # DLR worker and fallback strategy
 
-Status: proposed (31 Oct 2026). Owner: Abhirup. Supersedes the "ban Grok-family in unknown mode" rule on `grokbot/week-curve-phase1` (commit 4595557), which must be reworked, not merged as is.
+Status: landed (updated 2 Nov 2026). Owner: Abhirup. Detail doc for [ROUTING_STRATEGY.md](ROUTING_STRATEGY.md), which is the single source of truth; if the two disagree, ROUTING_STRATEGY.md wins. Supersedes the "ban Grok-family in unknown mode" rule on `grokbot/week-curve-phase1` (commit 4595557).
 
 ## 1. Roles
 
@@ -9,25 +9,27 @@ Status: proposed (31 Oct 2026). Owner: Abhirup. Supersedes the "ban Grok-family 
 
 ## 2. Worker ranking
 
-Default fallback order when the preferred worker is out of tokens (owner's order): **Claude > Codex > Grok Build > Cursor > local** (updated 31 Oct 2026; see ROUTING_STRATEGY.md). Cursor sits after Grok Build: strong for editor-scale edits, but it is a seat with a monthly cap and no headless CLI contract yet.
+Default fallback order when the preferred worker is out of tokens (owner's order, user-confirmed 31 Oct 2026): **Claude > Codex > Grok Build > Cursor > local** (Nativ MLX / Ollama). Grok Bot is not in this list: it is the orchestrator and the out-of-band last resort. Cursor sits after Grok Build: strong for editor-scale edits, but it is a seat with a monthly cap and no headless CLI contract yet.
+
+The code ships no built-in order: `worker_order` in config is empty by default and the user ranks workers. Per-class ranking is `class_order.<class>` (see [configuration.md](configuration.md)); a class without an entry uses `worker_order`. The table below is the owner's recommended `class_order`, derived from the global order above.
 
 | Class | 1st | 2nd | 3rd | 4th | Last |
 |---|---|---|---|---|---|
-| feature | Claude | Grok Build | Cursor | Codex | Grok Bot (self) |
-| bugfix | Claude | Grok Build | Codex | Cursor | Grok Bot |
-| review | Grok Bot | Claude | Grok Build | Codex | — (never local) |
-| mechanical | Grok Build | Codex | Cursor | local (Nativ/aider-ollama) | Grok Bot |
-| draft (wording) | local | Grok Bot | Claude | — | — |
+| feature | Claude | Codex | Grok Build | Cursor | Grok Bot (self) |
+| bugfix | Claude | Codex | Grok Build | Cursor | Grok Bot |
+| review | Grok Bot | Claude | Codex | Grok Build | — (never local) |
+| mechanical | Codex | Cursor | local (Nativ/aider-ollama) | Grok Build | Grok Bot |
+| draft (wording) | local | Claude | — | — | Grok Bot |
 
-Rules: capability decides the order; available tokens decide who is eligible. A worker only moves up when a higher one is out, never because it is cheaper. Research is never routed to a worker.
+Rules: capability decides the order; available tokens decide who is eligible. A worker only moves up when a higher one is out (or a higher one is ahead of its week curve and drops one rank), never because it is cheaper. Research is never routed to a worker. `grok-bot` may appear only last in a class order; it is never quota-gated and never a failover hop. When every other worker in the class is out, the run returns `status: handoff_to_orchestrator` with the task file (exit 0) instead of refusing.
 
 ## 3. Token-aware routing
 
 1. **Meter first.** Before each job, read every worker's meter (5-hour and weekly, `percent_used`, `reset_at`). A meter older than 30 min or unreadable is `unknown`.
-2. **Eligibility:** weekly < cap (default 85%, configurable per worker) and 5-hour < 80%. `unknown` means try the worker last among cloud workers; it does not mean banned (no fall-closed for the orchestrator's own family).
+2. **Eligibility:** weekly < cap (default 85%, configurable per worker) and 5-hour < 80%. For ordinary workers, a missing, stale or unparseable meter is `unknown` and makes the worker ineligible ("unknown means no") unless it is listed in `unmetered_workers`. The exception is the Grok family (the `grok-bot` pool: `grok-build` and any worker tagged `shares_pool_with grok-bot`). With `grok_bot.billing.mode` set to `unknown` (the default), those workers are tried last among cloud workers, paced and never banned; `shared` never dispatches to them; `separate` paces them by their week curve.
 3. **Pacing (week curve):** allowed = 85 × elapsed fraction of the 7-day window. A worker ahead of the curve drops one rank instead of being banned. In the last 24 h before reset the reserve is released to 95%.
-4. **Failover on exhaustion:** a 429/quota/limit error puts the worker in cooldown until its `reset_at` (or 1 h if unknown) and the job moves to the next eligible worker. One retry per worker, at most 3 workers per job.
-5. **Never idle:** if every cloud worker is out, use local for mechanical/draft; for anything else Grok Bot does it itself. A job is refused only for policy reasons (push, merge, research, secrets), never for quota.
+4. **Failover on exhaustion:** a 429/quota/limit error (or an auth error) puts the worker in cooldown until its `reset_at` (or 1 h if unknown). The job gets one failover to the next eligible worker in order, in the same worktree with the handoff note (`.llm-router-handoff.md`) and the failure tail; if that also fails, it stops and reports.
+5. **Never idle:** if every cloud worker is out, use local for mechanical/draft; for anything else the job is handed to Grok Bot (`handoff_to_orchestrator`), which does it itself. A job is refused only for policy reasons (push, merge, research, secrets), never for quota.
 6. **Size control:** split jobs larger than one focused change before dispatch; send `--size draft` for wording.
 
 ## 4. Quality gates (every job, every worker)
