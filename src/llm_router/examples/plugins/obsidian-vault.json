@@ -1,0 +1,15 @@
+{
+  "name": "obsidian-vault",
+  "capabilities": [
+    "context",
+    "output_sink"
+  ],
+  "transport": "builtin",
+  "command": [],
+  "description": "Obsidian vault Router Brain plugin (context reader + redacted markdown output sink).",
+  "enabled": false,
+  "permissions": [
+    "read_vault",
+    "write_vault"
+  ]
+}
