@@ -14,7 +14,7 @@ capable and has headroom left.
 """
 from datetime import timedelta
 
-from . import config, selection
+from . import config, scorecards, selection
 
 FALLBACK = 'grok-bot'
 WEEK = timedelta(days=7)
@@ -24,7 +24,9 @@ WEEKLY = 'weekly'
 def capability(policy, worker, unit_kind):
     table = ((policy.get('scheduler') or {}).get('capabilities') or {})
     if worker not in table:
-        return 1.0
+        # No explicit override for this worker: use its empirical scorecard pass rate if any.
+        empirical = scorecards.class_score(policy, worker, unit_kind)
+        return 1.0 if empirical is None else empirical
     value = (table[worker] or {}).get(unit_kind, 0)
     return min(max(float(value), 0.0), 1.0) if type(value) in (int, float) else 0.0
 

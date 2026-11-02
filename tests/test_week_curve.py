@@ -67,6 +67,112 @@ class WeekBudgetTests(unittest.TestCase):
         self.assertFalse(week_curve.week_budget({'percent_used': 100, 'reset_at': RESET}, at(6, 23))['eligible'])
 
 
+SEPARATE = {'grok_bot': {'billing': {'mode': 'separate'}}}
+CLOUD_AND_LOCAL = ['grok-build', 'codex', 'claude', 'developer', 'grok-bot']
+LOCAL = ('developer', 'grok-bot')
+
+
+def budget(used, now, reset_at=RESET):
+    return week_curve.week_budget({'percent_used': used, 'reset_at': reset_at}, now)
+
+
+def gated_order(evidence, now):
+    _, verdict, reason = week_curve.gate(SEPARATE, now, evidence)
+    return verdict, reason, week_curve.pace(CLOUD_AND_LOCAL, {'grok-build'}, verdict, LOCAL)
+
+
+class FrozenClockEdgeTests(unittest.TestCase):
+    """Exact boundaries of the 7-day window, the mid-week curve, the last 24h and the reset itself."""
+
+    # Day 0: exact start of the window.
+    def test_day0_exact_start_zero_used_is_on_curve(self):
+        result = budget(0, DAY0)
+        self.assertEqual((result['state'], result['eligible'], result['reason']), ('on_curve', True, 'headroom'))
+        self.assertEqual(result['allowed_used'], 0)
+        self.assertEqual(gated_order({'percent_used': 0, 'reset_at': RESET}, DAY0)[:2], (week_curve.FIRST_FIT, None))
+
+    def test_day0_exact_start_any_usage_is_ahead_of_curve(self):
+        for used in (0.01, 1, 50):
+            result = budget(used, DAY0)
+            self.assertEqual((result['state'], result['eligible']), ('ahead_of_curve', False), used)
+        verdict, reason, order = gated_order({'percent_used': 1, 'reset_at': RESET}, DAY0)
+        self.assertEqual((verdict, reason), (week_curve.DROP_RANK, 'grok_week_curve_no_headroom'))
+        self.assertEqual(order, ['codex', 'grok-build', 'claude', 'developer', 'grok-bot'])
+
+    def test_before_window_start_is_unknown_and_tried_last(self):
+        for now in (DAY0 - timedelta(seconds=1), DAY0 - timedelta(days=3)):
+            result = budget(0, now)
+            self.assertEqual((result['state'], result['reason']), ('unknown', 'reset_beyond_period'), now)
+            self.assertFalse(result['eligible'])
+            verdict, reason, order = gated_order({'percent_used': 0, 'reset_at': RESET}, now)
+            self.assertEqual((verdict, reason), (week_curve.TRY_LAST, 'grok_week_curve_reset_beyond_period'))
+            self.assertEqual(order, ['codex', 'claude', 'grok-build', 'developer', 'grok-bot'])
+
+    # Mid-week: at(3, 12) allows exactly 85 * 0.5 = 42.5.
+    def test_midweek_exact_curve_boundary(self):
+        below = budget(42.4, at(3, 12))
+        self.assertEqual((below['state'], below['eligible'], below['allowed_used']), ('on_curve', True, 42.5))
+        self.assertEqual(gated_order({'percent_used': 42.4, 'reset_at': RESET}, at(3, 12))[0], week_curve.FIRST_FIT)
+        on_line = budget(42.5, at(3, 12))
+        self.assertEqual((on_line['state'], on_line['eligible'], on_line['headroom']), ('ahead_of_curve', False, 0))
+        self.assertEqual(gated_order({'percent_used': 42.5, 'reset_at': RESET}, at(3, 12))[0], week_curve.DROP_RANK)
+
+    # Last 24h: the reserve is released from 15 to 5 exactly at reset - 24h.
+    def test_last_day_boundary_releases_reserve(self):
+        just_before = budget(85, RESET - week_curve.LAST_DAY - timedelta(seconds=1))
+        self.assertEqual((just_before['state'], just_before['floor'], just_before['eligible']),
+                         ('ahead_of_curve', 15, False))
+        exact = budget(85, RESET - week_curve.LAST_DAY)
+        self.assertEqual((exact['state'], exact['floor'], exact['eligible'], exact['reason']),
+                         ('last_day', 5, True, 'reserve_released'))
+
+    def test_last_day_floor_is_95_percent(self):
+        for now in (RESET - week_curve.LAST_DAY, RESET - timedelta(seconds=1)):
+            for used in (85, 94, 94.99):
+                result = budget(used, now)
+                self.assertEqual((result['eligible'], result['reason']), (True, 'reserve_released'), (now, used))
+            for used in (95, 99.9):
+                result = budget(used, now)
+                self.assertEqual((result['state'], result['eligible'], result['reason']),
+                                 ('last_day', False, 'below_last_day_floor'), (now, used))
+        verdict, reason, order = gated_order({'percent_used': 95, 'reset_at': RESET}, RESET - week_curve.LAST_DAY)
+        self.assertEqual((verdict, reason), (week_curve.INELIGIBLE, 'grok_week_curve_below_last_day_floor'))
+        self.assertNotIn('grok-build', order)
+
+    # After reset: a reading taken before the reset says nothing about the new period.
+    def test_at_and_after_reset_is_unknown_and_tried_last(self):
+        for now in (RESET, RESET + timedelta(seconds=1), RESET + timedelta(days=2)):
+            for used in (0, 50, 100):
+                result = budget(used, now)
+                self.assertEqual((result['state'], result['eligible'], result['reason']),
+                                 ('unknown', False, 'reset_passed_needs_new_reading'), (now, used))
+            verdict, reason, order = gated_order({'percent_used': 100, 'reset_at': RESET}, now)
+            self.assertEqual((verdict, reason), (week_curve.TRY_LAST, 'grok_week_curve_reset_passed_needs_new_reading'))
+            self.assertEqual(order, ['codex', 'claude', 'grok-build', 'developer', 'grok-bot'])
+
+    # Missing or unusable reset_at: unknown, never banned.
+    def test_missing_reset_at_is_unknown_and_tried_last(self):
+        naive = RESET.replace(tzinfo=None)
+        cases = {None: 'missing_reset_at', '': 'bad_reset_at', naive: 'bad_reset_at',
+                 naive.isoformat(): 'bad_reset_at'}
+        for reset_at, why in cases.items():
+            result = budget(10, at(3), reset_at)
+            self.assertEqual((result['state'], result['eligible'], result['reason']), ('unknown', False, why), reset_at)
+            verdict, reason, order = gated_order({'percent_used': 10, 'reset_at': reset_at}, at(3))
+            self.assertEqual((verdict, reason), (week_curve.TRY_LAST, 'grok_week_curve_' + why), reset_at)
+            self.assertEqual(order, ['codex', 'claude', 'grok-build', 'developer', 'grok-bot'])
+        no_key = week_curve.week_budget({'percent_used': 10}, at(3))
+        self.assertEqual((no_key['state'], no_key['reason']), ('unknown', 'missing_reset_at'))
+
+    def test_after_reset_selection_tries_pool_last_without_banning(self):
+        now = RESET + timedelta(hours=1)
+        picked = selection.select(10, policy=grok_policy('separate'), now=now, io=fake_io(0, now),
+                                  grok_bot_evidence={'percent_used': 50, 'reset_at': RESET.isoformat()})
+        self.assertEqual(picked['reasons']['grok-build'], 'grok_week_curve_reset_passed_needs_new_reading')
+        self.assertEqual(picked['grok_bot']['verdict'], week_curve.TRY_LAST)
+        self.assertEqual(picked['eligible'][-1], 'grok-build')
+
+
 class PaceTests(unittest.TestCase):
     def test_try_last_goes_after_cloud_before_local(self):
         order = ['grok-build', 'codex', 'sample', 'claude', 'developer', 'grok-bot']
