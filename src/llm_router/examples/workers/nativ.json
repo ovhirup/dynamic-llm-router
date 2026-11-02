@@ -1,0 +1,31 @@
+{
+  "_why": "Nativ (io.github.blaizzy.nativ) serves MLX models over an OpenAI-compatible API. Check aider flags against your CLI version before use.",
+  "workers": {
+    "nativ": {
+      "command": [
+        "aider",
+        "--yes-always",
+        "--no-auto-commits",
+        "--no-gitignore",
+        "--openai-api-base",
+        "{base_url}/v1",
+        "--model",
+        "openai/{model}",
+        "--message-file",
+        "{prompt_file}"
+      ],
+      "base_url": "http://127.0.0.1:8080",
+      "model": "mlx-community/Qwen2.5-Coder-14B-Instruct-4bit",
+      "prompt_delivery": "file",
+      "concurrency": 1,
+      "env": {
+        "allow": [
+          "OPENAI_API_KEY"
+        ]
+      }
+    }
+  },
+  "unmetered_workers": [
+    "nativ"
+  ]
+}

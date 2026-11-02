@@ -35,6 +35,8 @@ def build_parser():
     selection.add_argument('--size', choices=('draft', 'full'), default='full')
     selection.add_argument('--cached-only', action='store_true')
     selection.add_argument('--class', dest='task_class', choices=config.TASK_CLASSES)
+    selection.add_argument('--role', choices=('planner', 'coder', 'searcher', 'judge', 'advisor'),
+                           help='pick worker by role (planner, coder, searcher, judge, advisor)')
 
     task = commands.add_parser('run-task', help='Run a task file headless in a clean git checkout')
     task.add_argument('--task-file', required=True)
@@ -53,6 +55,8 @@ def build_parser():
     job.add_argument('--size', choices=('draft', 'full'), default='full')
     job.add_argument('--worker')
     job.add_argument('--class', dest='task_class', choices=config.TASK_CLASSES)
+    job.add_argument('--role', choices=('planner', 'coder', 'searcher', 'judge', 'advisor'),
+                     help='role for this job (planner, coder, searcher, judge, advisor)')
     keep = job.add_mutually_exclusive_group()
     keep.add_argument('--keep', action='store_true', help='keep the worktree even on failure')
     keep.add_argument('--prune', action='store_true', help='remove the worktree even on success')
@@ -75,6 +79,8 @@ def build_parser():
 
     jobs = commands.add_parser('jobs', help='List recent run-job jobs and worktrees')
     jobs.add_argument('--limit', type=int, default=20)
+    jobs.add_argument('--live-feed', action='store_true',
+                      help='emit the live jobs feed (running, 30m recent, history, 3-line redacted log preview)')
     clean = commands.add_parser('cleanup', help='Remove old router worktrees')
     clean.add_argument('--older-than', required=True, help='age like 30m, 12h or 7d')
     clean.add_argument('--dry-run', action='store_true')
@@ -127,6 +133,11 @@ def build_parser():
     replay = eval_cmds.add_parser('run', help='Replay the corpus under two policies and write the A/B report')
     replay.add_argument('--policies', required=True, help='JSON file: [baseline spec, candidate spec]')
     replay.add_argument('--corpus', help='corpus file (default: <state>/logs/eval/corpus.jsonl)')
+    replay.add_argument('--eval-set', action='store_true',
+                        help='use the packaged DLR benchmark eval set (fixed cases per task class) when no --corpus')
+    replay.add_argument('--class', dest='task_class', default=None,
+                        choices=('feature', 'bugfix', 'review', 'mechanical', 'draft'),
+                        help='only replay cases of this task class')
     replay.add_argument('--mode', choices=('offline', 'live'), default='offline')
     replay.add_argument('--fake-workers', help='offline: JSON file of per-worker fake profiles')
     replay.add_argument('--no-recorded', action='store_true',
@@ -139,6 +150,9 @@ def build_parser():
     refresh.add_argument('--once', action='store_true', help='one serial pass (what the scheduler runs)')
     refresh.add_argument('--worker')
     commands.add_parser('status', help='Meters, freshness, resets, eligibility, open alerts')
+    usage = commands.add_parser('usage', aliases=['burn-down'],
+                                help='Token burn-down dashboard: used %, remaining, reset, burn rate and next worker')
+    usage.add_argument('--json', action='store_true', dest='as_json', help='print machine-readable JSON')
     alert = commands.add_parser('alerts', help='List or acknowledge open alerts')
     alert_cmds = alert.add_subparsers(dest='alerts_command')
     acknowledge = alert_cmds.add_parser('ack')
@@ -146,6 +160,11 @@ def build_parser():
     for name in ('install-agent', 'uninstall-agent'):
         agent = commands.add_parser(name, help='macOS LaunchAgent for quota refresh (dry run unless --yes)')
         agent.add_argument('--yes', action='store_true', help='actually write/load the agent')
+
+    wd = commands.add_parser('watchdog', help='Monitor running jobs for stalls, loops, drift, or infra failures')
+    wd.add_argument('--stall-seconds', type=float, default=300, help='seconds without heartbeat/log before stalled')
+    wd.add_argument('--loop-threshold', type=int, default=3, help='repeated identical lines before looping')
+    wd.add_argument('--recover', action='store_true', help='terminate unhealthy workers and reassign to next eligible')
 
     scan = commands.add_parser('scan', help='Leak-scan a git tree (tracked + untracked, not ignored) before publishing')
     scan.add_argument('path', nargs='?', default='.')
@@ -187,7 +206,8 @@ def init_config(force=False, workers=None, never='', meters='', non_interactive=
                 dry_run=False, input_fn=input, output_fn=print, which=shutil.which, is_tty=None):
     from importlib import resources
     known = {'codex': 'codex', 'grok-build': 'grok', 'cursor': 'cursor-agent',
-             'claude': 'claude', 'aider': 'aider', 'opencode': 'opencode', 'aider-ollama': 'ollama'}
+             'claude': 'claude', 'aider': 'aider', 'opencode': 'opencode', 'aider-ollama': 'ollama',
+             'nativ': 'nativ'}
     detected = [name for name, binary in known.items() if which(binary)]
     interactive = (sys.stdin.isatty() if is_tty is None else is_tty) and not non_interactive
     split = lambda value: [v.strip() for v in value.split(',') if v.strip()] if isinstance(value, str) else list(value)
@@ -223,7 +243,7 @@ def init_config(force=False, workers=None, never='', meters='', non_interactive=
     examples = resources.files('llm_router').joinpath('examples')
     warnings = []
     for name in chosen:
-        if name in ('aider', 'aider-ollama', 'opencode'):
+        if name in ('aider', 'aider-ollama', 'opencode', 'nativ'):
             preset = json.loads(examples.joinpath('workers', name + '.json').read_text())
             fragment['workers'].update(preset['workers'])
         if name in ('codex', 'grok-build', 'cursor', 'claude'):
@@ -328,6 +348,12 @@ def main(argv=None):
         report = doctor(policy)
         _print(report)
         return 0 if report['ok'] else 1
+    if args.command == 'watchdog':
+        from . import watchdog
+        report = watchdog.check_all(policy=policy, stall_seconds=args.stall_seconds,
+                                    loop_threshold=args.loop_threshold, recover=args.recover)
+        _print(report)
+        return 0 if report['ok'] or args.recover else 1
     if args.command == 'scan':
         from . import security, task_dispatch
         terms = security.load_terms(args.terms) if args.terms else task_dispatch.private_terms(policy)
@@ -367,16 +393,30 @@ def main(argv=None):
         try:
             specs = json.loads(Path(args.policies).read_text())
             profiles = json.loads(Path(args.fake_workers).read_text()) if args.fake_workers else {}
-            cases = eval_corpus.load(args.corpus or eval_corpus.corpus_path(policy))
+            if args.eval_set and not args.corpus:
+                cases = eval_corpus.default_eval_set()
+            else:
+                cases = eval_corpus.load(args.corpus or eval_corpus.corpus_path(policy))
             report = eval_harness.run(cases, specs, mode=args.mode, profiles=profiles, policy=policy,
-                                      confirm=args.yes, use_recorded=not args.no_recorded)
+                                      confirm=args.yes, use_recorded=not args.no_recorded,
+                                      task_class=args.task_class)
         except (eval_harness.Refused, OSError, json.JSONDecodeError) as refusal:
             print(json.dumps({'ok': False, 'refused': str(refusal)}))
             return 3
         stamp = config.now_local(policy).strftime('%Y%m%d-%H%M%S')
-        _print({'gate': report['gate'], 'metrics': {name: entry['metrics'] for name, entry in report['policies'].items()},
+        _print({'gate': report['gate'], 'task_class': args.task_class, 'cases': report['cases'],
+                'metrics': {name: entry['metrics'] for name, entry in report['policies'].items()},
+                'by_class': {name: entry['by_class'] for name, entry in report['policies'].items()},
                 'skipped': len(report['skipped']), 'report': eval_harness.write_report(report, policy, stamp)})
         return 0 if report['gate']['adopt'] else 1
+    if args.command in ('usage', 'burn-down'):
+        from . import burn_down
+        report = burn_down.usage_report(policy)
+        if args.as_json:
+            _print(report)
+        else:
+            print(burn_down.render_usage_table(report))
+        return 0
     if args.command in ('quota', 'status', 'alerts', 'install-agent', 'uninstall-agent'):
         from . import alerts as alerts_module, quota_service
         if args.command == 'quota':
@@ -419,7 +459,11 @@ def main(argv=None):
                                               keep=True if args.keep else False if args.prune else None,
                                               policy=policy, task_class=args.task_class)
             elif args.command == 'jobs':
-                result = job_dispatch.list_jobs(policy=policy, limit=args.limit)
+                if getattr(args, 'live_feed', False):
+                    from . import live_jobs_feed
+                    result = live_jobs_feed.build_live_jobs_feed(policy=policy)
+                else:
+                    result = job_dispatch.list_jobs(policy=policy, limit=args.limit)
             else:
                 result = job_dispatch.cleanup(args.older_than, dry_run=args.dry_run, policy=policy)
         except job_dispatch.Refused as refusal:
@@ -477,9 +521,14 @@ def main(argv=None):
         _print(result)
         return 0 if result['ok'] or result.get('status') == 'handoff_to_orchestrator' else 1
     if args.command == 'select':
-        from . import selection
+        from . import roles, selection
         chars = 0 if args.size == 'draft' else (policy.get('developer') or {}).get('draft_max_chars', 4000) + 1
-        _print(selection.select(chars, policy=policy, cached_only=args.cached_only, task_class=args.task_class))
+        base_sel = selection.select(chars, policy=policy, cached_only=args.cached_only, task_class=args.task_class)
+        if args.role:
+            role_pick = roles.select_for_role(
+                args.role, policy=policy, eligible=base_sel.get('eligible'), meters=base_sel.get('meters'))
+            base_sel.update(worker=role_pick['worker'], role=args.role, role_pick=role_pick)
+        _print(base_sel)
         return 0
     parser.error('unknown command')
     return 2

@@ -7,11 +7,12 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from helpers import load_policy, TERM
+from helpers import FakeWorkerHarness, load_policy, TERM
 from llm_router import job_dispatch as jd
-from llm_router import cooldown, task_dispatch as td
+from llm_router import cooldown, selection, task_dispatch as td
 from test_task_dispatch import repo
 
 
@@ -44,7 +45,7 @@ class JobTests(unittest.TestCase):
         self.policy = policy
         # Never reach a real CLI from unit tests: every worker starts as a failing fake.
         for name in ('codex', 'grok-build', 'cursor'):
-            self.worker("import sys; sys.exit(3)", name)
+            FakeWorkerHarness('fail').install(self.policy, name)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -55,6 +56,9 @@ class JobTests(unittest.TestCase):
     def worker(self, code, name='codex'):
         tail = [a for a in self.policy['run_task']['commands'][name] if a in ('-', '{prompt_file}', '{prompt_pointer}')]
         self.policy['run_task']['commands'][name] = [sys.executable, '-c', code] + tail
+
+    def fake(self, mode, name='codex', **options):
+        return FakeWorkerHarness(mode, **options).install(self.policy, name)
 
     def job(self, **kw):
         kw.setdefault('select', self.select)
@@ -125,8 +129,8 @@ class JobTests(unittest.TestCase):
                 'meters': {'codex': 10, 'grok-build': 10, 'cursor': 10}, 'reason': 'test'}
 
     def test_quota_error_fails_over_to_next_worker(self):
-        self.worker("import sys; print('Usage limit reached', file=sys.stderr); sys.exit(1)")
-        self.worker("open('out.txt','w').write('hi\\n')", 'grok-build')
+        self.fake('quota')
+        self.fake('ok', 'grok-build')
         result = self.job(test_cmd='test -f out.txt', select=self.select_all)
         self.assertTrue(result['ok'], result)
         runs = result['attempts'][0]['runs']
@@ -172,9 +176,8 @@ class JobTests(unittest.TestCase):
         self.assertIn('no eligible worker', result['attempts'][1]['refused'])  # nobody re-runs
 
     def test_auth_error_marks_worker_unavailable_and_fails_over(self):
-        self.worker("import sys; print('Failed to authenticate: OAuth session expired and could not be "
-                    "refreshed', file=sys.stderr); sys.exit(1)")
-        self.worker("open('out.txt','w').write('hi\\n')", 'grok-build')
+        self.fake('auth')
+        self.fake('ok', 'grok-build')
         result = self.job(test_cmd='test -f out.txt')
         self.assertTrue(result['ok'], result)
         runs = result['attempts'][0]['runs']
@@ -188,11 +191,10 @@ class JobTests(unittest.TestCase):
 
     def test_live_case_auth_then_timeout_fails_over_to_third_worker(self):
         # 31 Oct: claude auth failed in 3s, aider timed out, and the router refused the retry.
-        self.worker("import sys; print('OAuth session expired', file=sys.stderr); sys.exit(1)")
-        self.worker("import time, sys; print('quota exhausted? no, just slow'); sys.stdout.flush(); time.sleep(30)",
-                    'grok-build')
+        self.fake('auth', stderr='OAuth session expired')
+        self.fake('timeout', 'grok-build', stderr='quota exhausted? no, just slow')
         self.policy['run_task']['timeouts_seconds']['grok-build'] = 1
-        self.worker("open('out.txt','w').write('hi\\n')", 'cursor')
+        self.fake('ok', 'cursor')
         result = self.job(test_cmd='test -f out.txt', select=self.select_all)
         self.assertTrue(result['ok'], result)
         self.assertEqual([(h['worker'], h['reason']) for h in result['hops']],
@@ -201,7 +203,7 @@ class JobTests(unittest.TestCase):
         self.assertNotIn('grok-build', cooldown.active())  # a timeout is not a quota cooldown
 
     def test_exhausted_failover_is_reported_not_refused(self):
-        self.worker("import sys; print('OAuth session expired', file=sys.stderr); sys.exit(1)")
+        self.fake('auth', stderr='OAuth session expired')
         result = self.job(test_cmd='true')  # eligible: codex, grok-build (both fail)
         self.assertFalse(result['ok'])
         self.assertEqual((result['status'], result['failover']), ('failed', 'exhausted'))
@@ -274,7 +276,7 @@ class JobTests(unittest.TestCase):
         self.assertEqual(git(Path(result['worktree']), 'diff', '--cached', '--name-only'), '')
 
     def test_no_change_is_failure(self):
-        self.worker("pass")
+        self.fake('no_change')
         result = self.job(test_cmd='true')
         self.assertFalse(result['ok'])
         self.assertEqual([a['changed'] for a in result['attempts']], [False, False])
@@ -657,6 +659,95 @@ class JobTests(unittest.TestCase):
 
 def stat_mode(path):
     return os.stat(path).st_mode & 0o777
+
+
+class AllWorkersOutNeverIdleTests(unittest.TestCase):
+    """Issue #28: with every cloud worker out, run-job still does work (local) or hands off; never idles."""
+    tearDown = JobTests.tearDown
+    worker = JobTests.worker
+    job = JobTests.job
+    assert_main_untouched = JobTests.assert_main_untouched
+    CLOUD = ('claude', 'codex', 'grok-build', 'cursor')
+    CLASS_ORDER = {
+        'mechanical': ['grok-build', 'codex', 'cursor', 'aider-ollama', 'grok-bot'],
+        'feature': ['claude', 'grok-build', 'cursor', 'codex', 'grok-bot'],
+        'bugfix': ['grok-build', 'codex', 'claude', 'cursor', 'grok-bot'],
+        'review': ['codex', 'claude', 'grok-build', 'grok-bot'],
+    }
+
+    def setUp(self):
+        JobTests.setUp(self)
+        self.now = datetime.now(timezone.utc).replace(microsecond=0)
+        rt = self.policy['run_task']
+        rt['commands']['aider-ollama'] = ['fake']
+        rt['timeouts_seconds']['aider-ollama'] = 60
+        self.policy['unmetered_workers'] = ['aider-ollama']
+        self.policy['class_order'] = copy.deepcopy(self.CLASS_ORDER)
+        self.worker("import sys; sys.exit(3)", 'claude')  # a cloud run here would be a bug
+        stamp = lambda delta: (self.now + delta).isoformat()
+        # claude and codex read percent_used 100 from their meters; grok-build and cursor are cooling down.
+        self.io = {}
+        for name in ('claude', 'codex'):
+            self.policy['quota'][name]['enabled'] = True
+            windows = {w: {'percent_used': 100, 'observed_at': stamp(timedelta(minutes=-1)),
+                           'expires_at': stamp(timedelta(hours=1)), 'reset_at': stamp(timedelta(hours=5))}
+                       for w in ('primary', 'weekly')}
+            observation = {'evidence': {'source_worker': name, 'required_windows': ['primary', 'weekly'],
+                                        'windows': windows}}
+            self.io[name] = {'load': (lambda o=observation: o), 'save': lambda o: None,
+                             'observe': lambda p: self.fail('no live meter read when the cache is exhausted')}
+        self.cooldowns = {w: {'until': stamp(timedelta(hours=1))} for w in ('grok-build', 'cursor')}
+
+    def select(self, chars, **kw):
+        return selection.select(chars, policy=self.policy, io=self.io, now=self.now,
+                                cooldowns=self.cooldowns, **kw)
+
+    def assert_cloud_skipped(self, result, task_class):
+        for name in self.CLASS_ORDER[task_class]:
+            if name in self.CLOUD:
+                self.assertNotIn(name, result['eligible'], (task_class, result['reasons']))
+                self.assertRegex(result['reasons'][name], r'^(quota_exhausted|cooldown_until_)')
+
+    def test_mechanical_runs_local_worker_and_commits_on_router_branch(self):
+        chosen = self.select(10000, task_class='mechanical')
+        self.assert_cloud_skipped(chosen, 'mechanical')
+        self.assertEqual((chosen['worker'], chosen['reason']), ('aider-ollama', 'preferred_eligible_worker'))
+        self.worker("open('out.txt','w').write('local\\n')", 'aider-ollama')
+        before = jd.main_state(self.repo)
+        result = self.job(test_cmd='test -f out.txt', task_class='mechanical')
+        self.assertTrue(result['ok'], result)
+        self.assertEqual((result['status'], result['tests_status']), ('committed', 'passed'))
+        self.assertEqual(result['workers'], ['aider-ollama'])
+        self.assertEqual([h['worker'] for h in result['hops']], ['aider-ollama'])
+        self.assertTrue(result['branch'].startswith('router/add-feature-'))
+        self.assertEqual(git(self.repo, 'rev-parse', result['branch']), result['commit'])
+        self.assertEqual(git(self.repo, 'rev-parse', 'HEAD'), result['base_sha'])
+        self.assertIs(result['main_checkout_untouched'], True)
+        self.assertEqual(jd.main_state(self.repo), before)
+        self.assertFalse((self.repo / 'out.txt').exists())
+
+    def test_non_mechanical_classes_hand_off_to_orchestrator_not_refused(self):
+        for task_class in ('feature', 'bugfix', 'review'):
+            with self.subTest(task_class=task_class):
+                chosen = self.select(10000, task_class=task_class)
+                self.assert_cloud_skipped(chosen, task_class)
+                self.assertEqual((chosen['worker'], chosen['reason']), ('grok-bot', 'handoff_to_orchestrator'))
+                self.assertEqual(chosen['eligible'], ['grok-bot'])
+                before = jd.main_state(self.repo)
+                branches = git(self.repo, 'branch', '--list')
+                result = self.job(test_cmd='test -f out.txt', task_class=task_class)
+                self.assertEqual(result['status'], 'handoff_to_orchestrator', result)
+                self.assertEqual(result['reason'], 'no_eligible_worker')
+                self.assertEqual(result['task_file'], str(self.task.resolve()))
+                self.assertIsNone(result['commit'])
+                self.assertEqual(result['workers'], [])
+                self.assertFalse(any('refused' in a for a in result['attempts']), result['attempts'])
+                self.assertIs(result['main_checkout_untouched'], True)
+                self.assertEqual(jd.main_state(self.repo), before)
+                self.assertEqual((result['worktree_state'], result['branch_state']), ('pruned', 'deleted'))
+                self.assertFalse(Path(result['worktree']).exists())
+                self.assertEqual(git(self.repo, 'branch', '--list', result['branch']), '')
+                self.assertEqual(git(self.repo, 'branch', '--list'), branches)
 
 
 class WatchdogAndPacingTests(unittest.TestCase):

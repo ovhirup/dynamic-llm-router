@@ -313,5 +313,66 @@ class CliTests(EvalFixture):
         self.assertIn('--yes', json.loads(out.getvalue())['refused'])
 
 
+CLASSES = {'feature', 'bugfix', 'review', 'mechanical', 'draft'}
+
+
+class EvalSetTests(unittest.TestCase):
+    SPECS = [{'name': 'base', 'worker_order': ['grok-build', 'codex']}, {'name': 'cand', 'worker': 'codex'}]
+
+    def test_default_eval_set_covers_every_class_and_is_replayable(self):
+        cases = eval_corpus.default_eval_set()
+        self.assertEqual({case['task_class'] for case in cases}, CLASSES)
+        required = ('case_id', 'task_class', 'repo', 'base_sha', 'task', 'task_text', 'test_command', 'size',
+                    'baseline')
+        for case in cases:
+            self.assertTrue(case['replayable'], case['case_id'])
+            for key in required:
+                self.assertTrue(case.get(key), f'{case["case_id"]} missing {key}')
+        self.assertEqual(len({case['case_id'] for case in cases}), len(cases))
+        bugfix = eval_corpus.filter_by_class(cases, 'bugfix')
+        self.assertTrue(bugfix)
+        self.assertTrue(all(case['task_class'] == 'bugfix' for case in bugfix))
+        self.assertEqual(len(eval_corpus.filter_by_class(cases)), len(cases))
+
+    def test_case_from_job_keeps_task_class(self):
+        self.assertEqual(eval_corpus.case_from_job({'job_id': 'j', 'task_class': 'review'})['task_class'], 'review')
+        self.assertIsNone(eval_corpus.case_from_job({'job_id': 'j'})['task_class'])
+
+    def test_run_reports_by_class_metrics_and_filters_by_class(self):
+        cases = eval_corpus.default_eval_set()
+        report = eval_harness.run(cases, self.SPECS, profiles={'codex': {'pass_rate': 1.0}})
+        for name in ('base', 'cand'):
+            by_class = report['policies'][name]['by_class']
+            self.assertEqual(set(by_class), CLASSES)
+            self.assertEqual(sum(m['cases'] for m in by_class.values()), report['cases'])
+        only = eval_harness.run(cases, self.SPECS, profiles={'codex': {'pass_rate': 1.0}}, task_class='review')
+        expected = len(eval_corpus.filter_by_class(cases, 'review'))
+        self.assertEqual(only['cases'], expected)
+        self.assertEqual(only['task_class'], 'review')
+        self.assertEqual(set(only['policies']['cand']['by_class']), {'review'})
+        self.assertEqual(only['policies']['cand']['by_class']['review']['cases'], expected)
+
+
+class EvalSetCliTests(EvalFixture):
+    def test_eval_run_class_uses_packaged_eval_set(self):
+        policies = Path(self.tmp.name) / 'policies.json'
+        policies.write_text(json.dumps(EvalSetTests.SPECS))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(['eval', 'run', '--policies', str(policies), '--eval-set', '--class', 'mechanical',
+                             '--fake-workers', str(FIXTURES / 'fake_workers.json')])
+        self.assertIn(code, (0, 1))
+        result = json.loads(out.getvalue())
+        self.assertEqual(result['task_class'], 'mechanical')
+        self.assertEqual(result['cases'], len(eval_corpus.filter_by_class(eval_corpus.default_eval_set(), 'mechanical')))
+        self.assertEqual(set(result['by_class']['cand']), {'mechanical'})
+        saved = json.loads(Path(result['report']['json']).read_text())
+        self.assertEqual(set(saved['policies']['base']['by_class']), {'mechanical'})
+
+    def test_unknown_class_is_rejected(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli.main(['eval', 'run', '--policies', 'x.json', '--eval-set', '--class', 'nope'])
+
+
 if __name__ == '__main__':
     unittest.main()

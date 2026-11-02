@@ -48,10 +48,32 @@ every job and is never cached across sessions.
   file delivery, explicitly unmetered.
 - [aider with Ollama](../src/llm_router/examples/workers/aider-ollama.json): adds `--model ollama_chat/qwen2.5-coder:14b`;
   allows parent `OLLAMA_API_BASE` plus essential environment variables, explicitly unmetered.
+- [Nativ](../src/llm_router/examples/workers/nativ.json): aider against a local [Nativ](https://github.com/Blaizzy/nativ)
+  (`io.github.blaizzy.nativ` 0.4.3) MLX server through its OpenAI-compatible API:
+  `aider ... --openai-api-base {base_url}/v1 --model openai/{model} --message-file {prompt_file}`;
+  file delivery, `concurrency: 1`, explicitly unmetered. Worker fields:
+  - `base_url` (default `http://127.0.0.1:8080`): an `http://` or `https://` URL; expands `{base_url}`.
+  - `model` (default `mlx-community/Qwen2.5-Coder-14B-Instruct-4bit`): non-empty; expands `{model}`.
+
+  Both are stored as `run_task.local_models.<name>`. Before a worker with a `base_url` is marked eligible,
+  selection GETs `<base_url>/v1/models` (2 s timeout, no proxies, no redirects). An unreachable server,
+  non-200 reply or invalid JSON gives reason `server_not_running`; a model missing from `data[].id`
+  (exact or `/`-suffix match) gives `model_not_present`. Tested with
+  `mlx-community/Qwen2.5-Coder-14B-Instruct-4bit`, which uses about 9 GB of RAM on a 16 GB M4 Mac;
+  start Nativ and load the model before routing work to it.
 - [opencode](../src/llm_router/examples/workers/opencode.json): `opencode run {prompt}`, explicit arg delivery.
   Warning: prompt passed in argv: visible to other local users in the process list.
 - [custom quota command](../src/llm_router/examples/workers/custom-with-quota.json): made-up sample-worker usage command,
   named percent regex, monthly window, timeouts and freshness. Replace it with your own CLI.
+
+## Role-based routing & direct Claude Code tips (#135)
+
+DLR can split work by role (`--role {planner,coder,searcher,judge,advisor}`):
+- `planner`, `judge`, and `advisor` route to the strongest available worker (`claude > grok-build > codex`).
+- `coder` routes to the next worker with budget (`codex > grok-build > cursor > claude > aider-ollama`).
+- `searcher` routes to local/cheaper workers first (`aider-ollama > developer > cursor`).
+- When a `coder` hits repeated identical errors or a loop, DLR escalates a transcript summary to the `advisor` role and feeds its guidance back to the `coder`.
+- For direct interactive Claude Code sessions, use `/model opusplan` (Opus plans, Sonnet executes), delegate file/codebase searches to a Haiku subagent (`CLAUDE_CODE_SUBAGENT_MODEL=haiku`), and keep autocompact enabled so long transcripts never burn Opus quota.
 
 `llm-router init --workers aider,opencode --non-interactive` installs the selected presets and marks workers
 without enabled meters unmetered (not paced). An installed Ollama CLI offers the `aider-ollama` preset;
