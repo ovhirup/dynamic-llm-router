@@ -79,6 +79,8 @@ def build_parser():
 
     jobs = commands.add_parser('jobs', help='List recent run-job jobs and worktrees')
     jobs.add_argument('--limit', type=int, default=20)
+    jobs.add_argument('--live-feed', action='store_true',
+                      help='emit the live jobs feed (running, 30m recent, history, 3-line redacted log preview)')
     clean = commands.add_parser('cleanup', help='Remove old router worktrees')
     clean.add_argument('--older-than', required=True, help='age like 30m, 12h or 7d')
     clean.add_argument('--dry-run', action='store_true')
@@ -454,7 +456,11 @@ def main(argv=None):
                                               keep=True if args.keep else False if args.prune else None,
                                               policy=policy, task_class=args.task_class)
             elif args.command == 'jobs':
-                result = job_dispatch.list_jobs(policy=policy, limit=args.limit)
+                if getattr(args, 'live_feed', False):
+                    from . import live_jobs_feed
+                    result = live_jobs_feed.build_live_jobs_feed(policy=policy)
+                else:
+                    result = job_dispatch.list_jobs(policy=policy, limit=args.limit)
             else:
                 result = job_dispatch.cleanup(args.older_than, dry_run=args.dry_run, policy=policy)
         except job_dispatch.Refused as refusal:
