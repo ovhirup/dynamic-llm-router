@@ -221,7 +221,9 @@ cd tests && ../.venv/bin/python -m unittest discover -t . -s .
 ```
 
 Tests use fake workers, fake `gh`, fixture screens and temp git repos only; they never call a real agent CLI
-or the network. See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
+or the network. GitHub Actions (`.github/workflows/ci.yml`) runs `python -m unittest discover -t . -s . -v`
+across Ubuntu and macOS (Python 3.10–3.13) plus a full-history `llm-router scan . --history` leak check on
+every push and pull request with zero secrets required. See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
