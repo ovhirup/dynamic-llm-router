@@ -133,6 +133,25 @@ class OrchestratorHandoffTests(unittest.TestCase):
         with self.assertRaisesRegex(td.Refused, 'no eligible'):
             td.run_task(self.task, self.repo, select=self.select, policy=self.policy, output_root=self.out)
 
+    def test_bot_dispatch_end_to_end_handoff_and_draft_size(self):
+        from llm_router import job_dispatch as jd
+        calls = []
+
+        def fake_run_job(repo, task_file, **kw):
+            calls.append(kw)
+            return {'ok': False, 'status': 'handoff_to_orchestrator', 'job_id': 'target-20261031-120000',
+                    'workers': [], 'reason': 'no_eligible_worker', 'branch': 'router/task-20261031-120000',
+                    'commit': None}
+
+        res = jd.bot_dispatch(self.repo, self.task, task_class='draft', policy=self.policy,
+                              run_job_fn=fake_run_job)
+        self.assertEqual(calls[-1]['task_class'], 'draft')
+        self.assertEqual(calls[-1]['size'], 'draft')
+        self.assertEqual(res['action'], 'handoff_to_orchestrator')
+        self.assertEqual(res['worker'], 'grok-bot')
+        self.assertEqual(res['job_id'], 'target-20261031-120000')
+        self.assertEqual(res['reason'], 'no_eligible_worker')
+
 
 if __name__ == '__main__':
     unittest.main()

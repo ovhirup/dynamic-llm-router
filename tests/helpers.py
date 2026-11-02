@@ -22,6 +22,7 @@ Path(os.environ['LLM_ROUTER_CONFIG_DIR']).mkdir(parents=True)
 Path(os.environ['LLM_ROUTER_CONFIG_DIR'], 'config.json').write_text(json.dumps({'worker_order': ['codex', 'grok-build', 'cursor', 'developer']}))
 
 from llm_router import config, cooldown  # noqa: E402
+from fake_worker import FakeWorkerHarness, fake_worker_argv  # noqa: E402,F401  (re-exported)
 
 # A quota-error test persists a cooldown; clear it so no other test inherits a cooled worker.
 _run = unittest.TestCase.run

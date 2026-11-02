@@ -68,6 +68,46 @@ class CliTests(unittest.TestCase):
         code, out = run(['select', '--cached-only'])
         self.assertIsNone(json.loads(out)['worker'])
 
+    def test_bot_dispatch_refuses_research_class_with_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = Path(tmp) / 'task.md'
+            task.write_text('Survey options.\n')
+            code, out = run(['bot-dispatch', '--repo', tmp, '--task-file', str(task), '--class', 'research'])
+        self.assertEqual(code, 3)
+        payload = json.loads(out)
+        self.assertEqual(payload['action'], 'refused')
+        self.assertIsNone(payload['worker'])
+        self.assertIsNone(payload['job_id'])
+        self.assertIn('research', payload['reason'])
+
+    def test_bot_dispatch_calls_run_job_and_prints_one_json_object(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / 'config.json'
+            cfg.write_text(json.dumps({
+                'worker_order': ['codex', 'cursor'],
+                'unmetered_workers': ['codex', 'cursor'],
+                'class_order': {'bugfix': ['cursor', 'codex']},
+            }))
+            task = Path(tmp) / 'fix.md'
+            task.write_text('Fix bug.\n')
+            fake_job = {'ok': True, 'status': 'committed', 'job_id': 'repo-20261031-120000',
+                        'workers': ['cursor'], 'reason': 'preferred_eligible_worker',
+                        'branch': 'router/fix-20261031-120000', 'commit': 'abc1234'}
+            with mock.patch('llm_router.job_dispatch.run_job', return_value=fake_job) as mocked:
+                code, out = run(['--config', str(cfg), 'bot-dispatch', '--repo', tmp,
+                                 '--task-file', str(task), '--class', 'bugfix', '--size', 'full'])
+        self.assertEqual(code, 0)
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(mocked.call_args.kwargs['task_class'], 'bugfix')
+        self.assertEqual(mocked.call_args.kwargs['size'], 'full')
+        payload = json.loads(out)
+        self.assertEqual(payload['action'], 'dispatched')
+        self.assertEqual(payload['worker'], 'cursor')
+        self.assertEqual(payload['job_id'], 'repo-20261031-120000')
+        self.assertEqual(payload['reason'], 'preferred_eligible_worker')
+        self.assertEqual(payload['class_order'], ['cursor', 'codex', 'grok-bot'])
+
 
 class RefreshHangTests(unittest.TestCase):
     def test_hung_observer_does_not_block_refresh(self):
