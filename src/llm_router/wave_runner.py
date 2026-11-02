@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
-from . import alerts, config, orchestrator as orch_module, security, task_dag, task_dispatch
+from . import agent_map, alerts, config, orchestrator as orch_module, security, task_dag, task_dispatch
 from . import merge_queue
 from . import unit_worktrees as uw
 from .job_dispatch import Refused, _git
@@ -86,10 +86,11 @@ def default_unit_runner(entry, prompt, policy):
             'reason': result.get('reason')}
 
 
-def _unit_prompt(unit):
+def _unit_prompt(unit, repo_map=''):
     scope = '\n'.join(f'- {p}' for p in unit['scope'])
-    return (f"{unit['prompt'].rstrip()}\n\nOnly change files inside this scope:\n{scope}\n"
+    base = (f"{unit['prompt'].rstrip()}\n\nOnly change files inside this scope:\n{scope}\n"
             'Commit your work on the current branch when done. Do not push.\n')
+    return f'{base}\n{repo_map}\n' if repo_map else base
 
 
 def load_run_files(units_file, assign_file=None):
@@ -204,7 +205,7 @@ def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=N
                 results.append(record)
                 continue
             try:
-                outcome = unit_runner(entry, _unit_prompt(by_id[uid]), policy) or {}
+                outcome = unit_runner(entry, _unit_prompt(by_id[uid], agent_map.load_repo_map(entry['worktree'])), policy) or {}
             except Exception as error:  # one unit's crash must not stop the wave
                 outcome = {'ok': False, 'status': 'error', 'reason': f'{type(error).__name__}: {error}'}
             finally:

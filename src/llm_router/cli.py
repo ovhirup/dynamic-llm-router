@@ -29,6 +29,10 @@ def build_parser():
     init.add_argument('--meters', default='')
     init.add_argument('--non-interactive', action='store_true')
     init.add_argument('--dry-run', action='store_true')
+    init_map_cmd = commands.add_parser('init-map',
+                                       help='Write AGENTS.md, CLAUDE.md, docs/decisions.md and docs/learnings.md')
+    init_map_cmd.add_argument('path', nargs='?', default='.', help='target repository root (default: .)')
+    init_map_cmd.add_argument('--force', action='store_true', help='overwrite existing map files')
     commands.add_parser('doctor', help='Validate config, binaries and observers (no worker is run)')
 
     selection = commands.add_parser('select', help='Show which worker would be picked (reads meters)')
@@ -350,6 +354,10 @@ def main(argv=None):
     except config.ConfigError as error:
         print(json.dumps({'ok': False, 'config_error': str(error)}))
         return 2
+    if args.command == 'init-map':
+        from . import agent_map
+        _print(agent_map.init_map(args.path, force=args.force))
+        return 0
     if args.command == 'paths':
         _print(paths_report(policy))
         return 0
