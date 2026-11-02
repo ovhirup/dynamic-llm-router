@@ -1,0 +1,16 @@
+{
+  "name": "hark",
+  "capabilities": [
+    "input_source",
+    "context"
+  ],
+  "transport": "mcp_stdio",
+  "command": [
+    "hark-mcp"
+  ],
+  "description": "Hark local dictation and meeting transcription input source (never a coding worker).",
+  "enabled": false,
+  "permissions": [
+    "read_transcripts"
+  ]
+}

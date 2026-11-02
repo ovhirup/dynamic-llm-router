@@ -179,6 +179,15 @@ def build_parser():
     replay.add_argument('--size', choices=('draft', 'full'), default=None,
                         help='override task size (e.g. --size draft for stale-meter runs); recorded in report')
     replay.add_argument('--yes', action='store_true', help='live: confirm running real workers')
+    adopt = eval_cmds.add_parser('apply', help='Gate a candidate config fragment against the active policy and '
+                                               'write it to the config only if it beats the baseline')
+    adopt.add_argument('candidate', help='JSON file: config fragment deep-merged into the current config')
+    adopt.add_argument('--corpus', help='corpus file (default: <state>/logs/eval/corpus.jsonl)')
+    adopt.add_argument('--mode', choices=('offline', 'live'), default='offline')
+    adopt.add_argument('--fake-workers', help='offline: JSON file of per-worker fake profiles')
+    adopt.add_argument('--no-recorded', action='store_true',
+                       help='offline: never replay recorded outcomes, use fake profiles for every worker')
+    adopt.add_argument('--yes', action='store_true', help='live: confirm running real workers')
 
     quota = commands.add_parser('quota', help='Quota meter refresh')
     quota_cmds = quota.add_subparsers(dest='quota_command', required=True)
@@ -521,6 +530,32 @@ def main(argv=None):
         from . import eval_corpus, eval_harness
         if args.eval_command == 'capture':
             _print(eval_corpus.capture(policy, source=args.jobs_dir, out=args.out, limit=args.limit))
+            return 0
+        if args.eval_command == 'apply':
+            try:
+                candidate = json.loads(Path(args.candidate).read_text())
+                profiles = json.loads(Path(args.fake_workers).read_text()) if args.fake_workers else {}
+                cases = eval_corpus.load(args.corpus or eval_corpus.corpus_path(policy))
+                result = eval_harness.apply_if_beats_baseline(
+                    args.config, candidate, cases, mode=args.mode, profiles=profiles, confirm=args.yes,
+                    use_recorded=not args.no_recorded)
+            except eval_harness.Refused as refusal:
+                gated = getattr(refusal, 'result', None)
+                print(json.dumps({'ok': False, 'adopted': False, 'refused': str(refusal),
+                                  'gate': gated['gate'] if gated else None}))
+                return 1 if gated else 3
+            except (OSError, json.JSONDecodeError) as refusal:
+                print(json.dumps({'ok': False, 'refused': str(refusal)}))
+                return 3
+            except config.ConfigError as error:
+                print(json.dumps({'ok': False, 'config_error': str(error)}))
+                return 2
+            report = result['report']
+            stamp = config.now_local(policy).strftime('%Y%m%d-%H%M%S')
+            _print({'ok': True, 'adopted': True, 'gate': result['gate'], 'config_path': result['config_path'],
+                    'backup': result['backup'],
+                    'metrics': {name: entry['metrics'] for name, entry in report['policies'].items()},
+                    'report': eval_harness.write_report(report, policy, stamp)})
             return 0
         try:
             specs = json.loads(Path(args.policies).read_text())
