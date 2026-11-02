@@ -28,7 +28,9 @@ The wizard only runs in a terminal and only writes when you run it. For each too
 3. Asks separately whether to enable it as a **worker** and/or as an **orchestrator**.
 4. For each enabled tool, asks consent and runs a **tiny smoke test**: a fixed "reply exactly
    `DLR_SETUP_OK`" prompt in a throwaway git repo, bounded to 30 seconds. Grok Bot is checked by pasting
-   its chat reply. A tool whose smoke fails or is declined is left out, never silently enabled.
+   its chat reply. The smoke only sets verification status: a tool you enabled stays enabled whether
+   its smoke passes (`passed`), fails (`failed`) or is declined or skipped (`unverified`). Live quota
+   and auth checks still gate every dispatch.
 5. Asks for per-tool **reserve** percentages (default 15%; the 85% hard pacing gate never changes), the
    **preferred orchestrator**, the **switch policy**, and optional default/per-role **pins**, each with a
    required reason.

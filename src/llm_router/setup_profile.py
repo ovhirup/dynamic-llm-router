@@ -113,17 +113,19 @@ def validate_setup(setup):
         _object(smoke, name + ' smoke')
         if type(smoke.get('passed')) is not bool:
             raise config.ConfigError('smoke.passed must be boolean')
+    # A smoke only sets verification status; whether a tool is enabled is the user's explicit choice (#212).
     for name in set(workers) | set(orchestrators):
         tool = tools.get(name)
-        if tool is None or not tool['smoke']['passed']:
-            raise config.ConfigError('enabled tools require a successful smoke')
+        if tool is None:
+            raise config.ConfigError('enabled tools require a tool record')
         if name in workers and not tool['requested_capabilities']['worker']:
             raise config.ConfigError('worker was not explicitly enabled')
         if name in orchestrators and not tool['requested_capabilities']['orchestrator']:
             raise config.ConfigError('orchestrator was not explicitly enabled')
-        expected = 'not_required' if name == 'cli' else 'user_verified' if name == 'grok-bot' else 'verified'
+        verified = 'not_required' if name == 'cli' else 'user_verified' if name == 'grok-bot' else 'verified'
+        expected = verified if tool['smoke']['passed'] or name == 'cli' else 'unknown'
         if tool.get('auth') != expected:
-            raise config.ConfigError('enabled tool has no verified smoke/auth label')
+            raise config.ConfigError('enabled tool auth label does not match its smoke result')
     return setup
 
 
@@ -146,8 +148,8 @@ def validate_profile(fragment):
         if name not in CLOUD_WORKERS or opts != {'enabled': True}:
             raise config.ConfigError('setup quota enables only packaged cloud observers; hard gates are unchanged')
     _names(result['unmetered_workers'], ('aider-ollama',), 'unmetered_workers')
-    if result['unmetered_workers'] and not (tools.get('aider-ollama', {}).get('smoke') or {}).get('passed'):
-        raise config.ConfigError('local unmetered routing requires a successful local smoke')
+    if result['unmetered_workers'] and 'aider-ollama' not in set(workers) | set(setup['enabled_orchestrators']):
+        raise config.ConfigError('local unmetered routing requires the local tool to be enabled')
     _object(result['workers'], 'workers')
     if set(result['workers']) - {'aider-ollama'}:
         raise config.ConfigError('setup may only compose the packaged local aider worker')

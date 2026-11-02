@@ -95,15 +95,47 @@ class SetupWizardTests(unittest.TestCase):
         self.assertIn(MARKER, self.calls[0][2])
         self.assertFalse(self.calls[0][1].exists())
 
-    def test_declined_smoke_excludes_requested_tool_without_silent_unmetered_fallback(self):
+    def test_declined_smoke_keeps_requested_tool_enabled_but_unverified(self):
         requested = {'codex': {'worker': True, 'orchestrator': True}}
         result = self.run_setup(requested, installed=('codex',), read=answers(requested, consent=False))
         self.assertEqual(self.calls, [])
-        self.assertEqual(result['config']['worker_order'], [])
-        tool = result['config']['setup']['tools']['codex']
-        self.assertTrue(tool['requested_capabilities']['worker'])
-        self.assertFalse(tool['smoke']['passed'])
-        self.assertNotIn('codex', result['config']['unmetered_workers'])
+        self.assertEqual(result['config']['worker_order'], ['codex'])
+        setup = result['config']['setup']
+        self.assertEqual(setup['enabled_orchestrators'], ['codex'])
+        tool = setup['tools']['codex']
+        self.assertEqual((tool['smoke']['passed'], tool['smoke']['status'], tool['auth']), (False, 'unverified', 'unknown'))
+        self.assertEqual(tool['smoke']['reason'], 'consent_declined')
+        self.assertNotIn('codex', result['config']['unmetered_workers'])  # still metered, never silently unpaced
+
+    def test_all_tools_enabled_with_every_smoke_declined_stay_enabled_regression_212(self):
+        from llm_router import setup_profile
+        requested = {name: {'worker': True, 'orchestrator': True} for name in setup_profile.WORKERS}
+        installed = ('claude', 'codex', 'grok', 'cursor-agent', 'ollama', 'aider')
+        result = self.run_setup(requested, installed=installed, read=answers(requested, manual=True, consent=False))
+        self.assertEqual(self.calls, [])
+        setup = result['config']['setup']
+        self.assertEqual(setup['enabled_workers'], list(setup_profile.WORKERS))
+        self.assertEqual(setup['enabled_orchestrators'], list(setup_profile.WORKERS))
+        self.assertEqual(setup['preferred_orchestrator'], 'grok-bot')
+        for name in setup_profile.WORKERS:
+            with self.subTest(tool=name):
+                self.assertEqual(result['smoke'][name]['status'], 'unverified')
+                self.assertEqual(setup['tools'][name]['auth'], 'unknown')
+        self.assertEqual(result['config']['unmetered_workers'], ['aider-ollama'])
+        saved = json.loads(self.output.read_text())
+        self.assertEqual(setup_profile.validate_profile(saved)['setup']['enabled_workers'], list(setup_profile.WORKERS))
+        self.assertTrue(any('unverified' in line for line in self.messages))
+        self.assertFalse(any('excluded' in line for line in self.messages))
+
+    def test_failed_smoke_records_failure_but_keeps_tool_enabled(self):
+        requested = {'codex': {'worker': True}}
+        self.runner = lambda argv, cwd, timeout, grace, **kwargs: {
+            'returncode': 1, 'timed_out': False, 'stdout': '', 'stderr': 'not signed in'}
+        result = self.run_setup(requested, installed=('codex',))
+        setup = result['config']['setup']
+        self.assertEqual(setup['enabled_workers'], ['codex'])
+        tool = setup['tools']['codex']
+        self.assertEqual((tool['smoke']['passed'], tool['smoke']['status'], tool['auth']), (False, 'failed', 'unknown'))
 
     def test_manual_grok_bot_is_user_verified_and_preferred_without_a_cli(self):
         requested = {'grok-bot': {'worker': True, 'orchestrator': True}}

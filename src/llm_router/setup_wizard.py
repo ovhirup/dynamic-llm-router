@@ -138,9 +138,9 @@ def smoke_tool(worker, policy=None, *, runner=None, env=None, input_fn=None, out
 
 def build_profile(tools, *, reserves=None, preferred_orchestrator=None, switch_policy=None,
                   worker_overrides=None, orchestrator_overrides=None, model=None):
-    """Build a pure validated profile from explicit requests and successful challenges."""
+    """Build a pure validated profile from explicit requests; smoke results are verification only."""
     tools = deepcopy(tools)
-    active = {name for name, tool in tools.items() if (tool.get('smoke') or {}).get('passed') is True}
+    active = set(tools)
     workers = [name for name in setup_profile.WORKERS if name in active and
                (tools[name].get('requested_capabilities') or {}).get('worker') is True]
     orchestrators = [name for name in setup_profile.ORCHESTRATORS if name in active and
@@ -222,9 +222,9 @@ def run_setup(output=None, *, input_fn=None, output_fn=None, which=None, runner=
         if worker or orchestrator:
             consent = _yes(input_fn, output_fn, name + ': run tiny smoke (may spend a small amount of allowance)', False)
             if not consent:
-                tool['smoke'].update(status='declined', reason='consent_declined')
+                tool['smoke'].update(status='unverified', reason='consent_declined')
             elif name == 'grok-bot' and not available:
-                tool['smoke'].update(status='failed', reason='chat_unavailable')
+                tool['smoke'].update(status='unverified', reason='chat_unavailable')
             else:
                 if name == 'aider-ollama':
                     model = input_fn('Local Ollama model [qwen2.5-coder:14b]: ').strip() or 'qwen2.5-coder:14b'
@@ -237,7 +237,8 @@ def run_setup(output=None, *, input_fn=None, output_fn=None, which=None, runner=
                                             input_fn=input_fn, output_fn=output_fn, model=model)
             tool['auth'] = tool['smoke']['auth']
             if not tool['smoke']['passed']:
-                output_fn(name + ': excluded from usable capabilities; smoke ' + tool['smoke']['reason'] + '.')
+                output_fn(name + ': enabled but unverified (smoke ' + tool['smoke']['status'] + ': '
+                          + tool['smoke']['reason'] + '); live quota and auth checks still apply at dispatch.')
         smoke[name] = deepcopy(tool['smoke'])
     output_fn('cli: ' + RATIONALES['cli'])
     cli_enabled = _yes(input_fn, output_fn, 'cli: enable as orchestrator', False)

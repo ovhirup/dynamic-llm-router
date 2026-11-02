@@ -115,6 +115,18 @@ class SetupProfileTests(unittest.TestCase):
                 setup_profile.write_profile(value, self.path)
             self.assertEqual(self.path.read_text(), 'previous')
 
+    def test_unverified_tools_stay_enabled_but_labels_must_match_the_smoke(self):
+        from llm_router import setup_profile
+        data = fragment()
+        data['setup']['tools']['codex']['smoke'] = {'passed': False, 'status': 'unverified', 'auth': 'unknown',
+                                                    'reason': 'consent_declined'}
+        data['setup']['tools']['codex']['auth'] = 'unknown'
+        self.assertEqual(setup_profile.validate_profile(data)['setup']['enabled_workers'], ['codex'])
+        claimed = deepcopy(data)
+        claimed['setup']['tools']['codex']['auth'] = 'verified'
+        with self.assertRaises(config.ConfigError):
+            setup_profile.validate_profile(claimed)
+
     def test_failed_backup_prevents_replacement(self):
         from llm_router import setup_profile
         data = fragment()
