@@ -123,6 +123,15 @@ class ScoreTests(unittest.TestCase):
         self.assertFalse(eval_score.gate(base, dict(base, cases=1, tokens_total=1))['adopt'])
         self.assertFalse(eval_score.gate(base, dict(base, tokens_total=None))['adopt'])  # no evidence
 
+    def test_gate_never_adopts_when_both_sides_have_zero_pass_rate(self):
+        zero_base = {'cases': 2, 'pass_rate': 0.0, 'quality_mean': 0.0, 'tokens_total': 200,
+                     'quota_percent_mean': 2.0, 'elapsed_seconds_median': 30.0}
+        faster_zero = dict(zero_base, tokens_total=50, quota_percent_mean=0.5, elapsed_seconds_median=2.0)
+        verdict = eval_score.gate(zero_base, faster_zero)
+        self.assertFalse(verdict['adopt'])
+        self.assertEqual(verdict['verdict'], 'inconclusive')
+        self.assertIn('0% pass rate', verdict['reasons'][0])
+
 
 class OfflineHarnessTests(EvalFixture):
     def test_ab_report_adopts_cheaper_faster_candidate(self):
