@@ -15,7 +15,7 @@ import re
 import subprocess
 import time
 
-from . import alerts, config, security
+from . import alerts, approval_audit, config, security
 from . import task_dispatch as td
 ACTIONS = ('push', 'merge')
 MERGE_METHODS = ('merge', 'squash', 'rebase')
@@ -326,7 +326,7 @@ def _append_approval(policy, record):
 
 
 def approval_status(policy, job_id, action, sha, now=None):
-    """Latest record for (job, action, exact sha) decides: approval (unexpired) / denial / used."""
+    """Latest record for (job, action, exact sha) decides: approval (unexpired) / denial / undone / used."""
     relevant = [r for r in approval_records(policy) if r.get('job') == job_id and r.get('action') == action]
     latest = None
     for record in relevant:
@@ -334,16 +334,24 @@ def approval_status(policy, job_id, action, sha, now=None):
             latest = record
     if latest is None:
         older = any(r.get('type') == 'approval' for r in relevant)
-        return {'ok': False, 'why': (f'{action} approval was for an older commit; {sha[:10]} needs a new approval'
-                                     if older else f'no {action} approval for {sha[:10]}')}
+        return {'ok': False, 'stale': older,
+                'why': (f'{action} approval was for an older commit; {sha[:10]} needs a new approval'
+                        if older else f'no {action} approval for {sha[:10]}')}
     if latest['type'] == 'denial':
-        return {'ok': False, 'why': f'{action} denied for {sha[:10]}'}
+        return {'ok': False, 'stale': False, 'why': f'{action} denied for {sha[:10]}'}
+    if latest['type'] == 'undone':
+        return {'ok': False, 'stale': False, 'why': f'{action} approval for {sha[:10]} was undone'}
     if latest['type'] == 'used':
-        return {'ok': False, 'why': f'{action} approval for {sha[:10]} was already used'}
+        return {'ok': False, 'stale': False, 'why': f'{action} approval for {sha[:10]} was already used'}
     expires = latest['expires_at']
-    if datetime.fromisoformat(expires) <= now_local(now):
-        return {'ok': False, 'why': f'{action} approval for {sha[:10]} expired at {expires}'}
-    return {'ok': True, 'why': f'approved until {expires}', 'approval': latest}
+    current = now_local(now)
+    if datetime.fromisoformat(expires) <= current:
+        return {'ok': False, 'stale': True, 'expired': True,
+                'why': f'{action} approval for {sha[:10]} expired at {expires}'}
+    undo_until = latest.get('undo_until')
+    can_undo = bool(undo_until and datetime.fromisoformat(undo_until) > current)
+    return {'ok': True, 'stale': False, 'can_undo': can_undo, 'undo_until': undo_until,
+            'why': f'approved until {expires}', 'approval': latest}
 
 
 def _match_sha(head, sha):
@@ -351,11 +359,13 @@ def _match_sha(head, sha):
         raise Refused(f'--sha {sha} is not the current branch head {head[:12]}; review again')
 
 
-def approve(job_id, action, sha=None, hours=None, note=None, policy=None, now=None):
+def approve(job_id, action, sha=None, hours=None, note=None, policy=None, now=None, undo_seconds=None):
     policy = _load_policy(policy)
     if action not in ACTIONS:
         raise Refused(f'action must be one of {ACTIONS}')
     job = load_job(policy, job_id)
+    if job.get('review_required') is True and (job.get('review') or {}).get('verdict') != 'approve':
+        raise Refused('stronger-model review required before approving Codex/Cursor/local output')
     guard_branch(policy, job, settings_for(policy, job))
     head = head_sha(job)
     _match_sha(head, sha)
@@ -368,11 +378,36 @@ def approve(job_id, action, sha=None, hours=None, note=None, policy=None, now=No
         raise Refused('push the branch and open the draft PR before approving a merge')
     stamp = now_local(now)
     ttl = float(hours if hours is not None else _cfg(policy).get('approval_ttl_hours', 24))
+    undo_window = float(undo_seconds if undo_seconds is not None else _cfg(policy).get('undo_window_seconds', 300))
     record = {'type': 'approval', 'job': job_id, 'action': action, 'sha': head, 'branch': job['branch'],
               'repo': Path(job['repo']).name, 'at': stamp.isoformat(timespec='seconds'),
               'expires_at': (stamp + timedelta(hours=ttl)).isoformat(timespec='seconds'),
+              'undo_until': (stamp + timedelta(seconds=max(0.0, undo_window))).isoformat(timespec='seconds'),
               'note': security.redact(note or ''), 'review_dir': gate['review'].get('dir')}
     record['id'] = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()[:12]
+    saved = _append_approval(policy, record)
+    approval_audit.record_approval_audit(policy, saved, actor='owner', now=stamp)
+    return saved
+
+
+def undo(job_id, action, note=None, policy=None, now=None):
+    """Undo an unused approval within its undo window; refuses used or expired approvals."""
+    policy = _load_policy(policy)
+    if action not in ACTIONS:
+        raise Refused(f'action must be one of {ACTIONS}')
+    job = load_job(policy, job_id)
+    head = head_sha(job)
+    status = approval_status(policy, job_id, action, head, now=now)
+    if not status['ok']:
+        raise Refused(f'cannot undo {action}: {status["why"]}')
+    approval = status['approval']
+    stamp = now_local(now)
+    undo_until = approval.get('undo_until')
+    if undo_until and datetime.fromisoformat(undo_until) <= stamp:
+        raise Refused(f'undo window for {action} approval expired at {undo_until} (use deny instead)')
+    record = {'type': 'undone', 'job': job_id, 'action': action, 'sha': head, 'branch': job['branch'],
+              'approval_id': approval.get('id'), 'at': stamp.isoformat(timespec='seconds'),
+              'note': security.redact(note or '')}
     return _append_approval(policy, record)
 
 
@@ -382,9 +417,12 @@ def deny(job_id, action, note=None, policy=None, now=None):
         raise Refused(f'action must be one of {ACTIONS}')
     job = load_job(policy, job_id)
     head = head_sha(job)
+    stamp = now_local(now)
     record = {'type': 'denial', 'job': job_id, 'action': action, 'sha': head, 'branch': job['branch'],
-              'at': now_local(now).isoformat(timespec='seconds'), 'note': security.redact(note or '')}
-    return _append_approval(policy, record)
+              'at': stamp.isoformat(timespec='seconds'), 'note': security.redact(note or '')}
+    saved = _append_approval(policy, record)
+    approval_audit.record_approval_audit(policy, saved, actor='owner', now=stamp)
+    return saved
 
 
 def _mark_used(policy, approval, now=None):
