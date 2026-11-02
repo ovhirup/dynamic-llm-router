@@ -7,11 +7,12 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from helpers import load_policy, TERM
+from helpers import FakeWorkerHarness, load_policy, TERM
 from llm_router import job_dispatch as jd
-from llm_router import cooldown, task_dispatch as td
+from llm_router import cooldown, selection, task_dispatch as td
 from test_task_dispatch import repo
 
 
@@ -44,7 +45,7 @@ class JobTests(unittest.TestCase):
         self.policy = policy
         # Never reach a real CLI from unit tests: every worker starts as a failing fake.
         for name in ('codex', 'grok-build', 'cursor'):
-            self.worker("import sys; sys.exit(3)", name)
+            FakeWorkerHarness('fail').install(self.policy, name)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -55,6 +56,9 @@ class JobTests(unittest.TestCase):
     def worker(self, code, name='codex'):
         tail = [a for a in self.policy['run_task']['commands'][name] if a in ('-', '{prompt_file}', '{prompt_pointer}')]
         self.policy['run_task']['commands'][name] = [sys.executable, '-c', code] + tail
+
+    def fake(self, mode, name='codex', **options):
+        return FakeWorkerHarness(mode, **options).install(self.policy, name)
 
     def job(self, **kw):
         kw.setdefault('select', self.select)
@@ -94,9 +98,9 @@ class JobTests(unittest.TestCase):
         note = ('## Goal\nAdd out.txt\n## Files touched\nout.txt\n## Diff summary\nadd\n'
                 '## Test status\npassed\n## Decisions\nclean\n## Next steps\nnone\n## Gotchas\nnone\n')
         self.worker("import sys; print(%r, file=sys.stderr); open('out.txt','w').write('hi\\n'); "
-                    "open('.llm-router-handoff.md','w').write(%r)" % (f'{TERM} {secret}', note))
+                    "open('.llm-router-handoff.md','w').write(%r)" % (f'{TERM} {secret}', note), 'grok-build')
         before = jd.main_state(self.repo)
-        result = self.job(test_cmd='test -f out.txt')
+        result = self.job(test_cmd='test -f out.txt', worker='grok-build')
         self.assertTrue(result['ok'], result)
         path = self.base / 'vault' / 'jobs' / f'{result["job_id"]}.md'
         self.assertEqual(result['vault_note'], str(path))
@@ -115,6 +119,28 @@ class JobTests(unittest.TestCase):
         self.assert_main_untouched(before)
         self.assertFalse(any(p.name in ('vault', 'jobs', 'handoffs') for p in self.repo.iterdir()))
 
+    def test_diff_scope_gate_blocks_extra_file_and_allows_in_scope_edits(self):
+        self.task.write_text('# Scoped task\nCreate out.txt only.\n\n## Allowed paths\n- out.txt\n- docs/\n')
+        self.worker("open('out.txt','w').write('ok\\n'); open('rogue.txt','w').write('extra\\n')")
+        before = jd.main_state(self.repo)
+        result = self.job(test_cmd='test -f out.txt')
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['status'], 'diff_out_of_scope')
+        self.assertEqual(result['reason'], 'diff_out_of_scope')
+        self.assertIsNone(result['commit'])
+        self.assertEqual(result['diff_scope']['out_of_scope'], ['rogue.txt'])
+        self.assertEqual(result['allowed_paths'], ['docs/', 'out.txt'])
+        self.assert_main_untouched(before)
+
+        # In-scope edit (including inside a declared directory) passes and commits.
+        self.worker("import pathlib; pathlib.Path('docs').mkdir(exist_ok=True); "
+                    "open('out.txt','w').write('ok\\n'); open('docs/guide.md','w').write('hi\\n')")
+        ok_res = self.job(test_cmd='test -f out.txt')
+        self.assertTrue(ok_res['ok'], ok_res)
+        self.assertEqual(ok_res['status'], 'committed')
+        self.assertEqual(ok_res['diff_scope']['status'], 'ok')
+        self.assertEqual(ok_res['diff_scope']['out_of_scope'], [])
+
     def test_retry_with_test_output_then_pass(self):
         capture = self.base / 'prompts.txt'
         self.worker("import sys; p=sys.stdin.read(); open(%r,'a').write(p+'\\n=====\\n'); "
@@ -131,8 +157,8 @@ class JobTests(unittest.TestCase):
                 'meters': {'codex': 10, 'grok-build': 10, 'cursor': 10}, 'reason': 'test'}
 
     def test_quota_error_fails_over_to_next_worker(self):
-        self.worker("import sys; print('Usage limit reached', file=sys.stderr); sys.exit(1)")
-        self.worker("open('out.txt','w').write('hi\\n')", 'grok-build')
+        self.fake('quota')
+        self.fake('ok', 'grok-build')
         result = self.job(test_cmd='test -f out.txt', select=self.select_all)
         self.assertTrue(result['ok'], result)
         runs = result['attempts'][0]['runs']
@@ -148,6 +174,24 @@ class JobTests(unittest.TestCase):
         self.assertEqual([r['worker'] for r in runs], ['codex', 'grok-build', 'cursor'])
         self.assertTrue(all(r['reason'] not in (None, 'ok') for r in runs), runs)
 
+    def test_failed_worker_exit_1_saves_root_cause_in_job_json(self):
+        # Issue #14: an exit-1 worker with stderr must not leave the job log without a reason.
+        for name in ('codex', 'grok-build'):
+            self.worker("import sys; print('loading model', file=sys.stderr); "
+                        "print('Error: model qwen2.5-coder:14b not found', file=sys.stderr); sys.exit(1)", name)
+        result = self.job(test_cmd='true')
+        self.assertFalse(result['ok'])
+        saved = json.loads((self.base / 'jobs' / f'{result["job_id"]}.json').read_text())
+        for doc in (result, saved):
+            self.assertEqual(doc['failure_reason'], 'Error: model qwen2.5-coder:14b not found')
+            self.assertIn('loading model', doc['stderr_tail'])
+            self.assertIn('not found', doc['error'])
+            for attempt in [a for a in doc['attempts'] if a.get('runs')]:
+                self.assertEqual(attempt['failure_reason'], 'Error: model qwen2.5-coder:14b not found')
+                self.assertIn('not found', attempt['stderr_tail'])
+                self.assertTrue(all(r['returncode'] == 1 and 'not found' in r['stderr_tail']
+                                    for r in attempt['runs']))
+
     def test_failed_worker_is_not_retried_in_the_next_cycle(self):
         calls = []
         def run_task(*args, **kwargs):
@@ -160,9 +204,8 @@ class JobTests(unittest.TestCase):
         self.assertIn('no eligible worker', result['attempts'][1]['refused'])  # nobody re-runs
 
     def test_auth_error_marks_worker_unavailable_and_fails_over(self):
-        self.worker("import sys; print('Failed to authenticate: OAuth session expired and could not be "
-                    "refreshed', file=sys.stderr); sys.exit(1)")
-        self.worker("open('out.txt','w').write('hi\\n')", 'grok-build')
+        self.fake('auth')
+        self.fake('ok', 'grok-build')
         result = self.job(test_cmd='test -f out.txt')
         self.assertTrue(result['ok'], result)
         runs = result['attempts'][0]['runs']
@@ -176,11 +219,10 @@ class JobTests(unittest.TestCase):
 
     def test_live_case_auth_then_timeout_fails_over_to_third_worker(self):
         # 31 Oct: claude auth failed in 3s, aider timed out, and the router refused the retry.
-        self.worker("import sys; print('OAuth session expired', file=sys.stderr); sys.exit(1)")
-        self.worker("import time, sys; print('quota exhausted? no, just slow'); sys.stdout.flush(); time.sleep(30)",
-                    'grok-build')
+        self.fake('auth', stderr='OAuth session expired')
+        self.fake('timeout', 'grok-build', stderr='quota exhausted? no, just slow')
         self.policy['run_task']['timeouts_seconds']['grok-build'] = 1
-        self.worker("open('out.txt','w').write('hi\\n')", 'cursor')
+        self.fake('ok', 'cursor')
         result = self.job(test_cmd='test -f out.txt', select=self.select_all)
         self.assertTrue(result['ok'], result)
         self.assertEqual([(h['worker'], h['reason']) for h in result['hops']],
@@ -189,7 +231,7 @@ class JobTests(unittest.TestCase):
         self.assertNotIn('grok-build', cooldown.active())  # a timeout is not a quota cooldown
 
     def test_exhausted_failover_is_reported_not_refused(self):
-        self.worker("import sys; print('OAuth session expired', file=sys.stderr); sys.exit(1)")
+        self.fake('auth', stderr='OAuth session expired')
         result = self.job(test_cmd='true')  # eligible: codex, grok-build (both fail)
         self.assertFalse(result['ok'])
         self.assertEqual((result['status'], result['failover']), ('failed', 'exhausted'))
@@ -262,7 +304,7 @@ class JobTests(unittest.TestCase):
         self.assertEqual(git(Path(result['worktree']), 'diff', '--cached', '--name-only'), '')
 
     def test_no_change_is_failure(self):
-        self.worker("pass")
+        self.fake('no_change')
         result = self.job(test_cmd='true')
         self.assertFalse(result['ok'])
         self.assertEqual([a['changed'] for a in result['attempts']], [False, False])
@@ -568,6 +610,172 @@ class JobTests(unittest.TestCase):
         report = jd.cleanup('0m', policy=self.policy)
         self.assertEqual(report['skipped'][0]['why'], 'uncommitted changes')
         self.assertTrue(Path(done['worktree']).exists())
+
+    # ---- stronger-model review (#13) ----
+
+    def test_review_required_for_weaker_and_local_workers_only(self):
+        for name in ('codex', 'cursor', 'aider-ollama', 'local', 'developer', 'nativ'):
+            self.assertTrue(jd.review_required(name), name)
+        for name in ('claude', 'grok-build', None, ''):
+            self.assertFalse(jd.review_required(name), name)
+
+    def test_codex_commit_writes_review_prompt_and_stays_pending_for_grok_bot(self):
+        self.worker("open('out.txt','w').write('hi\\n')")
+        result = self.job(test_cmd='test -f out.txt')
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(result['review_required'])
+        review = result['review']
+        self.assertEqual((review['status'], review['reviewer']), ('pending', 'grok-bot'))
+        prompt = Path(review['prompt_file'])
+        self.assertEqual(prompt.name, '.llm-router-review-prompt.md')
+        self.assertEqual(stat_mode(prompt), 0o600)
+        text = prompt.read_text()
+        self.assertIn('+hi', text)
+        self.assertIn('- out.txt', text)
+        self.assertIn('passed', text)
+        self.assertFalse(Path(result['worktree'], prompt.name).exists())  # never in the work tree
+        saved = json.loads((self.base / 'jobs' / f'{result["job_id"]}.json').read_text())
+        self.assertTrue(saved['review_required'])
+        self.assertEqual(saved['review']['status'], 'pending')
+
+    def test_reviewer_gets_diff_and_reject_fails_the_job(self):
+        self.worker("open('out.txt','w').write('hi\\n')")
+        seen = []
+        def reviewer(summary, diff, prompt_path):
+            seen.append((summary['commit'], diff, Path(prompt_path).read_text()))
+            return {'status': 'recorded', 'reviewer': 'claude', 'verdict': 'reject', 'notes': 'no'}
+        result = self.job(test_cmd='test -f out.txt', reviewer=reviewer)
+        self.assertEqual(len(seen), 1)
+        commit, diff, prompt = seen[0]
+        self.assertEqual(commit, result['commit'])
+        self.assertIn('+hi', diff)
+        self.assertIn(diff.strip(), prompt)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['status'], 'review_rejected')
+        self.assertEqual((result['review']['reviewer'], result['review']['verdict']), ('claude', 'reject'))
+        self.assertEqual(result['worktree_state'], 'kept')
+
+    def test_stronger_worker_output_needs_no_review(self):
+        self.worker("open('out.txt','w').write('hi\\n')", 'grok-build')
+        called = []
+        result = self.job(test_cmd='test -f out.txt', worker='grok-build',
+                          reviewer=lambda *a: called.append(a))
+        self.assertTrue(result['ok'], result)
+        self.assertFalse(result['review_required'])
+        self.assertIsNone(result['review'])
+        self.assertEqual(called, [])
+
+    def test_pr_gate_refuses_unreviewed_weaker_output_until_approved(self):
+        from llm_router import pr_gate as pg
+        self.worker("open('out.txt','w').write('hi\\n')")
+        result = self.job(test_cmd='test -f out.txt')
+        self.assertTrue(result['review_required'])
+        path = self.base / 'jobs' / f'{result["job_id"]}.json'
+        with self.assertRaisesRegex(pg.Refused, 'stronger-model review required'):
+            pg.approve(result['job_id'], 'push', policy=self.policy)
+        job = json.loads(path.read_text())
+        job['review'] = {'status': 'recorded', 'reviewer': 'claude', 'verdict': 'reject', 'notes': ''}
+        path.write_text(json.dumps(job))
+        with self.assertRaisesRegex(pg.Refused, 'stronger-model review required'):
+            pg.approve(result['job_id'], 'push', policy=self.policy)
+        job['review']['verdict'] = 'approve'
+        path.write_text(json.dumps(job))
+        with self.assertRaises(pg.Refused) as caught:  # next gate: the review bundle, not the model review
+            pg.approve(result['job_id'], 'push', policy=self.policy)
+        self.assertNotIn('stronger-model review', str(caught.exception))
+
+
+def stat_mode(path):
+    return os.stat(path).st_mode & 0o777
+
+
+class AllWorkersOutNeverIdleTests(unittest.TestCase):
+    """Issue #28: with every cloud worker out, run-job still does work (local) or hands off; never idles."""
+    tearDown = JobTests.tearDown
+    worker = JobTests.worker
+    job = JobTests.job
+    assert_main_untouched = JobTests.assert_main_untouched
+    CLOUD = ('claude', 'codex', 'grok-build', 'cursor')
+    CLASS_ORDER = {
+        'mechanical': ['grok-build', 'codex', 'cursor', 'aider-ollama', 'grok-bot'],
+        'feature': ['claude', 'grok-build', 'cursor', 'codex', 'grok-bot'],
+        'bugfix': ['grok-build', 'codex', 'claude', 'cursor', 'grok-bot'],
+        'review': ['codex', 'claude', 'grok-build', 'grok-bot'],
+    }
+
+    def setUp(self):
+        JobTests.setUp(self)
+        self.now = datetime.now(timezone.utc).replace(microsecond=0)
+        rt = self.policy['run_task']
+        rt['commands']['aider-ollama'] = ['fake']
+        rt['timeouts_seconds']['aider-ollama'] = 60
+        self.policy['unmetered_workers'] = ['aider-ollama']
+        self.policy['class_order'] = copy.deepcopy(self.CLASS_ORDER)
+        self.worker("import sys; sys.exit(3)", 'claude')  # a cloud run here would be a bug
+        stamp = lambda delta: (self.now + delta).isoformat()
+        # claude and codex read percent_used 100 from their meters; grok-build and cursor are cooling down.
+        self.io = {}
+        for name in ('claude', 'codex'):
+            self.policy['quota'][name]['enabled'] = True
+            windows = {w: {'percent_used': 100, 'observed_at': stamp(timedelta(minutes=-1)),
+                           'expires_at': stamp(timedelta(hours=1)), 'reset_at': stamp(timedelta(hours=5))}
+                       for w in ('primary', 'weekly')}
+            observation = {'evidence': {'source_worker': name, 'required_windows': ['primary', 'weekly'],
+                                        'windows': windows}}
+            self.io[name] = {'load': (lambda o=observation: o), 'save': lambda o: None,
+                             'observe': lambda p: self.fail('no live meter read when the cache is exhausted')}
+        self.cooldowns = {w: {'until': stamp(timedelta(hours=1))} for w in ('grok-build', 'cursor')}
+
+    def select(self, chars, **kw):
+        return selection.select(chars, policy=self.policy, io=self.io, now=self.now,
+                                cooldowns=self.cooldowns, **kw)
+
+    def assert_cloud_skipped(self, result, task_class):
+        for name in self.CLASS_ORDER[task_class]:
+            if name in self.CLOUD:
+                self.assertNotIn(name, result['eligible'], (task_class, result['reasons']))
+                self.assertRegex(result['reasons'][name], r'^(quota_exhausted|cooldown_until_)')
+
+    def test_mechanical_runs_local_worker_and_commits_on_router_branch(self):
+        chosen = self.select(10000, task_class='mechanical')
+        self.assert_cloud_skipped(chosen, 'mechanical')
+        self.assertEqual((chosen['worker'], chosen['reason']), ('aider-ollama', 'preferred_eligible_worker'))
+        self.worker("open('out.txt','w').write('local\\n')", 'aider-ollama')
+        before = jd.main_state(self.repo)
+        result = self.job(test_cmd='test -f out.txt', task_class='mechanical')
+        self.assertTrue(result['ok'], result)
+        self.assertEqual((result['status'], result['tests_status']), ('committed', 'passed'))
+        self.assertEqual(result['workers'], ['aider-ollama'])
+        self.assertEqual([h['worker'] for h in result['hops']], ['aider-ollama'])
+        self.assertTrue(result['branch'].startswith('router/add-feature-'))
+        self.assertEqual(git(self.repo, 'rev-parse', result['branch']), result['commit'])
+        self.assertEqual(git(self.repo, 'rev-parse', 'HEAD'), result['base_sha'])
+        self.assertIs(result['main_checkout_untouched'], True)
+        self.assertEqual(jd.main_state(self.repo), before)
+        self.assertFalse((self.repo / 'out.txt').exists())
+
+    def test_non_mechanical_classes_hand_off_to_orchestrator_not_refused(self):
+        for task_class in ('feature', 'bugfix', 'review'):
+            with self.subTest(task_class=task_class):
+                chosen = self.select(10000, task_class=task_class)
+                self.assert_cloud_skipped(chosen, task_class)
+                self.assertEqual((chosen['worker'], chosen['reason']), ('grok-bot', 'handoff_to_orchestrator'))
+                self.assertEqual(chosen['eligible'], ['grok-bot'])
+                before = jd.main_state(self.repo)
+                branches = git(self.repo, 'branch', '--list')
+                result = self.job(test_cmd='test -f out.txt', task_class=task_class)
+                self.assertEqual(result['status'], 'handoff_to_orchestrator', result)
+                self.assertEqual(result['reason'], 'no_eligible_worker')
+                self.assertEqual(result['task_file'], str(self.task.resolve()))
+                self.assertIsNone(result['commit'])
+                self.assertEqual(result['workers'], [])
+                self.assertFalse(any('refused' in a for a in result['attempts']), result['attempts'])
+                self.assertIs(result['main_checkout_untouched'], True)
+                self.assertEqual(jd.main_state(self.repo), before)
+                self.assertEqual((result['worktree_state'], result['branch_state']), ('pruned', 'deleted'))
+                self.assertFalse(Path(result['worktree']).exists())
+                self.assertEqual(git(self.repo, 'branch', '--list', result['branch']), '')
+                self.assertEqual(git(self.repo, 'branch', '--list'), branches)
 
 
 class WatchdogAndPacingTests(unittest.TestCase):
