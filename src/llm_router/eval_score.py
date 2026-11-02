@@ -42,7 +42,10 @@ def score(outcome, expected_paths=None, weights=None):
     quality = sum(weights[k] * v for k, v in used.items()) / total if total else 0.0
     return {'case_id': outcome.get('case_id'), 'worker': outcome.get('worker'), 'passed': passed,
             'quality': round(quality, 4), 'parts': parts, 'tokens': outcome.get('tokens'),
-            'quota_percent': outcome.get('quota_percent'), 'elapsed_seconds': outcome.get('elapsed_seconds')}
+            'quota_percent': outcome.get('quota_percent'),
+            'quota_delta_status': outcome.get('quota_delta_status'),
+            'quota_delta_reason': outcome.get('quota_delta_reason'),
+            'elapsed_seconds': outcome.get('elapsed_seconds')}
 
 
 def _numbers(rows, key):

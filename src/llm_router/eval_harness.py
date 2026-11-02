@@ -116,12 +116,24 @@ def live_outcome(case, spec, base_policy, run_job, meter):
         job = run_job(case['repo'], str(task), base=case['base_sha'], worker=spec.get('worker'),
                       size=case.get('size') or 'full', keep=False, policy=policy)
     workers = job.get('workers') or []
-    spent = [meter(w) - before[w] for w in workers
-             if type(before.get(w)) in (int, float) and type(meter(w)) in (int, float)]
+    after = {w: meter(w) for w in workers}
+    spent = [after[w] - before[w] for w in workers
+             if type(before.get(w)) in (int, float) and type(after.get(w)) in (int, float)]
+    if not workers:
+        quota_delta_status = 'no_worker_ran'
+        quota_delta_reason = job.get('reason') or job.get('status') or 'no worker ran'
+    elif spent:
+        quota_delta_status = 'ok'
+        quota_delta_reason = None
+    else:
+        missing = [w for w in workers if type(before.get(w)) not in (int, float) or type(after.get(w)) not in (int, float)]
+        quota_delta_status = 'unknown'
+        quota_delta_reason = f'meter stale or unknown for {", ".join(missing)}'
     observed = eval_corpus.case_from_job(job)['baseline']
     return {'case_id': case['case_id'], 'worker': workers[-1] if workers else None,
             'tests_status': job.get('tests_status'), 'changed_paths': observed['changed_paths'],
             'tokens': observed['tokens'], 'quota_percent': round(sum(spent), 2) if spent else None,
+            'quota_delta_status': quota_delta_status, 'quota_delta_reason': quota_delta_reason,
             'elapsed_seconds': observed['elapsed_seconds'], 'reviewer_score': job.get('reviewer_score'),
             'hops': workers, 'job_id': job.get('job_id'), 'status': job.get('status')}
 
