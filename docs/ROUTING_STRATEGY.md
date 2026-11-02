@@ -1,7 +1,7 @@
 # Dynamic LLM Router: master routing strategy
 
 Status as of 31 Oct 2026. This is the single source of truth for how DLR picks, runs, switches and learns. Detail docs:
-`STRATEGY_WORKERS_FALLBACK.md` and `ROUTER_BRAIN.md` (branch `grokbot/strategy-workers-fallback`), plus `workers.md` and `configuration.md`.
+[STRATEGY_WORKERS_FALLBACK.md](STRATEGY_WORKERS_FALLBACK.md) (worker ranking and fallback rules), `ROUTER_BRAIN.md`, `workers.md` and `configuration.md`.
 
 Legend: **[Shipped 0.4.0]** is on main. **[In review]** has a local branch awaiting approval. **[Planned]** is an open issue.
 
