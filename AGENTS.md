@@ -7,7 +7,7 @@ Whichever coding tool or agent receives the prompt (`cursor`, `claude`, `codex`,
 - **Architecture & routing strategy:** [`docs/ROUTING_STRATEGY.md`](docs/ROUTING_STRATEGY.md), [`docs/STRATEGY_WORKERS_FALLBACK.md`](docs/STRATEGY_WORKERS_FALLBACK.md), [`docs/ROUTER_BRAIN.md`](docs/ROUTER_BRAIN.md)
 - **Standing decisions:** [`docs/decisions.md`](docs/decisions.md)
 - **Project learnings:** [`docs/learnings.md`](docs/learnings.md)
-- **Configuration & workers:** [`docs/configuration.md`](docs/configuration.md), [`docs/workers.md`](docs/workers.md), [`docs/evaluation.md`](docs/evaluation.md)
+- **Configuration & workers:** [`docs/configuration.md`](docs/configuration.md), [`docs/setup.md`](docs/setup.md), [`docs/workers.md`](docs/workers.md), [`docs/evaluation.md`](docs/evaluation.md)
 - **Core package:** `src/llm_router/` (`cli.py`, `selection.py`, `task_dispatch.py`, `job_dispatch.py`, `wave_runner.py`, `merge_queue.py`, `pr_gate.py`)
 - **Tests:** `tests/` (offline, deterministic, fake workers only)
 

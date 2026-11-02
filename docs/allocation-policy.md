@@ -22,6 +22,10 @@ user settings or observers and uses the saved `as_of`, never the current clock.
 `--class` applies when collecting a plan; it cannot change a saved candidate list.
 Use `--size draft` to inspect draft eligibility.
 
+`--explain` adds setup preferences, disabled capabilities, reserves, captured
+windows and resets, pins and the orchestrator preview; `--worker`/`--orchestrator`
+preview an override without logging it. See [setup.md](setup.md).
+
 The normal collector path uses fresh cache first. A fallback-only observer may
 contribute fresh cached evidence without a live consultation. Unknown, stale,
 malformed or future evidence cannot make a metered worker eligible.

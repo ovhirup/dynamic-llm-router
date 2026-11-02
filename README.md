@@ -67,7 +67,8 @@ See [SECURITY.md](SECURITY.md) for the threat model and how to report issues.
 
 ```bash
 pipx install git+https://github.com/ovhirup/dynamic-llm-router   # or: pip install -e . in a venv
-llm-router init       # interactive detection and worker ordering; Claude opt-in defaults No
+llm-router setup      # wizard: pick workers/orchestrators, smoke-test each, save a backed-up setup profile
+llm-router init       # older interactive detection and worker ordering; Claude opt-in defaults No
 llm-router doctor     # validates config, finds binaries and observers; runs no worker
 llm-router paths      # where config and state live
 ```
@@ -83,6 +84,7 @@ with your config. Nothing personal ships in the package.
 | What | Where (first match) |
 |------|---------------------|
 | Config file | `$LLM_ROUTER_CONFIG`, else `<config dir>/config.json` |
+| Setup profile (from `llm-router setup`) | `<config dir>/setup.json`, layered over `config.json`; see [docs/setup.md](docs/setup.md) |
 | Config dir | `$LLM_ROUTER_CONFIG_DIR`, else `$XDG_CONFIG_HOME/llm-router`, else `~/.config/llm-router` |
 | State dir (caches, ledger, logs, worktrees) | `$LLM_ROUTER_STATE_DIR`, else `$XDG_STATE_HOME/llm-router`, else `~/.local/state/llm-router` |
 | Per-repo settings (`test_cmd`, `allow_no_tests`, remote, required checks…) | `<config dir>/repos.json` |
@@ -177,6 +179,10 @@ Applies equally to `run-task` and `run-job`; a forced worker has no failover.
 | Unknown meter for full-size work | Refused unless X is in `unmetered_workers`. |
 | Draft-size unknown meter | Allowed with an unpaced warning. |
 | Forced worker fails | No failover to another worker. |
+| Disabled in the setup profile | Refused, exit 2, before any work starts. |
+
+Every `--worker` (and `run-job --orchestrator`) override is logged with `--override-reason` (or a default
+reason) to `<state dir>/logs/setup-decisions.jsonl`, as are saved setup pins. See [docs/setup.md](docs/setup.md).
 
 ## Job flow
 

@@ -5,6 +5,14 @@ versions follow [SemVer](https://semver.org/) (0.x: minor versions may break con
 
 ## [Unreleased]
 
+- Add `llm-router setup` (#210): detects Claude, Codex, Grok Build, Cursor, Grok Bot and Ollama + Aider,
+  enables each separately as worker and/or orchestrator with the rationale and recommended default shown,
+  smoke-tests every enabled tool, and writes a backed-up `setup.json` layered over `config.json` (never
+  edited). #208 still orders workers automatically; `--worker`/`--orchestrator` (with `--override-reason`)
+  and saved role/default pins are logged to `logs/setup-decisions.jsonl`. The calling app is proposed as
+  orchestrator with a live-usage recommendation and switched only on confirmation or a saved policy
+  (`orchestrator switch`, `orchestrator prefer`). `plan --explain` shows why. See `docs/setup.md`.
+
 - Add live stronger-model review for merge-queue units (#113): `llm-router units review --batch B [--unit U]`
   sends each `needs_review` entry's diff, scope and test evidence to claude (else a grok-bot handoff
   prompt) and records the verdict, bound to the head that was reviewed. `--verdict approve|reject` records an

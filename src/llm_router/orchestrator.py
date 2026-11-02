@@ -52,6 +52,27 @@ def detect_orchestrator(explicit=None, env=None):
     return {'orchestrator': config.ORCHESTRATOR, 'reason': 'default_fallback'}
 
 
+def resolve(explicit=None, decision=None):
+    """A saved-preference decision (#210) wins over environment detection; else detect as before."""
+    if decision is not None:
+        reason = 'explicit_flag' if decision.get('source') == 'explicit_flag' else decision['reason']
+        return {'orchestrator': decision['orchestrator'], 'reason': reason}
+    return detect_orchestrator(explicit=explicit)
+
+
+def decision_summary(decision):
+    """The switch/override facts a job summary keeps; budgets stay in the private decision log."""
+    if decision is None:
+        return None
+    keys = ('orchestrator', 'reason', 'source', 'caller', 'current', 'proposed', 'switched',
+            'confirmed', 'confirmation_required', 'override_reason', 'audit_path')
+    summary = {key: decision.get(key) for key in keys if key in decision}
+    recommendation = decision.get('recommendation') or {}
+    summary['recommendation'] = {'orchestrator': recommendation.get('orchestrator'),
+                                 'reason': recommendation.get('reason')}
+    return summary
+
+
 def fallback_chain(policy, current=None):
     """Ordered fallback chain of orchestrators: `worker_order` tools + `grok-bot` last, excluding `current`."""
     order = [w for w in (policy.get('worker_order') or []) if w in SUPPORTED_ORCHESTRATORS]

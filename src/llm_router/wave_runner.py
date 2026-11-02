@@ -109,7 +109,8 @@ def load_run_files(units_file, assign_file=None):
 
 
 def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=None, quota_left=None,
-              assign=None, unit_runner=None, acquire_slot=None, test_runner=None, orchestrator=None):
+              assign=None, unit_runner=None, acquire_slot=None, test_runner=None, orchestrator=None,
+              orchestrator_decision=None):
     """Assign, create worktrees, run waves, gate after each wave; returns a JSON-serialisable summary.
 
     quota_left: {worker: n} or callable(units, policy) -> {worker: n} (default: current meter evidence).
@@ -117,7 +118,7 @@ def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=N
     unit_runner(entry, prompt, policy) -> {'ok', 'status'?, 'reason'?} (default runs the real worker).
     """
     policy = policy or config.load_policy()
-    detected_orch = orch_module.detect_orchestrator(explicit=orchestrator)
+    detected_orch = orch_module.resolve(orchestrator, orchestrator_decision)
     try:
         units = task_dag.parse_units(units)
     except task_dag.DagError as error:
@@ -153,6 +154,8 @@ def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=N
     summary = {'batch_id': None, 'orchestrator': detected_orch['orchestrator'],
                'orchestrator_reason': detected_orch['reason'], 'waves': [], 'deferred': deferred,
                'queue': None, 'continuation_brief': None, 'stall_notice': None, 'ok': True}
+    if orchestrator_decision is not None:
+        summary['orchestrator_decision'] = orch_module.decision_summary(orchestrator_decision)
     if automatic:
         summary['allocations'] = allocations
     if not runnable:

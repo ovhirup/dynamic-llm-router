@@ -7,7 +7,7 @@ from pathlib import Path
 import shutil
 import sys
 
-from . import __version__, config
+from . import __version__, config, setup_profile
 
 
 def _print(value):
@@ -31,6 +31,11 @@ def build_parser():
     init.add_argument('--meters', default='')
     init.add_argument('--non-interactive', action='store_true')
     init.add_argument('--dry-run', action='store_true')
+    setup = commands.add_parser('setup', help='Interactive wizard: detect tools, choose workers and orchestrators, '
+                                'smoke-test each enabled one, save a backed-up setup profile')
+    setup.add_argument('--output', help='setup profile path (default: <config dir>/setup.json); '
+                                        'config.json, repos.json and secrets are refused')
+    setup.add_argument('--dry-run', action='store_true', help='run detection and smokes but write nothing')
     init_map_cmd = commands.add_parser('init-map',
                                        help='Write AGENTS.md, CLAUDE.md, docs/decisions.md and docs/learnings.md')
     init_map_cmd.add_argument('path', nargs='?', default='.', help='target repository root (default: .)')
@@ -51,6 +56,7 @@ def build_parser():
     task.add_argument('--worker')
     task.add_argument('--class', dest='task_class', choices=config.TASK_CLASSES)
     task.add_argument('--allow-dirty', action='store_true')
+    task.add_argument('--override-reason', help='why --worker/--orchestrator overrides automatic choice (logged)')
 
     job = commands.add_parser('run-job', help='Run a task in a new worktree branch, test, retry once, commit locally')
     job.add_argument('--repo', required=True)
@@ -61,8 +67,9 @@ def build_parser():
     job.add_argument('--size', choices=('draft', 'full'), default='full')
     job.add_argument('--worker')
     job.add_argument('--class', dest='task_class', choices=config.TASK_CLASSES)
-    job.add_argument('--orchestrator', choices=('cursor', 'claude', 'codex', 'grok-build', 'grok-bot'),
-                     help='calling orchestrator tool (default: auto-detected from environment)')
+    job.add_argument('--orchestrator', choices=setup_profile.ORCHESTRATORS,
+                     help='orchestrator for this job (default: saved preference / auto-detected caller)')
+    job.add_argument('--override-reason', help='why --worker/--orchestrator overrides automatic choice (logged)')
     job.add_argument('--role', choices=('planner', 'coder', 'searcher', 'judge', 'advisor'),
                      help='role for this job (planner, coder, searcher, judge, advisor)')
     keep = job.add_mutually_exclusive_group()
@@ -81,6 +88,7 @@ def build_parser():
     dispatch.add_argument('--branch', help='new branch name (default router/<slug>-<stamp>)')
     dispatch.add_argument('--test-cmd', help='shell test command (default: test_cmd from repos.json)')
     dispatch.add_argument('--worker')
+    dispatch.add_argument('--override-reason', help='why --worker/--orchestrator overrides automatic choice (logged)')
     dispatch_keep = dispatch.add_mutually_exclusive_group()
     dispatch_keep.add_argument('--keep', action='store_true', help='keep the worktree even on failure')
     dispatch_keep.add_argument('--prune', action='store_true', help='remove the worktree even on success')
@@ -131,13 +139,24 @@ def build_parser():
                                'workers are picked from current meter evidence')
     unit_run.add_argument('--base', default='HEAD')
     unit_run.add_argument('--assign-file', help='JSON {unit id: worker}; overrides any inline assign')
-    unit_run.add_argument('--orchestrator', choices=('cursor', 'claude', 'codex', 'grok-build', 'grok-bot'),
-                          help='calling orchestrator tool (default: auto-detected from environment)')
+    unit_run.add_argument('--orchestrator', choices=setup_profile.ORCHESTRATORS,
+                          help='orchestrator for this batch (default: saved preference / auto-detected caller)')
+    unit_run.add_argument('--override-reason', help='why --worker/--orchestrator overrides automatic choice (logged)')
 
     orch = commands.add_parser('orchestrator', help='Dynamic orchestrator detection and budget-aware handoff')
     orch_cmds = orch.add_subparsers(dest='orchestrator_command', required=True)
     orch_status = orch_cmds.add_parser('status', help='Show current orchestrator, why it was chosen, and fallback chain')
     orch_status.add_argument('--orchestrator', choices=('cursor', 'claude', 'codex', 'grok-build', 'grok-bot'))
+    orch_switch = orch_cmds.add_parser('switch', help='Switch the current orchestrator (confirmed, then logged)')
+    orch_switch.add_argument('target', choices=setup_profile.ORCHESTRATORS)
+    orch_switch.add_argument('--reason', help='why you are switching (logged)')
+    orch_switch.add_argument('--yes', action='store_true', help='confirm without the interactive prompt')
+    orch_prefer = orch_cmds.add_parser('prefer', help='Save the orchestrator switch preference in the setup profile '
+                                       '(backed up first)')
+    orch_prefer.add_argument('--mode', choices=setup_profile.SWITCH_MODES, required=True,
+                             help='always_ask, always_accept_caller, or always_use (with --target)')
+    orch_prefer.add_argument('--target', choices=setup_profile.ORCHESTRATORS, help='fixed orchestrator for always_use')
+    orch_prefer.add_argument('--preferred', choices=setup_profile.ORCHESTRATORS, help='also change the preferred orchestrator')
 
     evaluate = commands.add_parser('eval', help='Evaluation harness: replay past jobs and A/B two routing policies')
     eval_cmds = evaluate.add_subparsers(dest='eval_command', required=True)
@@ -346,12 +365,93 @@ def doctor(policy):
     return report
 
 
+def run_setup_command(args):
+    from . import setup_wizard
+    if not sys.stdin.isatty():
+        raise config.ConfigError('setup is interactive: run `llm-router setup` in a terminal')
+    result = setup_wizard.run_setup(args.output, dry_run=args.dry_run)
+    setup = result['config']['setup']
+    return {'ok': True, 'dry_run': args.dry_run, 'written': result['written'], 'backup': result['backup'],
+            'enabled_workers': setup['enabled_workers'], 'enabled_orchestrators': setup['enabled_orchestrators'],
+            'preferred_orchestrator': setup['preferred_orchestrator'], 'switch_policy': setup['switch_policy'],
+            'smoke': {name: row.get('status') for name, row in result['smoke'].items()}}
+
+
+def worker_intent(policy, args, role=None):
+    """An explicit --worker or a saved setup pin, logged with its reason; None means automatic."""
+    from . import session_preferences
+    if args.worker is None and 'setup' not in policy:
+        return None
+    intent = session_preferences.resolve_worker(policy, explicit=args.worker, role=role,
+                                                reason=getattr(args, 'override_reason', None))
+    return intent if intent['worker'] is not None else None
+
+
+def _interactive():
+    return sys.stdin.isatty() and sys.stderr.isatty()
+
+
+def _confirm_switch(text):
+    # The question goes to stderr so stdout stays one JSON document; cancelling keeps the current one.
+    print(text + '\nSwitch orchestrator? [yes / keep current / use recommended]: ', end='', file=sys.stderr)
+    try:
+        return input()
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        return 'keep current'
+
+
+def orchestrator_decision(policy, args, role=None):
+    """An explicit --orchestrator (this job only) or the saved preference, confirmed on a terminal and
+    logged; legacy detection (None) when neither applies."""
+    from . import orchestrator as orch_module, session_preferences
+    explicit = getattr(args, 'orchestrator', None)
+    if explicit is None and 'setup' not in policy:
+        return None
+    if 'setup' not in policy and explicit not in orch_module.SUPPORTED_ORCHESTRATORS:
+        raise config.ConfigError(f'{explicit} as orchestrator requires a setup profile: run `llm-router setup`')
+    confirm = _confirm_switch if _interactive() else None
+    return session_preferences.resolve_orchestrator(policy, explicit=explicit, role=role,
+                                                    reason=getattr(args, 'override_reason', None),
+                                                    confirm=confirm, one_off=True)
+
+
+def save_switch_preference(mode, target=None, preferred=None):
+    path = setup_profile.profile_path()
+    if not path.is_file():
+        raise config.ConfigError('no setup profile yet: run `llm-router setup` first')
+    try:
+        fragment = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        raise config.ConfigError('setup profile is not valid JSON; rerun `llm-router setup`') from None
+    if not isinstance(fragment, dict) or not isinstance(fragment.get('setup'), dict):
+        raise config.ConfigError('setup profile is incomplete; rerun `llm-router setup`')
+    setup = fragment['setup']
+    if preferred is not None:
+        setup['preferred_orchestrator'] = preferred
+    if mode == 'always_use' and target is None:
+        target = setup.get('preferred_orchestrator')
+    setup['switch_policy'] = {'mode': mode, 'target': target if mode == 'always_use' else None}
+    written = setup_profile.write_profile(fragment, path)
+    return dict(written, switch_policy=setup['switch_policy'], preferred_orchestrator=setup['preferred_orchestrator'])
+
+
 def main(argv=None):
     parser, gate_help = build_parser()
     args = parser.parse_args(argv)
     if args.command == 'plan':
         from . import allocation_cli
         return allocation_cli.run(args)
+    if args.command == 'setup':
+        try:
+            _print(run_setup_command(args))
+            return 0
+        except config.ConfigError as error:
+            _print({'ok': False, 'config_error': str(error)})
+            return 2
+        except (EOFError, KeyboardInterrupt):
+            _print({'ok': False, 'aborted': 'setup cancelled; nothing was written'})
+            return 1
     if args.command == 'init':
         try:
             _print(init_config(force=args.force, workers=args.workers, never=args.never, meters=args.meters,
@@ -474,15 +574,51 @@ def main(argv=None):
         _print(result)
         return 0
     if args.command == 'orchestrator':
-        from . import orchestrator as orch_module
-        _print(orch_module.status_report(policy=policy, explicit=args.orchestrator))
+        from . import orchestrator as orch_module, session_preferences
+        try:
+            if args.orchestrator_command == 'prefer':
+                _print(save_switch_preference(args.mode, args.target, args.preferred))
+                return 0
+            if args.orchestrator_command == 'switch':
+                confirm = (lambda text: 'yes') if args.yes else _confirm_switch if _interactive() else None
+                decision = session_preferences.resolve_orchestrator(
+                    policy, explicit=args.target, reason=args.reason or 'explicit orchestrator switch',
+                    confirm=confirm, force_confirmation=True)
+                _print(decision)
+                return 0 if decision['confirmed'] else 3
+            report = orch_module.status_report(policy=policy, explicit=args.orchestrator)
+            if 'setup' in policy:
+                report['session'] = session_preferences.resolve_orchestrator(policy, persist=False)
+        except config.ConfigError as error:
+            _print({'ok': False, 'config_error': str(error)})
+            return 2
+        _print(report)
         return 0
+    overrides = {}
+    if args.command in ('run-task', 'run-job', 'bot-dispatch', 'units'):
+        try:
+            if args.command != 'units':
+                intent = worker_intent(policy, args, getattr(args, 'role', None))
+                if intent is not None:
+                    overrides['worker_override'] = intent
+                    if intent['worker'] == config.ORCHESTRATOR and intent['source'] != 'explicit_flag':
+                        intent['handoff'] = 'grok-bot pin is a manual handoff; automatic allocation still runs'
+                    else:
+                        args.worker = intent['worker']
+            if args.command == 'run-job' or getattr(args, 'units_command', None) == 'run':
+                decision = orchestrator_decision(policy, args, getattr(args, 'role', None))
+                overrides['orchestrator_decision'] = decision
+        except config.ConfigError as error:
+            _print({'ok': False, 'config_error': str(error)})
+            return 2
     if args.command == 'bot-dispatch':
         from . import job_dispatch
         result = job_dispatch.bot_dispatch(
             args.repo, args.task_file, task_class=args.task_class, size=args.size,
             base=args.base, branch=args.branch, test_cmd=args.test_cmd, worker=args.worker,
             keep=True if args.keep else False if args.prune else None, policy=policy)
+        if 'worker_override' in overrides:
+            result['worker_override'] = overrides['worker_override']
         _print(result)
         if result['action'] == 'refused':
             return 3
@@ -495,7 +631,10 @@ def main(argv=None):
                                               test_cmd=args.test_cmd, size=args.size, worker=args.worker,
                                               keep=True if args.keep else False if args.prune else None,
                                               policy=policy, task_class=args.task_class,
-                                              orchestrator=args.orchestrator, role=args.role)
+                                              orchestrator=args.orchestrator, role=args.role,
+                                              orchestrator_decision=overrides.get('orchestrator_decision'))
+                if 'worker_override' in overrides:
+                    result['worker_override'] = overrides['worker_override']
             elif args.command == 'jobs':
                 if getattr(args, 'live_feed', False):
                     from . import live_jobs_feed
@@ -537,7 +676,8 @@ def main(argv=None):
                 from . import wave_runner
                 units, assignment = wave_runner.load_run_files(args.units_file, args.assign_file)
                 result = wave_runner.run_batch(args.repo, units, assignment, base=args.base, policy=policy,
-                                               orchestrator=args.orchestrator)
+                                               orchestrator=args.orchestrator,
+                                               orchestrator_decision=overrides.get('orchestrator_decision'))
             elif args.units_command == 'list':
                 result = uw.list_batches(policy=policy, repo=args.repo)
             else:
@@ -557,6 +697,8 @@ def main(argv=None):
         except task_dispatch.Refused as refusal:
             print(json.dumps({'ok': False, 'refused': str(refusal)}))
             return 3
+        if 'worker_override' in overrides:
+            result['worker_override'] = overrides['worker_override']
         _print(result)
         return 0 if result['ok'] or result.get('status') == 'handoff_to_orchestrator' else 1
     if args.command == 'select':

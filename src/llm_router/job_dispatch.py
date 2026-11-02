@@ -339,7 +339,7 @@ def hops(summary):
 def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full', worker=None,
             keep=None, policy=None, run_task=td.run_task, select=None, now=None, test_runner=td.run_bounded,
             popen=subprocess.Popen, notifier=None, meter=None, task_class=None,
-            orchestrator=None, reviewer=None, allowed_paths=None, role=None):
+            orchestrator=None, reviewer=None, allowed_paths=None, role=None, orchestrator_decision=None):
     """keep: True (--keep), False (--prune) or None (keep on success, prune on failure).
     meter(worker) -> percent used or None (default: the cached meter, never a live read).
     task_class ranks workers by class_order.<task_class> (see selection.select)."""
@@ -348,7 +348,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
         from . import roles
         roles.role_order(policy, role)  # invalid role -> ConfigError before any worktree
         run_task = functools.partial(run_task, role=role)
-    detected_orch = orch_module.detect_orchestrator(explicit=orchestrator)
+    detected_orch = orch_module.resolve(orchestrator, orchestrator_decision)
     if task_class is not None:
         config.worker_order(policy, task_class)  # unknown class -> ConfigError before any worktree
         run_task = functools.partial(run_task, task_class=task_class)
@@ -422,6 +422,8 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
                'review_required': False, 'review': None}
     if role is not None:
         summary['role'] = role
+    if orchestrator_decision is not None:
+        summary['orchestrator_decision'] = orch_module.decision_summary(orchestrator_decision)
     with RepoLock(_path(policy, 'lock_dir', 'logs/locks'), repo), _NoSleep(policy, popen):
         before = main_state(repo)
         worktree.parent.mkdir(parents=True, exist_ok=True)

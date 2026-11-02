@@ -12,6 +12,10 @@ with `_why` are comments. Run `llm-router doctor` after editing.
 | `LLM_ROUTER_CONFIG_DIR` | Config dir (else `$XDG_CONFIG_HOME/llm-router`, else `~/.config/llm-router`). |
 | `LLM_ROUTER_STATE_DIR` | Caches, ledger, logs, approvals, worktrees (else `$XDG_STATE_HOME/llm-router`, else `~/.local/state/llm-router`). |
 
+When `<config dir>/setup.json` exists (written by `llm-router setup`) and `LLM_ROUTER_CONFIG`/`--config` is not
+set, it is deep-merged over `config.json`: defaults, then `config.json`, then the setup profile. See
+[setup.md](setup.md).
+
 Relative paths in the config resolve against the **state dir**, except `run_task.private_terms_file` and
 `run_job.repo_config`, which resolve against the **config dir**. `~` is expanded.
 
