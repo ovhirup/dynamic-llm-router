@@ -203,6 +203,18 @@ def read_sidecar(output_dir, stamp):
     return fields
 
 
+def apply_pin(plan, pin):
+    """Force a setup pin onto a unit plan only if that worker passed every gate; never fall back."""
+    plan['pin'] = dict(pin)
+    worker = pin['worker']
+    if worker in plan['order']:
+        plan.update(order=[worker], worker=worker)
+    else:
+        why = plan['excluded'].get(worker, 'not eligible for this unit')
+        plan.update(order=[], worker=None, pin_blocked=f'pinned worker {worker} not eligible: {why}')
+    return plan
+
+
 def plan_unit(unit, policy):
     """Allocate an automatic full-size coding unit, preserving capability constraints."""
     from . import scheduler, selection, task_dag

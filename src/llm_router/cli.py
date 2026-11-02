@@ -1,5 +1,6 @@
 """llm-router command line."""
 import argparse
+import functools
 import json
 import os
 from datetime import datetime, timezone
@@ -420,9 +421,10 @@ def orchestrator_decision(policy, args, role=None):
     if 'setup' not in policy and explicit not in orch_module.SUPPORTED_ORCHESTRATORS:
         raise config.ConfigError(f'{explicit} as orchestrator requires a setup profile: run `llm-router setup`')
     confirm = _confirm_switch if _interactive() else None
+    # Deferred: run_job/run_batch log it via record_decision only after their checks pass (#212).
     return session_preferences.resolve_orchestrator(policy, explicit=explicit, role=role,
                                                     reason=getattr(args, 'override_reason', None),
-                                                    confirm=confirm, one_off=True)
+                                                    confirm=confirm, one_off=True, defer=True)
 
 
 def save_switch_preference(mode, target=None, preferred=None):
@@ -641,8 +643,13 @@ def main(argv=None):
                     else:
                         args.worker = intent['worker']
             if args.command == 'run-job' or getattr(args, 'units_command', None) == 'run':
-                decision = orchestrator_decision(policy, args, getattr(args, 'role', None))
+                # units are allocated as coder work, so a coder orchestrator pin applies to units run
+                role = getattr(args, 'role', None) if args.command == 'run-job' else 'coder'
+                decision = orchestrator_decision(policy, args, role)
                 overrides['orchestrator_decision'] = decision
+                if decision is not None:
+                    from . import session_preferences
+                    overrides['record_decision'] = functools.partial(session_preferences.record_orchestrator, policy)
         except config.ConfigError as error:
             _print({'ok': False, 'config_error': str(error)})
             return 2
@@ -667,7 +674,8 @@ def main(argv=None):
                                               keep=True if args.keep else False if args.prune else None,
                                               policy=policy, task_class=args.task_class,
                                               orchestrator=args.orchestrator, role=args.role,
-                                              orchestrator_decision=overrides.get('orchestrator_decision'))
+                                              orchestrator_decision=overrides.get('orchestrator_decision'),
+                                              record_decision=overrides.get('record_decision'))
                 if 'worker_override' in overrides:
                     result['worker_override'] = overrides['worker_override']
             elif args.command == 'jobs':
@@ -712,7 +720,8 @@ def main(argv=None):
                 units, assignment = wave_runner.load_run_files(args.units_file, args.assign_file)
                 result = wave_runner.run_batch(args.repo, units, assignment, base=args.base, policy=policy,
                                                orchestrator=args.orchestrator,
-                                               orchestrator_decision=overrides.get('orchestrator_decision'))
+                                               orchestrator_decision=overrides.get('orchestrator_decision'),
+                                               record_decision=overrides.get('record_decision'))
             elif args.units_command == 'list':
                 result = uw.list_batches(policy=policy, repo=args.repo)
             else:

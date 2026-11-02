@@ -339,10 +339,13 @@ def hops(summary):
 def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full', worker=None,
             keep=None, policy=None, run_task=td.run_task, select=None, now=None, test_runner=td.run_bounded,
             popen=subprocess.Popen, notifier=None, meter=None, task_class=None,
-            orchestrator=None, reviewer=None, allowed_paths=None, role=None, orchestrator_decision=None):
+            orchestrator=None, reviewer=None, allowed_paths=None, role=None, orchestrator_decision=None,
+            record_decision=None):
     """keep: True (--keep), False (--prune) or None (keep on success, prune on failure).
     meter(worker) -> percent used or None (default: the cached meter, never a live read).
-    task_class ranks workers by class_order.<task_class> (see selection.select)."""
+    task_class ranks workers by class_order.<task_class> (see selection.select).
+    record_decision(orchestrator_decision) logs a deferred orchestrator switch once the repo, task and
+    branch checks have passed, so a refused job records none (#212)."""
     policy = policy or config.load_policy()
     if role is not None:
         from . import roles
@@ -406,6 +409,9 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
     if _git(repo, 'check-ref-format', '--branch', branch).returncode != 0:
         raise Refused(f'invalid branch name {branch!r}')
     job_id = worktree.name
+    if record_decision is not None and orchestrator_decision is not None:
+        orchestrator_decision = record_decision(orchestrator_decision)
+        detected_orch = orch_module.resolve(orchestrator, orchestrator_decision)
     out_dir = td._router_path(policy, 'output_dir', 'logs/task-output')
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = {'job_id': job_id, 'repo': str(repo), 'task': task_path.name, 'base': base_ref,

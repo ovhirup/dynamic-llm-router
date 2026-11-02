@@ -108,14 +108,28 @@ def load_run_files(units_file, assign_file=None):
     return units, assignment
 
 
+def _worker_pin(policy):
+    """The saved coder (else default) worker pin that run-job would apply; units are coder work."""
+    if 'setup' not in policy:
+        return None
+    from . import session_preferences
+    intent = session_preferences.resolve_worker(policy, role='coder', audit=False)
+    if intent['worker'] in (None, config.ORCHESTRATOR):  # a grok-bot pin is a manual handoff, as in run-job
+        return None
+    return {key: intent[key] for key in ('worker', 'source', 'reason')}
+
+
 def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=None, quota_left=None,
               assign=None, unit_runner=None, acquire_slot=None, test_runner=None, orchestrator=None,
-              orchestrator_decision=None):
+              orchestrator_decision=None, record_decision=None):
     """Assign, create worktrees, run waves, gate after each wave; returns a JSON-serialisable summary.
 
     quota_left: {worker: n} or callable(units, policy) -> {worker: n} (default: current meter evidence).
     assign: callable(units, quota_left) -> {unit id: worker or None} (default task_dag.assign).
     unit_runner(entry, prompt, policy) -> {'ok', 'status'?, 'reason'?} (default runs the real worker).
+    Automatic assignment honours the setup coder/default worker pin (#212); an explicit assignment wins.
+    record_decision(orchestrator_decision) logs a deferred orchestrator switch after the units and
+    assignment checks pass.
     """
     policy = policy or config.load_policy()
     detected_orch = orch_module.resolve(orchestrator, orchestrator_decision)
@@ -124,10 +138,14 @@ def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=N
     except task_dag.DagError as error:
         raise Refused(f'bad units: {error}')
     automatic = assignment is None and assign is None and quota_left is None
-    allocations = {}
+    allocations, pin = {}, None
     if automatic:
         from . import allocation_dispatch
         allocations = {unit['id']: allocation_dispatch.plan_unit(unit, policy) for unit in units}
+        pin = _worker_pin(policy)
+        if pin is not None:
+            for plan in allocations.values():
+                allocation_dispatch.apply_pin(plan, pin)
         assignment = {uid: plan['worker'] for uid, plan in allocations.items()}
     elif assignment is None:
         left = quota_left(units, policy) if callable(quota_left) else \
@@ -138,6 +156,12 @@ def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=N
     unknown = set(assignment) - {u['id'] for u in units}
     if unknown:
         raise Refused(f'assignment names unknown unit {sorted(unknown)[0]!r}')
+    if automatic and pin is not None:
+        from . import session_preferences
+        session_preferences.audit_event(policy, dict(pin, event='worker_override', role='coder'))
+    if record_decision is not None and orchestrator_decision is not None:
+        orchestrator_decision = record_decision(orchestrator_decision)
+        detected_orch = orch_module.resolve(orchestrator, orchestrator_decision)
     unit_runner = unit_runner or default_unit_runner
     acquire_slot = acquire_slot or task_dispatch.acquire_slot
 
@@ -147,8 +171,9 @@ def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=N
         if worker in task_dag.PARALLEL_POOL:
             runnable[unit['id']] = worker
             continue
-        why = 'no parallel-pool worker with quota' if worker is None else \
-            f'worker {worker!r} is not in the parallel pool (orchestrator handles it)'
+        why = (allocations.get(unit['id']) or {}).get('pin_blocked') or (
+            'no parallel-pool worker with quota' if worker is None else
+            f'worker {worker!r} is not in the parallel pool (orchestrator handles it)')
         deferred.append({'id': unit['id'], 'worker': worker, 'status': 'deferred_to_orchestrator', 'reason': why})
 
     summary = {'batch_id': None, 'orchestrator': detected_orch['orchestrator'],
@@ -209,11 +234,13 @@ def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=N
                 continue
             if automatic:
                 plan = allocation_dispatch.plan_unit(by_id[uid], policy)
+                if pin is not None:
+                    allocation_dispatch.apply_pin(plan, pin)
                 summary['allocations'][uid] = plan
                 record['allocation'] = plan
                 if plan['worker'] is None:
                     record.update(ok=False, status='deferred_allocation',
-                                  reason='no eligible parallel worker in refreshed allocation')
+                                  reason=plan.get('pin_blocked') or 'no eligible parallel worker in refreshed allocation')
                     summary['deferred'].append(dict(record))
                     results.append(record)
                     continue

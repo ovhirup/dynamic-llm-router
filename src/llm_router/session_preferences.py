@@ -316,9 +316,11 @@ def _explanation(decision):
 
 
 def resolve_orchestrator(policy, explicit=None, role=None, *, reason=None, confirm=None, env=None,
-                         selection_result=None, now=None, persist=True, force_confirmation=False, one_off=False):
+                         selection_result=None, now=None, persist=True, force_confirmation=False, one_off=False,
+                         defer=False):
     """one_off: an explicit flag applies to this job only; it is logged as an override and leaves
-    the saved current orchestrator unchanged."""
+    the saved current orchestrator unchanged. defer: confirm now but log nothing; the caller passes the
+    result to record_orchestrator once its own checks pass (#212), so a refused job records no switch."""
     setup = _setup(policy, role)
     if setup is None and explicit is None:
         return preview(policy, role=role, env=env, reason=reason)
@@ -326,9 +328,8 @@ def resolve_orchestrator(policy, explicit=None, role=None, *, reason=None, confi
     decision = preview(policy, explicit, role, env=env, current=_saved_current(policy),
                        selection_result=captured, reason=reason)
     if one_off and explicit is not None:
-        path, _ = _append(policy, dict(decision, event='orchestrator_override', reason=decision['override_reason']), now)
-        decision.update(confirmed=True, switched=False, audit_path=path, persisted=True)
-        return security.redact_obj(decision)
+        decision.update(confirmed=True, switched=False, pending_event='orchestrator_override')
+        return _finish(policy, decision, defer, now)
     if force_confirmation and decision['orchestrator'] != decision['current']:
         decision.update(proposed=decision['orchestrator'], orchestrator=decision['current'], confirmation_required=True)
     if not persist:
@@ -349,12 +350,37 @@ def resolve_orchestrator(policy, explicit=None, role=None, *, reason=None, confi
             decision['reason'] += '; kept current'
     elif not decision['confirmation_required']:
         decision['confirmed'] = True  # explicit/saved policy is prior user consent
-    event = dict(decision, event='orchestrator_decision')
+    decision['pending_event'] = 'orchestrator_decision'
     if setup is None and explicit is not None:
+        decision['pending_reason'] = decision['override_reason']
+    return _finish(policy, decision, defer, now)
+
+
+def _finish(policy, decision, defer, now):
+    if defer:
+        decision.update(deferred=True, persisted=False)
+        return security.redact_obj(decision)
+    return record_orchestrator(policy, decision, now)
+
+
+def record_orchestrator(policy, decision, now=None):
+    """Append a confirmed-or-kept decision from resolve_orchestrator(defer=True) to the decision log."""
+    decision = deepcopy(decision)
+    kind = decision.pop('pending_event', None)
+    reason = decision.pop('pending_reason', None)
+    decision.pop('deferred', None)
+    if kind is None:
+        return decision
+    event = dict(decision, event=kind)
+    if kind == 'orchestrator_override':
         event['reason'] = decision['override_reason']
+    elif reason is not None:
+        event['reason'] = reason
     path, recorded = _append(policy, event, now)
-    decision.update(orchestrator=recorded['orchestrator'], current=recorded['previous'],
-                    switched=recorded['switched'], audit_path=path, persisted=True)
+    if kind == 'orchestrator_decision':
+        decision.update(orchestrator=recorded['orchestrator'], current=recorded['previous'],
+                        switched=recorded['switched'])
+    decision.update(audit_path=path, persisted=True)
     return security.redact_obj(decision)
 
 

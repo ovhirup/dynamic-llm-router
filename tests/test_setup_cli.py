@@ -33,6 +33,14 @@ def fragment(mode='always_ask', preferred='grok-bot', workers=('codex', 'claude'
                          switch_policy=merged['setup']['switch_policy'], **overrides)
 
 
+def accepted_job(*args, **kwargs):
+    """A run_job stand-in whose checks pass, so it records the deferred decision like the real one."""
+    pending = kwargs.get('orchestrator_decision')
+    if pending is not None and kwargs.get('record_decision'):
+        pending = kwargs['record_decision'](pending)
+    return {'ok': True, 'status': 'committed', 'orchestrator_decision': pending}
+
+
 class SetupCliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -214,9 +222,36 @@ class SetupCliTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env or {}), \
                 mock.patch.object(cli, '_interactive', return_value=tty), \
                 mock.patch('builtins.input', side_effect=read), \
-                mock.patch.object(job_dispatch, 'run_job', return_value={'ok': True, 'status': 'committed'}) as run_job:
+                mock.patch.object(job_dispatch, 'run_job', side_effect=accepted_job) as run_job:
             code, output, errors = run(['run-job', '--repo', str(self.base), '--task-file', str(task), *extra])
-        return code, run_job.call_args.kwargs['orchestrator_decision'], prompts, errors
+        recorded = json.loads(output).get('orchestrator_decision') if code == 0 else None
+        return code, recorded or run_job.call_args.kwargs['orchestrator_decision'], prompts, errors
+
+    def test_refused_job_logs_no_orchestrator_switch_regression_212(self):
+        self.write_profile(preferred='grok-bot')
+        task = self.base / 'task.md'
+        task.write_text('# t\n')
+        with mock.patch.dict(os.environ, {'CODEX_THREAD_ID': 't'}), \
+                mock.patch.object(cli, '_interactive', return_value=True), \
+                mock.patch('builtins.input', return_value='yes'):
+            code, output, _ = run(['run-job', '--repo', str(self.base / 'missing'), '--task-file', str(task)])
+        self.assertEqual(code, 3)
+        self.assertIn('refused', json.loads(output))
+        self.assertEqual([e for e in self.audit() if e['event'].startswith('orchestrator')], [])
+
+    def test_units_run_honours_the_coder_orchestrator_pin(self):
+        from llm_router import wave_runner
+        self.write_profile(preferred='grok-bot', orchestrator_overrides={
+            'roles': {'coder': {'orchestrator': 'cli', 'reason': 'batches run from the terminal'}}})
+        units = self.base / 'units.json'
+        units.write_text(json.dumps([{'id': 'a', 'prompt': 'p', 'scope': ['a/']}]))
+        with mock.patch.object(wave_runner, 'run_batch', return_value={'ok': True}) as run_batch:
+            code, _, _ = run(['units', 'run', '--repo', str(self.base), '--units-file', str(units)])
+        self.assertEqual(code, 0)
+        pending = run_batch.call_args.kwargs['orchestrator_decision']
+        self.assertEqual((pending['orchestrator'], pending['source']), ('cli', 'role_pin'))
+        self.assertTrue(callable(run_batch.call_args.kwargs['record_decision']))
+        self.assertEqual(self.audit(), [])  # logged by run_batch only after its checks pass
 
     def test_caller_is_proposed_but_not_switched_without_a_terminal(self):
         self.write_profile(preferred='grok-bot')

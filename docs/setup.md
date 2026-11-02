@@ -71,6 +71,13 @@ is disabled in setup is refused before any work starts. A pin to Grok Bot is a m
 launch, so automatic allocation still runs. Grok Bot always sorts last among enabled workers; to use it
 earlier, pin it for a role.
 
+`units run` honours the same pins. Units are allocated as `coder` work, so the coder pin (else the default
+pin) is applied to every automatically allocated unit, both when the batch is planned and when each unit
+is re-planned before it runs. A pinned worker that fails a gate leaves its unit deferred with
+`pinned worker X not eligible: <reason>`; it never falls back to another worker. An explicit assignment
+(`--assign-file` or an inline `assign`) wins over the pin. The pin is logged once per batch, after the
+units and assignment checks pass. A coder orchestrator pin applies to the batch's orchestrator.
+
 A per-job `--orchestrator` applies to that job only: it is logged, but does not change the saved current
 orchestrator (use `orchestrator switch` for that). `cli` and `aider-ollama` as orchestrators need a setup
 profile.
@@ -92,6 +99,8 @@ live #208 usage snapshot: remaining percentage per window, reset times and banke
 terminal; otherwise, or if you press Ctrl-D/Ctrl-C, the current orchestrator is kept and the proposal is
 recorded as pending. Every decision, switched or not, is
 appended to the decision log with its reason, and the job summary keeps an `orchestrator_decision`.
+For `run-job` and `units run` the question is asked up front, but the decision is logged only after the
+repo, task, branch and units checks pass, so a refused job never records a switch.
 
 Change it any time:
 
