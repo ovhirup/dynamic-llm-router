@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import agent_map, alerts, brain, config, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, triage
+from . import agent_map, alerts, brain, config, feedback, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, triage
 from . import task_dispatch as td
 
 Refused = td.Refused
@@ -425,7 +425,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
                'risk_tier': 'medium', 'approval_required': True,
                'attempts': [], 'workers': [], 'worktree_state': None, 'branch_state': None,
                'main_checkout_untouched': None, 'handoffs': [], 'warnings': [],
-               'review_required': False, 'review': None}
+               'review_required': False, 'review': None, 'task_class': task_class}
     if role is not None:
         summary['role'] = role
     if orchestrator_decision is not None:
@@ -473,6 +473,11 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
         summary['lesson_learned'] = learned
     summary['finished_at'] = td.now_local(policy).isoformat(timespec='seconds')
     summary = security.redact_obj(summary)
+    try:  # outcome feedback: a scorecard write never fails the job
+        feedback.record_job_feedback(policy, summary, task_class)
+    except Exception as error:
+        summary['warnings'].append(f'scorecard update failed: {type(error).__name__}: '
+                                   f'{security.redact(str(error))[:200]}')
     jobs_dir = _path(policy, 'jobs_dir', 'logs/jobs')
     jobs_dir.mkdir(parents=True, exist_ok=True)
     (jobs_dir / f'{job_id}.json').write_text(json.dumps(summary, indent=2))

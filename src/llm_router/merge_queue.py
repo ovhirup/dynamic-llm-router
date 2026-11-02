@@ -8,7 +8,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 
-from . import config, task_dag
+from . import config, feedback, task_dag
 from . import unit_worktrees as uw
 from .job_dispatch import Refused, RepoLock, _git, _path, detect_test_cmd, repo_settings, run_tests
 
@@ -156,6 +156,7 @@ def record_review(batch_id, unit_id, verdict, notes='', policy=None, reviewer=No
         _status(record)
         queue['updated_at'] = _now()
         uw._save(path, queue)
+    feedback.record_review_feedback(policy, record)
     return record
 
 
