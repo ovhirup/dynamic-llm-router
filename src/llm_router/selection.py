@@ -284,7 +284,14 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
     grok_budget, grok_verdict, grok_why = week_curve.gate(policy, now, grok_bot_evidence)
     grok_family = week_curve.pool_members(policy)
     paced = grok_family if grok_verdict != week_curve.FIRST_FIT else set()
+    enabled = None
+    if 'setup' in policy:
+        from . import setup_profile
+        enabled = set(setup_profile.validate_setup(policy['setup'])['enabled_workers'])
     for worker in order:
+        if enabled is not None and worker not in enabled:
+            reasons[worker] = 'setup_disabled'
+            continue
         if worker == config.ORCHESTRATOR:
             reasons[worker] = 'orchestrator_fallback'
             eligible.append(worker)
@@ -386,3 +393,24 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
 def read_meter(policy, worker, now=None, io=None):
     """A forced worker reads only its own meter (fresh cache, else one live read)."""
     return quota_service.read_meter(policy, worker, now=now, io=io)
+
+
+def select_for_worker(task_chars, worker, policy=None, role=None, **kwargs):
+    """Allocate one explicit/pinned candidate through every ordinary hard gate.
+
+    Only that worker's meter is consulted. Preference fit may be overridden, but
+    the allocator's judge/advisor local prohibition and all quota/reserve gates
+    remain authoritative. Grok Bot is only a manual handback candidate.
+    """
+    policy = policy or config.load_policy()
+    copied = deepcopy(policy)
+    config.materialise_workers(copied)
+    if worker not in config.known_workers(copied):
+        raise config.ConfigError('unknown worker override')
+    if config.blocked_worker(copied, worker):
+        raise config.ConfigError('worker override is disabled or banned')
+    copied['worker_order'] = [worker]
+    if role is not None:
+        copied.setdefault('role_order', {})[role] = [worker]
+    kwargs.pop('task_class', None)
+    return select(task_chars, policy=copied, role=role, task_class=None, **kwargs)

@@ -79,7 +79,35 @@ def deep_merge(base, override):
 
 
 def load_user_config(path=None):
-    path = Path(path) if path else config_file()
+    """An explicit path or $LLM_ROUTER_CONFIG is read alone; otherwise a saved setup profile is
+    layered over the legacy config.json, which is read but never rewritten."""
+    from . import setup_profile
+    resolved = setup_profile.preferred_config_path(path)
+    if resolved == setup_profile.profile_path() and not path and not os.environ.get('LLM_ROUTER_CONFIG'):
+        return _layer_setup(_read_config(config_file()), _read_config(resolved))
+    return _read_config(resolved)
+
+
+def _layer_setup(legacy, setup):
+    """Setup chooses candidates, but the user's bans, disabled meters and unmetered list still hold."""
+    merged = deep_merge(legacy, setup)
+    never = set(legacy.get('never') or [])
+    if never:
+        if isinstance(merged.get('worker_order'), list):
+            merged['worker_order'] = [w for w in merged['worker_order'] if w not in never]
+        for key in ('class_order', 'role_order'):
+            for name, order in (merged.get(key) or {}).items():
+                if isinstance(order, list):
+                    merged[key][name] = [w for w in order if w not in never]
+    for name, opts in (legacy.get('quota') or {}).items():
+        if isinstance(opts, dict) and opts.get('enabled') is False and isinstance(merged['quota'].get(name), dict):
+            merged['quota'][name]['enabled'] = False
+    if 'unmetered_workers' in setup and isinstance(legacy.get('unmetered_workers'), list):
+        merged['unmetered_workers'] = list(dict.fromkeys(legacy['unmetered_workers'] + setup['unmetered_workers']))
+    return merged
+
+
+def _read_config(path):
     try:
         data = json.loads(path.read_text())
     except FileNotFoundError:
@@ -100,14 +128,19 @@ def known_workers(policy):
 
 
 def worker_order(policy, task_class=None):
-    """class_order.<task_class> (grok-bot appended last) when a class is given, else flat worker_order."""
+    """Class/default candidates, with the opt-in setup worker allowlist applied last."""
     if task_class is None:
-        return list(policy['worker_order'])
-    if task_class not in TASK_CLASSES:
-        raise ConfigError(f'unknown task class {task_class!r}: use one of {", ".join(TASK_CLASSES)}')
-    order = [w for w in (policy.get('class_order') or {}).get(task_class) or policy['worker_order']
-             if w != ORCHESTRATOR]
-    return order + [ORCHESTRATOR]
+        order = list(policy['worker_order'])
+    else:
+        if task_class not in TASK_CLASSES:
+            raise ConfigError(f'unknown task class {task_class!r}: use one of {", ".join(TASK_CLASSES)}')
+        order = [w for w in (policy.get('class_order') or {}).get(task_class) or policy['worker_order']
+                 if w != ORCHESTRATOR] + [ORCHESTRATOR]
+    if 'setup' in policy:
+        from . import setup_profile
+        enabled = setup_profile.validate_setup(policy['setup'])['enabled_workers']
+        order = [worker for worker in order if worker in enabled]
+    return order
 
 
 def _validate_order(policy, label, order):
@@ -132,6 +165,10 @@ def _validate_order(policy, label, order):
 
 def blocked_worker(policy, name):
     from . import security
+    if 'setup' in policy:
+        from . import setup_profile
+        if name not in setup_profile.validate_setup(policy['setup'])['enabled_workers']:
+            return True
     if name in (policy.get('never') or []):
         return True
     argv = policy['run_task']['commands'].get(name, [])
@@ -295,6 +332,9 @@ def materialise_workers(policy):
 
 def validate(policy):
     from . import quota_service, security
+    if 'setup' in policy:
+        from . import setup_profile
+        setup_profile.validate_setup(policy['setup'])
     materialise_workers(policy)
     never = policy.get('never') or []
     if not isinstance(never, list) or not all(isinstance(n, str) for n in never):

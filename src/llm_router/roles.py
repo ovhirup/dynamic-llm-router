@@ -58,7 +58,13 @@ def role_order(policy, role):
     order = list(custom) if isinstance(custom, list) and custom else list(DEFAULT_ROLE_ORDER[role])
     if role in NEVER_LOCAL_ROLES:
         order = [w for w in order if w not in ('developer', 'aider-ollama', 'local', 'nativ')]
-    if config.ORCHESTRATOR not in order:
+    if 'setup' in (policy or {}):
+        from . import setup_profile
+        enabled = setup_profile.validate_setup(policy['setup'])['enabled_workers']
+        order = [worker for worker in order if worker in enabled]
+        if config.ORCHESTRATOR in enabled and config.ORCHESTRATOR not in order:
+            order.append(config.ORCHESTRATOR)
+    elif config.ORCHESTRATOR not in order:
         order.append(config.ORCHESTRATOR)
     return order
 
@@ -73,12 +79,14 @@ def select_for_role(role, policy=None, eligible=None, meters=None, cached_only=T
         meters = meters if meters is not None else (sel.get('meters') or {})
     else:
         meters = meters or {}
-    eligible_set = set(eligible) | {config.ORCHESTRATOR}
+    profile = 'setup' in policy
+    eligible_set = set(eligible) | (set() if profile else {config.ORCHESTRATOR})
     threshold = ((policy.get('run_task') or {}).get('pacing') or {}).get('refuse_full_percent', 85)
     candidates = []
     for worker in order:
         if worker == config.ORCHESTRATOR:
-            candidates.append(worker)
+            if not profile or (worker in eligible_set and not config.blocked_worker(policy, worker)):
+                candidates.append(worker)
             continue
         if config.blocked_worker(policy, worker):
             continue
@@ -88,13 +96,14 @@ def select_for_role(role, policy=None, eligible=None, meters=None, cached_only=T
         if type(used) in (int, float) and used >= threshold:
             continue
         candidates.append(worker)
-    chosen = candidates[0] if candidates else config.ORCHESTRATOR
+    chosen = candidates[0] if candidates else None if profile else config.ORCHESTRATOR
     return {
         'role': role,
         'worker': chosen,
         'candidates': candidates,
         'role_order': order,
-        'reason': 'handoff_to_orchestrator' if chosen == config.ORCHESTRATOR else 'role_budget_match',
+        'reason': 'handoff_to_orchestrator' if chosen == config.ORCHESTRATOR else
+                  'no_eligible_worker' if chosen is None else 'role_budget_match',
     }
 
 
