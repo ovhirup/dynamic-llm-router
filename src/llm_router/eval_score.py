@@ -42,7 +42,10 @@ def score(outcome, expected_paths=None, weights=None):
     quality = sum(weights[k] * v for k, v in used.items()) / total if total else 0.0
     return {'case_id': outcome.get('case_id'), 'worker': outcome.get('worker'), 'passed': passed,
             'quality': round(quality, 4), 'parts': parts, 'tokens': outcome.get('tokens'),
-            'quota_percent': outcome.get('quota_percent'), 'elapsed_seconds': outcome.get('elapsed_seconds')}
+            'quota_percent': outcome.get('quota_percent'),
+            'quota_delta_status': outcome.get('quota_delta_status'),
+            'quota_delta_reason': outcome.get('quota_delta_reason'),
+            'elapsed_seconds': outcome.get('elapsed_seconds')}
 
 
 def _numbers(rows, key):
@@ -68,7 +71,11 @@ def _lower(a, b):
 
 
 def gate(baseline, candidate):
-    """Adoption verdict for candidate vs baseline aggregate metrics."""
+    """Adoption verdict for candidate vs baseline aggregate metrics.
+
+    If candidate pass rate is 0 (or there are no passing cases), the gate returns no-adopt /
+    inconclusive (`adopt: False`); speed and token cost only break ties when candidate passes.
+    """
     reasons = []
     if candidate['cases'] == 0 or candidate['cases'] != baseline['cases']:
         return {'adopt': False, 'reasons': ['case counts differ or are empty: no comparison']}
@@ -78,6 +85,9 @@ def gate(baseline, candidate):
         reasons.append('quality regressed')
     if reasons:
         return {'adopt': False, 'reasons': reasons}
+    if candidate['pass_rate'] <= EPSILON:
+        return {'adopt': False, 'verdict': 'inconclusive',
+                'reasons': ['candidate has 0% pass rate (no passing cases): inconclusive']}
     wins = []
     if candidate['pass_rate'] > baseline['pass_rate'] + EPSILON:
         wins.append('higher pass rate')

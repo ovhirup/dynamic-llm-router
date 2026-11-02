@@ -61,6 +61,22 @@ def build_parser():
     keep.add_argument('--keep', action='store_true', help='keep the worktree even on failure')
     keep.add_argument('--prune', action='store_true', help='remove the worktree even on success')
 
+    dispatch = commands.add_parser('bot-dispatch',
+                                   help='Map --class and --size to class_order, call run-job and print one JSON verdict')
+    dispatch.add_argument('--repo', required=True)
+    dispatch.add_argument('--task-file', required=True)
+    dispatch.add_argument('--class', dest='task_class', default='feature',
+                          help='task class (' + ', '.join(config.TASK_CLASSES) + '; research is refused)')
+    dispatch.add_argument('--size', choices=('draft', 'full'), default=None,
+                          help='task size (default: draft for --class draft, else full)')
+    dispatch.add_argument('--base', help='base ref (default: current HEAD of --repo)')
+    dispatch.add_argument('--branch', help='new branch name (default router/<slug>-<stamp>)')
+    dispatch.add_argument('--test-cmd', help='shell test command (default: test_cmd from repos.json)')
+    dispatch.add_argument('--worker')
+    dispatch_keep = dispatch.add_mutually_exclusive_group()
+    dispatch_keep.add_argument('--keep', action='store_true', help='keep the worktree even on failure')
+    dispatch_keep.add_argument('--prune', action='store_true', help='remove the worktree even on success')
+
     jobs = commands.add_parser('jobs', help='List recent run-job jobs and worktrees')
     jobs.add_argument('--limit', type=int, default=20)
     clean = commands.add_parser('cleanup', help='Remove old router worktrees')
@@ -115,6 +131,11 @@ def build_parser():
     replay = eval_cmds.add_parser('run', help='Replay the corpus under two policies and write the A/B report')
     replay.add_argument('--policies', required=True, help='JSON file: [baseline spec, candidate spec]')
     replay.add_argument('--corpus', help='corpus file (default: <state>/logs/eval/corpus.jsonl)')
+    replay.add_argument('--eval-set', action='store_true',
+                        help='use the packaged DLR benchmark eval set (fixed cases per task class) when no --corpus')
+    replay.add_argument('--class', dest='task_class', default=None,
+                        choices=('feature', 'bugfix', 'review', 'mechanical', 'draft'),
+                        help='only replay cases of this task class')
     replay.add_argument('--mode', choices=('offline', 'live'), default='offline')
     replay.add_argument('--fake-workers', help='offline: JSON file of per-worker fake profiles')
     replay.add_argument('--no-recorded', action='store_true',
@@ -127,6 +148,9 @@ def build_parser():
     refresh.add_argument('--once', action='store_true', help='one serial pass (what the scheduler runs)')
     refresh.add_argument('--worker')
     commands.add_parser('status', help='Meters, freshness, resets, eligibility, open alerts')
+    usage = commands.add_parser('usage', aliases=['burn-down'],
+                                help='Token burn-down dashboard: used %, remaining, reset, burn rate and next worker')
+    usage.add_argument('--json', action='store_true', dest='as_json', help='print machine-readable JSON')
     alert = commands.add_parser('alerts', help='List or acknowledge open alerts')
     alert_cmds = alert.add_subparsers(dest='alerts_command')
     acknowledge = alert_cmds.add_parser('ack')
@@ -134,6 +158,11 @@ def build_parser():
     for name in ('install-agent', 'uninstall-agent'):
         agent = commands.add_parser(name, help='macOS LaunchAgent for quota refresh (dry run unless --yes)')
         agent.add_argument('--yes', action='store_true', help='actually write/load the agent')
+
+    wd = commands.add_parser('watchdog', help='Monitor running jobs for stalls, loops, drift, or infra failures')
+    wd.add_argument('--stall-seconds', type=float, default=300, help='seconds without heartbeat/log before stalled')
+    wd.add_argument('--loop-threshold', type=int, default=3, help='repeated identical lines before looping')
+    wd.add_argument('--recover', action='store_true', help='terminate unhealthy workers and reassign to next eligible')
 
     scan = commands.add_parser('scan', help='Leak-scan a git tree (tracked + untracked, not ignored) before publishing')
     scan.add_argument('path', nargs='?', default='.')
@@ -174,7 +203,8 @@ def init_config(force=False, workers=None, never='', meters='', non_interactive=
                 dry_run=False, input_fn=input, output_fn=print, which=shutil.which, is_tty=None):
     from importlib import resources
     known = {'codex': 'codex', 'grok-build': 'grok', 'cursor': 'cursor-agent',
-             'claude': 'claude', 'aider': 'aider', 'opencode': 'opencode', 'aider-ollama': 'ollama'}
+             'claude': 'claude', 'aider': 'aider', 'opencode': 'opencode', 'aider-ollama': 'ollama',
+             'nativ': 'nativ'}
     detected = [name for name, binary in known.items() if which(binary)]
     interactive = (sys.stdin.isatty() if is_tty is None else is_tty) and not non_interactive
     split = lambda value: [v.strip() for v in value.split(',') if v.strip()] if isinstance(value, str) else list(value)
@@ -210,7 +240,7 @@ def init_config(force=False, workers=None, never='', meters='', non_interactive=
     examples = resources.files('llm_router').joinpath('examples')
     warnings = []
     for name in chosen:
-        if name in ('aider', 'aider-ollama', 'opencode'):
+        if name in ('aider', 'aider-ollama', 'opencode', 'nativ'):
             preset = json.loads(examples.joinpath('workers', name + '.json').read_text())
             fragment['workers'].update(preset['workers'])
         if name in ('codex', 'grok-build', 'cursor', 'claude'):
@@ -315,6 +345,12 @@ def main(argv=None):
         report = doctor(policy)
         _print(report)
         return 0 if report['ok'] else 1
+    if args.command == 'watchdog':
+        from . import watchdog
+        report = watchdog.check_all(policy=policy, stall_seconds=args.stall_seconds,
+                                    loop_threshold=args.loop_threshold, recover=args.recover)
+        _print(report)
+        return 0 if report['ok'] or args.recover else 1
     if args.command == 'scan':
         from . import security, task_dispatch
         terms = security.load_terms(args.terms) if args.terms else task_dispatch.private_terms(policy)
@@ -352,16 +388,30 @@ def main(argv=None):
         try:
             specs = json.loads(Path(args.policies).read_text())
             profiles = json.loads(Path(args.fake_workers).read_text()) if args.fake_workers else {}
-            cases = eval_corpus.load(args.corpus or eval_corpus.corpus_path(policy))
+            if args.eval_set and not args.corpus:
+                cases = eval_corpus.default_eval_set()
+            else:
+                cases = eval_corpus.load(args.corpus or eval_corpus.corpus_path(policy))
             report = eval_harness.run(cases, specs, mode=args.mode, profiles=profiles, policy=policy,
-                                      confirm=args.yes, use_recorded=not args.no_recorded)
+                                      confirm=args.yes, use_recorded=not args.no_recorded,
+                                      task_class=args.task_class)
         except (eval_harness.Refused, OSError, json.JSONDecodeError) as refusal:
             print(json.dumps({'ok': False, 'refused': str(refusal)}))
             return 3
         stamp = config.now_local(policy).strftime('%Y%m%d-%H%M%S')
-        _print({'gate': report['gate'], 'metrics': {name: entry['metrics'] for name, entry in report['policies'].items()},
+        _print({'gate': report['gate'], 'task_class': args.task_class, 'cases': report['cases'],
+                'metrics': {name: entry['metrics'] for name, entry in report['policies'].items()},
+                'by_class': {name: entry['by_class'] for name, entry in report['policies'].items()},
                 'skipped': len(report['skipped']), 'report': eval_harness.write_report(report, policy, stamp)})
         return 0 if report['gate']['adopt'] else 1
+    if args.command in ('usage', 'burn-down'):
+        from . import burn_down
+        report = burn_down.usage_report(policy)
+        if args.as_json:
+            _print(report)
+        else:
+            print(burn_down.render_usage_table(report))
+        return 0
     if args.command in ('quota', 'status', 'alerts', 'install-agent', 'uninstall-agent'):
         from . import alerts as alerts_module, quota_service
         if args.command == 'quota':
@@ -385,6 +435,16 @@ def main(argv=None):
             result = quota_service.uninstall_agent(policy, yes=args.yes)
         _print(result)
         return 0
+    if args.command == 'bot-dispatch':
+        from . import job_dispatch
+        result = job_dispatch.bot_dispatch(
+            args.repo, args.task_file, task_class=args.task_class, size=args.size,
+            base=args.base, branch=args.branch, test_cmd=args.test_cmd, worker=args.worker,
+            keep=True if args.keep else False if args.prune else None, policy=policy)
+        _print(result)
+        if result['action'] == 'refused':
+            return 3
+        return 0 if result['action'] in ('dispatched', 'handoff_to_orchestrator') else 1
     if args.command in ('run-job', 'jobs', 'cleanup'):
         from . import job_dispatch
         try:
