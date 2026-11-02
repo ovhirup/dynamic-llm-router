@@ -24,8 +24,8 @@ class UndoAndStaleApprovalTests(unittest.TestCase):
             'approval_ttl_hours': 24,
             'undo_window_seconds': 300,
         }
-        self.worker("open('out.txt','w').write('ok\\n')")
-        self.done = self.job(test_cmd='test -f out.txt')
+        self.worker("open('out.txt','w').write('ok\\n')", 'grok-build')
+        self.done = self.job(test_cmd='test -f out.txt', worker='grok-build')
         self.job_id = self.done['job_id']
         pr_gate.review(self.job_id, policy=self.policy, now=NOW)
 
@@ -65,8 +65,10 @@ class UndoAndStaleApprovalTests(unittest.TestCase):
 
         # 2. Branch head moves -> approval for old SHA is flagged stale
         wt = self.done['worktree']
-        git(wt, 'commit', '--allow-empty', '-m', 'second commit')
+        git(wt, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@localhost',
+            'commit', '--allow-empty', '-m', 'second commit')
         new_head = git(wt, 'rev-parse', 'HEAD')
+        self.assertNotEqual(new_head, self.done['commit'])
         stale = pr_gate.approval_status(self.policy, self.job_id, 'push', new_head,
                                         now=NOW + timedelta(minutes=5))
         self.assertFalse(stale['ok'])
