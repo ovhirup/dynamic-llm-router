@@ -44,6 +44,28 @@ def failure_reason(stderr, stdout='', limit=300):
         return line if len(line) <= limit else line[:limit - 1] + '\u2026'
     return None
 
+
+def stderr_tail(stderr, stdout='', limit=2000):
+    """Redacted last `limit` chars of a failed worker's stderr (stdout tail when stderr is empty), or None."""
+    for text in (stderr or '', stdout or ''):
+        if text.strip():
+            return security.redact(text.rstrip()[-limit:])
+    return None
+
+
+def failure_fields(attempts):
+    """failure_reason/stderr_tail/error of the last failed attempt that recorded a cause, or {}."""
+    for record in reversed(attempts or []):
+        if record.get('ok') or not (record.get('failure_reason') or record.get('stderr_tail')):
+            continue
+        reason = record.get('failure_reason')
+        tail = record.get('stderr_tail')
+        error = reason or tail.strip().splitlines()[-1]
+        worker = record.get('worker')
+        return {'failure_reason': reason, 'stderr_tail': tail,
+                'error': f'{worker}: {error}' if worker else error}
+    return {}
+
 def coding_workers(policy):
     return tuple(k for k in policy['run_task']['commands'] if not k.startswith('_'))
 
@@ -673,6 +695,9 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                 reason = failure_reason(result.get('stderr', ''), result.get('stdout', ''))
                 if reason:
                     record['failure_reason'] = reason
+                tail = stderr_tail(result.get('stderr', ''), result.get('stdout', ''))
+                if tail:
+                    record['stderr_tail'] = tail
             auth = (not record['ok'] and not quota and record.get('success_check') != 'refusal' and
                     not result['timed_out'] and
                     bool(AUTH_ERROR.search(result.get('stderr', '') + result.get('stdout', '')[-4000:])))
@@ -715,6 +740,8 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
     summary['blocked_worker_attempts'] = security.count_lines(block_log) - blocks_before
     if summary['blocked_worker_attempts']:
         summary['warnings'].append('a worker tried to start a denylisted CLI; the shim refused it')
+    if not summary.get('ok'):
+        summary.update(failure_fields(summary['attempts']))
     summary['finished_at'] = now_local(policy).isoformat(timespec='seconds')
     for record in summary['attempts']:
         used = meters.get(record['worker'], '') if record['worker'] in metered else ''

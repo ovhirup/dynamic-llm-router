@@ -402,6 +402,11 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             if after != before:
                 summary['ok'] = False
                 summary['warnings'].append('main checkout state changed during the job: review it')
+    if not summary['ok']:
+        cause = td.failure_fields(summary['attempts'])
+        for key in ('failure_reason', 'stderr_tail', 'error'):
+            if cause.get(key) and not summary.get(key):
+                summary[key] = cause[key]
     summary['hops'] = hops(summary)
     summary['finished_at'] = td.now_local(policy).isoformat(timespec='seconds')
     summary = security.redact_obj(summary)
@@ -669,6 +674,11 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
                                     'tests': tests['status'], 'stackwich': evidence,
                                     'leak_check': (result.get('leak_check') or {}).get('status'),
                                     'warnings': result.get('warnings')})
+        if not result.get('ok'):
+            cause = td.failure_fields(runs)
+            for key in ('failure_reason', 'stderr_tail'):
+                if cause.get(key):
+                    summary['attempts'][-1][key] = cause[key]
         if selected and selected not in summary['workers']:
             summary['workers'].append(selected)
         if result['ok'] and changed and tests['status'] in passing and (

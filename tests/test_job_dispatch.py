@@ -142,6 +142,24 @@ class JobTests(unittest.TestCase):
         self.assertEqual([r['worker'] for r in runs], ['codex', 'grok-build', 'cursor'])
         self.assertTrue(all(r['reason'] not in (None, 'ok') for r in runs), runs)
 
+    def test_failed_worker_exit_1_saves_root_cause_in_job_json(self):
+        # Issue #14: an exit-1 worker with stderr must not leave the job log without a reason.
+        for name in ('codex', 'grok-build'):
+            self.worker("import sys; print('loading model', file=sys.stderr); "
+                        "print('Error: model qwen2.5-coder:14b not found', file=sys.stderr); sys.exit(1)", name)
+        result = self.job(test_cmd='true')
+        self.assertFalse(result['ok'])
+        saved = json.loads((self.base / 'jobs' / f'{result["job_id"]}.json').read_text())
+        for doc in (result, saved):
+            self.assertEqual(doc['failure_reason'], 'Error: model qwen2.5-coder:14b not found')
+            self.assertIn('loading model', doc['stderr_tail'])
+            self.assertIn('not found', doc['error'])
+            for attempt in [a for a in doc['attempts'] if a.get('runs')]:
+                self.assertEqual(attempt['failure_reason'], 'Error: model qwen2.5-coder:14b not found')
+                self.assertIn('not found', attempt['stderr_tail'])
+                self.assertTrue(all(r['returncode'] == 1 and 'not found' in r['stderr_tail']
+                                    for r in attempt['runs']))
+
     def test_failed_worker_is_not_retried_in_the_next_cycle(self):
         calls = []
         def run_task(*args, **kwargs):
