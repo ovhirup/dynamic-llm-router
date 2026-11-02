@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import agent_map, alerts, brain, config, handoff, orchestrator as orch_module, retry_feedback, security, stackwich, task_dag
+from . import agent_map, alerts, brain, config, handoff, orchestrator as orch_module, retry_feedback, security, stackwich, task_dag, triage
 from . import task_dispatch as td
 
 Refused = td.Refused
@@ -410,7 +410,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
                'started_at': started.isoformat(timespec='seconds'), 'finished_at': None,
                'ok': False, 'status': None, 'commit': None, 'diff_stat': '', 'tests': [],
                'test_command': None, 'test_command_source': None, 'allow_no_tests': allow_no_tests,
-               'tests_status': None, 'leak_check': None, 'blocked_by_leak_check': False,
+               'tests_status': None, 'leak_check': None, 'blocked_by_leak_check': False, 'triage': None,
                'allowed_paths': scope, 'diff_scope': None,
                'attempts': [], 'workers': [], 'worktree_state': None, 'branch_state': None,
                'main_checkout_untouched': None, 'handoffs': [], 'warnings': [],
@@ -565,13 +565,14 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
     extra = base_instructions  # every worker writes a handoff note at checkpoints and on stop
     test_artifacts, worker_paths = set(), set()
 
-    def save_note(worker, reason, worker_note=None, tests=None, test_log=None):
+    def save_note(worker, reason, worker_note=None, tests=None, test_log=None, triage_info=None):
         """Write a handoff note (the worker's if valid, else a router one) into the job's handoffs dir."""
         note, path = handoff.checkpoint(
             policy, summary['job_id'], worktree, summary['base_sha'], worker, reason,
             changed_paths(worktree) - test_artifacts - {handoff.NOTE_FILE}, worker_note=worker_note,
             goal=task_text[:1500], test_status=(tests or {}).get('status'), test_log=test_log,
-            meter=meter(worker) if worker else None, branch=summary['branch'])
+            meter=meter(worker) if worker else None, branch=summary['branch'],
+            triage_info=triage_info or summary.get('triage'))
         summary['handoffs'].append({'path': str(path), 'worker': worker, 'source': note.get('source'),
                                     'switch_reason': reason})
         return note
@@ -625,6 +626,9 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
             summary['attempts'].append({'attempt': cycle, 'handoff_to_orchestrator': result.get('task_file')})
             return
         runs = result.get('attempts', [])
+        parsed_triage = triage.extract_from_runs(runs)
+        if parsed_triage is not None:
+            summary['triage'] = parsed_triage
         used |= {r['worker'] for r in runs if r.get('worker')}
         failed |= {r['worker'] for r in runs if r.get('worker') and not r.get('ok')}
         claude_quota = any(r.get('worker') == 'claude' and r.get('quota_error') for r in runs)
@@ -727,6 +731,7 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         summary['tests_status'] = tests['status']
         summary['attempts'].append({'attempt': cycle, 'worker': selected, 'ok': result.get('ok'),
                                     'changed': changed, 'runs': result.get('attempts'),
+                                    'triage': parsed_triage,
                                     'tests': tests['status'], 'stackwich': evidence,
                                     'leak_check': (result.get('leak_check') or {}).get('status'),
                                     'warnings': result.get('warnings')})
