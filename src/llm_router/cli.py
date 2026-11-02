@@ -174,6 +174,10 @@ def build_parser():
         agent = commands.add_parser(name, help='macOS LaunchAgent for quota refresh (dry run unless --yes)')
         agent.add_argument('--yes', action='store_true', help='actually write/load the agent')
 
+    trig = commands.add_parser('triggers', help='Proactive event triggers from GitHub issues, CI failures, and PR comments')
+    trig_cmds = trig.add_subparsers(dest='triggers_command', required=True)
+    trig_cmds.add_parser('status', help='Show trigger configuration, seen event count, and recent dispatches')
+
     wd = commands.add_parser('watchdog', help='Monitor running jobs for stalls, loops, drift, or infra failures')
     wd.add_argument('--stall-seconds', type=float, default=300, help='seconds without heartbeat/log before stalled')
     wd.add_argument('--loop-threshold', type=int, default=3, help='repeated identical lines before looping')
@@ -365,6 +369,10 @@ def main(argv=None):
         report = doctor(policy)
         _print(report)
         return 0 if report['ok'] else 1
+    if args.command == 'triggers':
+        from . import triggers
+        _print(triggers.status_report(policy))
+        return 0
     if args.command == 'watchdog':
         from . import watchdog
         report = watchdog.check_all(policy=policy, stall_seconds=args.stall_seconds,
