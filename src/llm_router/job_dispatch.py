@@ -339,11 +339,15 @@ def hops(summary):
 def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full', worker=None,
             keep=None, policy=None, run_task=td.run_task, select=None, now=None, test_runner=td.run_bounded,
             popen=subprocess.Popen, notifier=None, meter=None, task_class=None,
-            orchestrator=None, reviewer=None, allowed_paths=None):
+            orchestrator=None, reviewer=None, allowed_paths=None, role=None):
     """keep: True (--keep), False (--prune) or None (keep on success, prune on failure).
     meter(worker) -> percent used or None (default: the cached meter, never a live read).
     task_class ranks workers by class_order.<task_class> (see selection.select)."""
     policy = policy or config.load_policy()
+    if role is not None:
+        from . import roles
+        roles.role_order(policy, role)  # invalid role -> ConfigError before any worktree
+        run_task = functools.partial(run_task, role=role)
     detected_orch = orch_module.detect_orchestrator(explicit=orchestrator)
     if task_class is not None:
         config.worker_order(policy, task_class)  # unknown class -> ConfigError before any worktree
@@ -416,6 +420,8 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
                'attempts': [], 'workers': [], 'worktree_state': None, 'branch_state': None,
                'main_checkout_untouched': None, 'handoffs': [], 'warnings': [],
                'review_required': False, 'review': None}
+    if role is not None:
+        summary['role'] = role
     with RepoLock(_path(policy, 'lock_dir', 'logs/locks'), repo), _NoSleep(policy, popen):
         before = main_state(repo)
         worktree.parent.mkdir(parents=True, exist_ok=True)

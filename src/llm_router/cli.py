@@ -490,7 +490,7 @@ def main(argv=None):
                                               test_cmd=args.test_cmd, size=args.size, worker=args.worker,
                                               keep=True if args.keep else False if args.prune else None,
                                               policy=policy, task_class=args.task_class,
-                                              orchestrator=args.orchestrator)
+                                              orchestrator=args.orchestrator, role=args.role)
             elif args.command == 'jobs':
                 if getattr(args, 'live_feed', False):
                     from . import live_jobs_feed

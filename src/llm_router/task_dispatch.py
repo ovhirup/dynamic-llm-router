@@ -468,7 +468,7 @@ def run_task(*args, **kwargs):
 def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, select=None,
               runner=run_bounded, draft=developer_draft, policy=None, output_root=None,
               extra_prompt=None, stamp=None, meter=None, stackwich_cycle=1, _claude_pinned=False,
-              exclude=(), tried=(), _slots=None, handoff=None, task_class=None):
+              exclude=(), tried=(), _slots=None, handoff=None, task_class=None, role=None):
     """exclude: workers that already failed in this job (never re-run); tried: workers this job has
     already used, counted against MAX_WORKERS. handoff(record, next_worker) runs before every
     failover hop and returns the handoff text the next worker gets in its prompt.
@@ -477,6 +477,9 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
     from . import selection as selection_module
     _slots = [] if _slots is None else _slots
     policy = policy or config.load_policy()
+    if role is not None:
+        from . import roles
+        roles.role_order(policy, role)
     injected_select = select is not None
     select = select or (lambda chars, **kw: selection_module.select(chars, policy=policy, **kw))
     if task_class is not None:
@@ -497,6 +500,8 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                'diff_stat': '', 'untracked': [], 'output_path': None,
                'handoff_cleanup': 'not_applicable', 'leak_check': None,
                'blocked_by_leak_check': False, 'blocked_worker_attempts': 0}
+    if role is not None:
+        summary['role'] = role
     if worker is not None and config.blocked_worker(policy, worker):
         raise Refused(f'{worker} is in never; remove it from never to use it')
     if worker is not None and worker not in forceable(policy):
@@ -516,6 +521,12 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
     else:
         selection = select(chars, consult_cursor=True) if worker == 'cursor' else select(chars)
     meters = selection.get('meters', {})
+    if role is not None:
+        role_pick = roles.select_for_role(role, policy, selection.get('eligible', []), meters)
+        selected = set(selection.get('eligible', []))
+        candidates = [name for name in role_pick['candidates'] if name in selected]
+        selection = dict(selection, eligible=candidates,
+                         worker=candidates[0] if candidates else None, role_pick=role_pick)
     hops = [name for name in selection.get('eligible', [])
             if name not in (worker, LAST_RESORT) and name not in exclude]
     if worker == 'claude' and _claude_pinned:
@@ -525,7 +536,7 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
         order, summary['reason'] = [worker], 'forced'
     else:
         order, summary['reason'] = hops, selection.get('reason')
-    if not order and worker is None and task_class is not None and LAST_RESORT in selection.get('eligible', []):
+    if not order and worker is None and (task_class is not None or role is not None) and LAST_RESORT in selection.get('eligible', []):
         return orchestrator_handoff(policy, summary, task_path, 'no_eligible_worker', selection)
     if not order:
         raise Refused('no eligible worker: ' + str(selection.get('reason')))
