@@ -87,6 +87,28 @@ class JobTests(unittest.TestCase):
         self.assertTrue((self.base / 'jobs' / f'{result["job_id"]}.json').exists())
         self.assertIn(',run-job,', (self.base / 'ledger.csv').read_text())
 
+    def test_diff_scope_gate_blocks_extra_file_and_allows_in_scope_edits(self):
+        self.task.write_text('# Scoped task\nCreate out.txt only.\n\n## Allowed paths\n- out.txt\n- docs/\n')
+        self.worker("open('out.txt','w').write('ok\\n'); open('rogue.txt','w').write('extra\\n')")
+        before = jd.main_state(self.repo)
+        result = self.job(test_cmd='test -f out.txt')
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['status'], 'diff_out_of_scope')
+        self.assertEqual(result['reason'], 'diff_out_of_scope')
+        self.assertIsNone(result['commit'])
+        self.assertEqual(result['diff_scope']['out_of_scope'], ['rogue.txt'])
+        self.assertEqual(result['allowed_paths'], ['docs/', 'out.txt'])
+        self.assert_main_untouched(before)
+
+        # In-scope edit (including inside a declared directory) passes and commits.
+        self.worker("import pathlib; pathlib.Path('docs').mkdir(exist_ok=True); "
+                    "open('out.txt','w').write('ok\\n'); open('docs/guide.md','w').write('hi\\n')")
+        ok_res = self.job(test_cmd='test -f out.txt')
+        self.assertTrue(ok_res['ok'], ok_res)
+        self.assertEqual(ok_res['status'], 'committed')
+        self.assertEqual(ok_res['diff_scope']['status'], 'ok')
+        self.assertEqual(ok_res['diff_scope']['out_of_scope'], [])
+
     def test_retry_with_test_output_then_pass(self):
         capture = self.base / 'prompts.txt'
         self.worker("import sys; p=sys.stdin.read(); open(%r,'a').write(p+'\\n=====\\n'); "

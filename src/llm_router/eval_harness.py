@@ -116,14 +116,77 @@ def live_outcome(case, spec, base_policy, run_job, meter):
         job = run_job(case['repo'], str(task), base=case['base_sha'], worker=spec.get('worker'),
                       size=case.get('size') or 'full', keep=False, policy=policy)
     workers = job.get('workers') or []
-    spent = [meter(w) - before[w] for w in workers
-             if type(before.get(w)) in (int, float) and type(meter(w)) in (int, float)]
+    after = {w: meter(w) for w in workers}
+    spent = [after[w] - before[w] for w in workers
+             if type(before.get(w)) in (int, float) and type(after.get(w)) in (int, float)]
+    if not workers:
+        quota_delta_status = 'no_worker_ran'
+        quota_delta_reason = job.get('reason') or job.get('status') or 'no worker ran'
+    elif spent:
+        quota_delta_status = 'ok'
+        quota_delta_reason = None
+    else:
+        missing = [w for w in workers if type(before.get(w)) not in (int, float) or type(after.get(w)) not in (int, float)]
+        quota_delta_status = 'unknown'
+        quota_delta_reason = f'meter stale or unknown for {", ".join(missing)}'
     observed = eval_corpus.case_from_job(job)['baseline']
     return {'case_id': case['case_id'], 'worker': workers[-1] if workers else None,
             'tests_status': job.get('tests_status'), 'changed_paths': observed['changed_paths'],
             'tokens': observed['tokens'], 'quota_percent': round(sum(spent), 2) if spent else None,
+            'quota_delta_status': quota_delta_status, 'quota_delta_reason': quota_delta_reason,
             'elapsed_seconds': observed['elapsed_seconds'], 'reviewer_score': job.get('reviewer_score'),
             'hops': workers, 'job_id': job.get('job_id'), 'status': job.get('status')}
+
+
+def _delta(base, cand, digits=4):
+    """candidate - baseline, or None when either side is not a number."""
+    if type(base) not in (int, float) or type(cand) not in (int, float):
+        return None
+    return round(cand - base, digits)
+
+
+def _winner(base, cand):
+    """Per-case verdict: tests pass first, then quality, then fewer tokens, then less time."""
+    if base['passed'] != cand['passed']:
+        return 'candidate' if cand['passed'] else 'baseline'
+    for key, better in (('quality', 1), ('tokens', -1), ('elapsed_seconds', -1)):
+        diff = _delta(base.get(key), cand.get(key))
+        if diff:
+            return 'candidate' if diff * better > 0 else 'baseline'
+    return 'tie'
+
+
+def compare_cases(baseline_scores, candidate_scores):
+    """Side-by-side per-case comparison of two policies' score() lists (matched by case_id)."""
+    by_id = {s.get('case_id'): s for s in candidate_scores}
+    rows, counts = [], {'candidate': 0, 'baseline': 0, 'tie': 0}
+    for base in baseline_scores:
+        cand = by_id.get(base.get('case_id'))
+        if cand is None:
+            continue
+        winner = _winner(base, cand)
+        counts[winner] += 1
+        rows.append({'case_id': base.get('case_id'),
+                     'baseline_worker': base.get('worker'), 'candidate_worker': cand.get('worker'),
+                     'baseline_passed': base['passed'], 'candidate_passed': cand['passed'],
+                     'baseline_quality': base.get('quality'), 'candidate_quality': cand.get('quality'),
+                     'baseline_tokens': base.get('tokens'), 'candidate_tokens': cand.get('tokens'),
+                     'baseline_elapsed_seconds': base.get('elapsed_seconds'),
+                     'candidate_elapsed_seconds': cand.get('elapsed_seconds'),
+                     'quality_delta': _delta(base.get('quality'), cand.get('quality')),
+                     'tokens_delta': _delta(base.get('tokens'), cand.get('tokens')),
+                     'elapsed_delta': _delta(base.get('elapsed_seconds'), cand.get('elapsed_seconds')),
+                     'winner': winner})
+
+    def total(key):
+        values = [r[key] for r in rows if r[key] is not None]
+        return round(sum(values), 4) if values else None
+
+    deltas = {'passed': sum(r['candidate_passed'] for r in rows) - sum(r['baseline_passed'] for r in rows),
+              'quality': total('quality_delta'), 'tokens': total('tokens_delta'),
+              'elapsed_seconds': total('elapsed_delta')}
+    return {'cases': rows, 'wins': counts['candidate'], 'losses': counts['baseline'], 'ties': counts['tie'],
+            'deltas': deltas}
 
 
 def run(cases, specs, mode='offline', profiles=None, policy=None, confirm=False, run_job=None, meter=None,
@@ -154,6 +217,8 @@ def run(cases, specs, mode='offline', profiles=None, policy=None, confirm=False,
                                             'scores': scores}
     report['gate'] = eval_score.gate(report['policies'][specs[0]['name']]['metrics'],
                                      report['policies'][specs[1]['name']]['metrics'])
+    report['comparison'] = compare_cases(report['policies'][specs[0]['name']]['scores'],
+                                         report['policies'][specs[1]['name']]['scores'])
     return security.redact_obj(report)
 
 
@@ -162,12 +227,37 @@ def render_markdown(report):
     keys = ['cases', 'pass_rate', 'quality_mean', 'tokens_total', 'tokens_mean', 'quota_percent_mean',
             'elapsed_seconds_median', 'elapsed_seconds_mean']
     lines = [f'# Router eval: {names[0]} (baseline) vs {names[1]} ({report["mode"]})', '',
-             f'| metric | {names[0]} | {names[1]} |', '|---|---|---|']
+             f'| metric | {names[0]} | {names[1]} | Delta |', '|---|---|---|---|']
+    def cell(v):
+        if v is None:
+            return '-'
+        if type(v) is float and v.is_integer() and abs(v) >= 2:  # 57000.0 -> 57000; keep 1.0/0.0 ratios
+            v = int(v)
+        return str(v)
+
+    def signed(v):
+        return f'+{cell(v)}' if type(v) in (int, float) and v > 0 else cell(v)
     for key in keys:
         values = [report['policies'][n]['metrics'].get(key) for n in names]
-        lines.append(f'| {key} | ' + ' | '.join('-' if v is None else str(v) for v in values) + ' |')
+        lines.append(f'| {key} | ' + ' | '.join(cell(v) for v in values) + f' | {signed(_delta(*values))} |')
     verdict = 'ADOPT' if report['gate']['adopt'] else 'KEEP BASELINE'
     lines += ['', f'**Gate: {verdict}** ({"; ".join(report["gate"]["reasons"])})', '']
+    comparison = report.get('comparison')
+    if comparison:
+        deltas = comparison['deltas']
+        lines += ['## Per-case comparison', '',
+                  f'Candidate wins {comparison["wins"]}, losses {comparison["losses"]}, ties {comparison["ties"]} '
+                  f'(deltas: passed {signed(deltas["passed"])}, quality {signed(deltas["quality"])}, '
+                  f'tokens {signed(deltas["tokens"])}, elapsed_seconds {signed(deltas["elapsed_seconds"])})', '',
+                  '| case_id | baseline worker | pass | quality | tokens | time (s) '
+                  '| candidate worker | pass | quality | tokens | time (s) | winner |',
+                  '|---|---|---|---|---|---|---|---|---|---|---|---|']
+        for row in comparison['cases']:
+            sides = [[row[f'{side}_worker'], 'yes' if row[f'{side}_passed'] else 'no', row[f'{side}_quality'],
+                      row[f'{side}_tokens'], row[f'{side}_elapsed_seconds']] for side in ('baseline', 'candidate')]
+            lines.append(f'| {row["case_id"]} | ' + ' | '.join(cell(v) for v in sides[0] + sides[1])
+                         + f' | {row["winner"]} |')
+        lines.append('')
     if report['skipped']:
         lines.append(f'Skipped {len(report["skipped"])} non-replayable case(s).')
     return '\n'.join(lines) + '\n'
