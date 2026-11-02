@@ -1,0 +1,16 @@
+{
+  "name": "figma-context",
+  "capabilities": [
+    "context"
+  ],
+  "transport": "mcp_stdio",
+  "command": [
+    "figma-developer-mcp",
+    "--stdio"
+  ],
+  "description": "Opt-in Framelink Figma MCP design context plugin for UI/design tasks (SwiftUI, React, CSS).",
+  "enabled": false,
+  "permissions": [
+    "read_design_context"
+  ]
+}
