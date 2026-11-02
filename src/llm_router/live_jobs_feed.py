@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 import re
 
-from . import config, security, task_dispatch as td
+from . import allocation_dispatch, config, security, task_dispatch as td
 
 RECENT_WINDOW_SECONDS = 30 * 60
 STALE_IN_FLIGHT_SECONDS = 6 * 3600
@@ -164,7 +164,11 @@ def build_live_jobs_feed(policy=None, now=None):
         state = 'done' if (ok or status == 'committed') else 'failed'
         log_path = info['latest_log'] or str(path)
         hops = data.get('hops') or info['hops']
+        allocation = (allocation_dispatch.allocation_fields(data)
+                      or allocation_dispatch.read_sidecar(out_dir, stamp))
+        allocation.pop('_allocation_attempt', None)
         all_jobs.append({
+            **allocation,
             'job_id': jid,
             'repo': Path(str(data.get('repo') or (match.group('repo') if match else jid))).name,
             'task': data.get('task') or jid,
@@ -202,14 +206,22 @@ def build_live_jobs_feed(policy=None, now=None):
             except OSError:
                 state = 'testing'
         elapsed = round(max(0.0, (now_dt - started_dt).total_seconds()), 1) if started_dt else None
+        allocation = allocation_dispatch.read_sidecar(out_dir, stamp)
+        allocation_attempt = allocation.pop('_allocation_attempt', 0)
+        if allocation and allocation['allocation']['worker']:
+            chosen = allocation['allocation']['worker']
+            info['worker'] = chosen
+            if not info['workers'] or info['workers'][-1] != chosen:
+                info['workers'].append(chosen)
         all_jobs.append({
+            **allocation,
             'job_id': wt.name,
             'repo': repo_name,
             'task': wt.name,
             'worker': info['worker'],
             'workers': info['workers'],
             'hops': info['hops'],
-            'attempt': max(1, info['attempt']),
+            'attempt': max(1, info['attempt'], allocation_attempt),
             'started_at': started_dt.isoformat(timespec='seconds') if started_dt else None,
             'finished_at': None,
             'elapsed_seconds': elapsed,

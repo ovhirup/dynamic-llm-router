@@ -342,7 +342,96 @@ class CliTests(EvalFixture):
         self.assertEqual(code, 3)
         self.assertIn('--yes', json.loads(out.getvalue())['refused'])
 
+    def test_eval_size_override_forces_draft_and_records_in_report(self):
+        seen_sizes = []
 
+        def fake_run_job(repo, task_file, **kwargs):
+            seen_sizes.append(kwargs.get('size'))
+            return {
+                'job_id': f'draft-{len(seen_sizes)}', 'workers': ['cursor'], 'tests_status': 'passed',
+                'status': 'committed', 'diff_stat': ' out.txt | 1 +\n 1 file changed',
+                'started_at': '2026-10-31T10:00:00+00:00', 'finished_at': '2026-10-31T10:00:30+00:00',
+                'attempts': [{'worker': 'cursor', 'runs': [{'worker': 'cursor', 'tokens': 300}]}],
+            }
+
+        report = eval_harness.run(self.cases, self.specs, mode='live', confirm=True, policy=self.policy,
+                                  run_job=fake_run_job, meter=lambda w: None, size='draft')
+        self.assertEqual(report['size_override'], 'draft')
+        self.assertEqual(seen_sizes, ['draft', 'draft', 'draft', 'draft'])
+        self.assertIn('size=draft', eval_harness.render_markdown(report))
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(['eval', 'run', '--size', 'draft', '--policies', str(FIXTURES / 'policies.json'),
+                             '--corpus', str(self.corpus), '--fake-workers', str(FIXTURES / 'fake_workers.json')])
+        self.assertEqual(code, 0)
+        cli_result = json.loads(out.getvalue())
+        self.assertEqual(cli_result['size_override'], 'draft')
+        saved = json.loads(Path(cli_result['report']['json']).read_text())
+        self.assertEqual(saved['size_override'], 'draft')
+
+
+class ConfigGateTests(EvalFixture):
+    """#66: a routing/config change is adopted only if it beats the baseline in the harness."""
+    BASELINE = {'worker_order': ['grok-build', 'codex']}
+    REGRESS = {'worker_order': ['grok-build']}           # grok-build alone fails: pass rate drops
+    TIE = {'worker_order': ['grok-build', 'codex']}       # same routing: no strict improvement
+    BEATS = {'worker_order': ['cursor', 'codex']}         # cheaper, faster, same pass rate
+
+    def setUp(self):
+        super().setUp()
+        self.config_path = Path(self.tmp.name) / 'config.json'
+        self.original = json.dumps(self.BASELINE, indent=2) + '\n'
+        self.config_path.write_text(self.original)
+
+    def _write(self, name, data):
+        path = Path(self.tmp.name) / name
+        path.write_text(json.dumps(data))
+        return path
+
+    def test_gate_config_change_returns_merged_policy_only_on_adopt(self):
+        baseline = load_policy(**self.BASELINE)
+        result = eval_harness.gate_config_change(self.cases, baseline, self.BEATS, profiles=self.profiles)
+        self.assertTrue(result['adopted'])
+        self.assertEqual(result['gate'], result['report']['gate'])
+        self.assertEqual(result['merged_policy']['worker_order'], ['cursor', 'codex'])
+        result = eval_harness.gate_config_change(self.cases, baseline, self.TIE, profiles=self.profiles)
+        self.assertFalse(result['adopted'])
+        self.assertIsNone(result['merged_policy'])
+        with self.assertRaises(eval_harness.Refused):
+            eval_harness.gate_config_change(self.cases, baseline, {}, profiles=self.profiles)
+
+    def test_regressing_or_tied_candidate_is_refused_and_config_untouched(self):
+        for candidate in (self.REGRESS, self.TIE):
+            with self.assertRaises(eval_harness.Refused) as caught:
+                eval_harness.apply_if_beats_baseline(self.config_path, candidate, self.cases, profiles=self.profiles)
+            self.assertFalse(caught.exception.result['adopted'])
+            self.assertEqual(self.config_path.read_text(), self.original)
+            self.assertEqual(list(Path(self.tmp.name).glob('config.json.bak-*')), [])
+
+    def test_candidate_that_beats_baseline_is_written_with_backup(self):
+        result = eval_harness.apply_if_beats_baseline(self.config_path, self.BEATS, self.cases, profiles=self.profiles)
+        self.assertTrue(result['adopted'])
+        self.assertEqual(json.loads(self.config_path.read_text()), {'worker_order': ['cursor', 'codex']})
+        self.assertEqual(Path(result['backup']).read_text(), self.original)
+
+    def test_cli_eval_apply_exit_codes(self):
+        common = ['--corpus', str(self.corpus), '--fake-workers', str(FIXTURES / 'fake_workers.json')]
+        for name, candidate in (('regress.json', self.REGRESS), ('tie.json', self.TIE)):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = cli.main(['--config', str(self.config_path), 'eval', 'apply',
+                                 str(self._write(name, candidate))] + common)
+            self.assertEqual(code, 1)
+            self.assertFalse(json.loads(out.getvalue())['adopted'])
+            self.assertEqual(self.config_path.read_text(), self.original)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(['--config', str(self.config_path), 'eval', 'apply',
+                             str(self._write('beats.json', self.BEATS))] + common)
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(out.getvalue())['adopted'])
+        self.assertEqual(json.loads(self.config_path.read_text())['worker_order'], ['cursor', 'codex'])
 CLASSES = {'feature', 'bugfix', 'review', 'mechanical', 'draft'}
 
 
@@ -402,6 +491,7 @@ class EvalSetCliTests(EvalFixture):
     def test_unknown_class_is_rejected(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             cli.main(['eval', 'run', '--policies', 'x.json', '--eval-set', '--class', 'nope'])
+
 
 
 if __name__ == '__main__':

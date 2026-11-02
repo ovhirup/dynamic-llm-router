@@ -1,12 +1,13 @@
-"""Worker selection: walk worker_order, read each meter (fresh cache first), pick the first eligible.
+"""Worker selection: validate live evidence, then score eligible allowances deterministically.
 
 Rules (same safety model for every worker):
 - A metered worker is eligible only with fresh evidence whose every required window is below its
   usage_threshold_percent. Unknown, stale, malformed or future-dated evidence means ineligible.
-- consult="fallback" workers are read only when no earlier worker is eligible (slow screen reads).
+- consult="fallback" workers use fresh cache at any rank; live reads remain fallback-only.
 - Workers in `never` are never candidates. Unmetered workers are eligible only when listed in
   unmetered_workers. `developer` is eligible only for draft-size tasks when enabled with an endpoint.
 """
+from copy import deepcopy
 from datetime import datetime, timezone
 import http.client
 import json
@@ -254,7 +255,7 @@ def health_reason(policy, worker, health_opener=None, timeout=3):
 
 def select(task_chars, policy=None, cached_only=False, now=None, io=None, consult_all=False,
            consult_cursor=False, threshold_overrides=None, claude_profile_loader=None, cooldowns=None,
-           task_class=None, grok_bot_evidence=None, health_opener=None):
+           task_class=None, grok_bot_evidence=None, health_opener=None, role=None):
     """Return {'worker', 'reason', 'eligible', 'meters', 'reasons', 'sources', 'versions', ...}.
 
     Workers cooling down after a quota error (see cooldown.py) are skipped until their reset.
@@ -267,6 +268,9 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
     /v1/models probes. A down server or a missing model makes them ineligible.
     """
     policy = policy or config.load_policy()
+    if role is not None:
+        from . import roles
+        roles.role_order(policy, role)
     clock_injected = now is not None
     now = now or datetime.now(timezone.utc)
     cooled = cooldown.active(now, cooldowns)
@@ -275,6 +279,7 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
     unmetered = set(policy.get('unmetered_workers') or [])
     overrides = threshold_overrides or {}
     eligible, meters, reasons, sources, versions, warnings = [], {}, {}, {}, {}, {}
+    evidences = {}
     order = config.worker_order(policy, task_class)
     grok_budget, grok_verdict, grok_why = week_curve.gate(policy, now, grok_bot_evidence)
     grok_family = week_curve.pool_members(policy)
@@ -316,14 +321,28 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
             continue
         consult = quota.get('consult', 'always')
         # a paced grok-family worker is not a first choice, so it must not stop a fallback read
-        if consult == 'fallback' and any(w not in paced for w in eligible) and not consult_all and not (consult_cursor and worker == 'cursor'):
-            reasons[worker] = 'not_consulted'
-            continue
-        observation, sources[worker] = _observation(policy, worker, io, now, cached_only)
+        cache_only_fallback = (consult == 'fallback' and any(w not in paced for w in eligible)
+                               and not consult_all and not (consult_cursor and worker == 'cursor'))
+        try:
+            observation, sources[worker] = _observation(
+                policy, worker, io, now, cached_only or cache_only_fallback)
+        except (TypeError, ValueError, KeyError, AttributeError):
+            observation, sources[worker] = None, 'cache'
         if sources[worker] == 'live' and not clock_injected:
             now = datetime.now(timezone.utc)  # a live read is stamped after `now`; don't call it future-dated
         evidence = quota_service.evidence_of(observation)
-        reason = evidence_reason(worker, evidence, now)
+        try:
+            validate_evidence(worker, evidence)
+        except (SelectionError, TypeError, ValueError, KeyError, AttributeError):
+            evidence = None
+        else:
+            evidences[worker] = deepcopy(evidence)
+        try:
+            reason = evidence_reason(worker, evidence, now)
+        except (SelectionError, TypeError, ValueError, KeyError, AttributeError):
+            reason = 'quota_unknown'
+        if cache_only_fallback and reason not in ('quota_available', 'quota_exhausted'):
+            reason = 'not_consulted'
         meters[worker] = peak(evidence) if reason in ('quota_available', 'quota_exhausted') else None
         if isinstance(observation, dict):
             versions[worker] = observation.get('cli_version')
@@ -338,11 +357,24 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
             eligible.append(worker)
     if grok_why:
         reasons.update({w: grok_why for w in eligible if w in grok_family})
-    eligible = week_curve.pace(eligible, grok_family, grok_verdict, LOCAL_WORKERS)
+    from . import allocation_policy, usage_snapshot
+    effective_policy = deepcopy(policy)
+    for name, limit in overrides.items():
+        effective_policy.setdefault('quota', {}).setdefault(name, {})['usage_threshold_percent'] = limit
+    if 'developer' in eligible:
+        # Developer's existing draft-only gate is intrinsically unmetered.
+        effective_policy['unmetered_workers'] = list(dict.fromkeys(
+            list(effective_policy.get('unmetered_workers') or []) + ['developer']))
+    snapshot = usage_snapshot.build_snapshot(
+        effective_policy, now, order, eligible, reasons, evidences,
+        pacing={'members': sorted(grok_family), 'verdict': grok_verdict})
+    allocation = allocation_policy.allocate(snapshot, role)
+    eligible = allocation['order']
     worker = eligible[0] if eligible else None
     reason = ('handoff_to_orchestrator' if worker == config.ORCHESTRATOR else 'preferred_eligible_worker' if worker
               else 'no_eligible_worker' if order else 'no_workers_configured')
     return {'worker': worker, 'reason': reason, 'task_class': task_class,
+            'allocation': allocation, 'usage_snapshot': snapshot, 'evidences': evidences,
             'hint': None if order else 'run llm-router init',
             'eligible': eligible, 'meters': meters, 'reasons': reasons, 'sources': sources,
             'cli_versions': versions, 'version_warnings': warnings,

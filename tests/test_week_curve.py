@@ -21,7 +21,8 @@ def at(days, hours=0):
 def fresh(worker, used, now):
     return {'source_worker': worker, 'required_windows': ['weekly'], 'windows': {'weekly': {
         'percent_used': used, 'observed_at': (now - timedelta(minutes=1)).isoformat(),
-        'expires_at': (now + timedelta(hours=1)).isoformat(), 'reset_at': RESET.isoformat()}}}
+        'expires_at': (now + timedelta(hours=1)).isoformat(),
+        'reset_at': (RESET if now < RESET else now + timedelta(days=7)).isoformat()}}}
 
 
 def fake_io(used, now):

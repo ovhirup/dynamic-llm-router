@@ -13,9 +13,12 @@ Modes:
 
 Gate (eval_score.gate): a routing/config change is adopted only if it beats the baseline here.
 """
+import copy
 import hashlib
 import json
+import os
 import re
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -102,19 +105,20 @@ def fake_outcome(case, spec, profiles, use_recorded=True):
                 hops=hops)
 
 
-def live_outcome(case, spec, base_policy, run_job, meter):
+def live_outcome(case, spec, base_policy, run_job, meter, size=None):
     """Run the case through run-job once under `spec` and turn the job summary into an outcome."""
     policy = config.deep_merge(base_policy, spec.get('config') or {})
     if spec.get('worker_order'):
         policy['worker_order'] = list(spec['worker_order'])
     if spec.get('never') is not None:
         policy['never'] = list(spec['never'])
+    effective_size = size or case.get('size') or 'full'
     with tempfile.TemporaryDirectory(prefix='llm-router-eval-') as tmp:
         task = Path(tmp) / (case.get('task') or f'{case["case_id"]}.md')
         task.write_text(case['task_text'])
         before = {w: meter(w) for w in order_for(spec)}
         job = run_job(case['repo'], str(task), base=case['base_sha'], worker=spec.get('worker'),
-                      size=case.get('size') or 'full', keep=False, policy=policy)
+                      size=effective_size, keep=False, policy=policy)
     workers = job.get('workers') or []
     hops_list = job.get('hops') or []
     all_runs_unavailable = bool(hops_list) and all(h.get('unavailable') for h in hops_list)
@@ -147,6 +151,7 @@ def live_outcome(case, spec, base_policy, run_job, meter):
         quota_delta_reason = f'meter stale or unknown for {", ".join(missing)}'
     observed = eval_corpus.case_from_job(job)['baseline']
     return {'case_id': case['case_id'], 'worker': workers[-1] if workers else spec.get('worker'),
+            'size': effective_size,
             'tests_status': 'unavailable' if unavailable else job.get('tests_status'),
             'changed_paths': observed['changed_paths'],
             'tokens': observed['tokens'], 'quota_percent': round(sum(spent), 2) if spent else None,
@@ -211,7 +216,7 @@ def compare_cases(baseline_scores, candidate_scores):
 
 
 def run(cases, specs, mode='offline', profiles=None, policy=None, confirm=False, run_job=None, meter=None,
-        use_recorded=True, task_class=None):
+        use_recorded=True, task_class=None, size=None):
     """Replay `cases` under both specs and return the A/B report dict (nothing is written).
 
     `task_class` restricts the run to cases of that class; each policy entry carries `by_class` metrics so a
@@ -220,6 +225,8 @@ def run(cases, specs, mode='offline', profiles=None, policy=None, confirm=False,
     specs = validate_specs(specs)
     if mode not in ('offline', 'live'):
         raise Refused('mode must be offline or live')
+    if size is not None and size not in ('draft', 'full'):
+        raise Refused('size override must be draft or full')
     if mode == 'live' and not confirm:
         raise Refused('live mode runs real workers and spends quota: pass --yes to confirm')
     cases = eval_corpus.filter_by_class(cases, task_class)
@@ -232,12 +239,13 @@ def run(cases, specs, mode='offline', profiles=None, policy=None, confirm=False,
             from .job_dispatch import run_job
         if meter is None:
             from .handoff import meter_percent as meter
-    report = {'mode': mode, 'baseline': specs[0]['name'], 'candidate': specs[1]['name'],
+    report = {'mode': mode, 'size_override': size, 'baseline': specs[0]['name'], 'candidate': specs[1]['name'],
               'cases': len(replayable), 'skipped': skipped, 'task_class': task_class, 'policies': {}}
     for spec in specs:
-        outcomes = [fake_outcome(c, spec, profiles or {}, use_recorded) if mode == 'offline'
-                    else live_outcome(c, spec, policy, run_job, meter) for c in replayable]
-        scores = [dict(eval_score.score(o, c['baseline'].get('changed_paths')), hops=o.get('hops'))
+        outcomes = [dict(fake_outcome(c, spec, profiles or {}, use_recorded), size=size or c.get('size') or 'full')
+                    if mode == 'offline'
+                    else live_outcome(c, spec, policy, run_job, meter, size=size) for c in replayable]
+        scores = [dict(eval_score.score(o, c['baseline'].get('changed_paths')), hops=o.get('hops'), size=o.get('size'))
                   for o, c in zip(outcomes, replayable)]
         unavailable_rows = [{'case_id': s.get('case_id'), 'worker': s.get('worker'), 'reason': s.get('reason')}
                             for s in scores if s.get('unavailable')]
@@ -256,11 +264,73 @@ def run(cases, specs, mode='offline', profiles=None, policy=None, confirm=False,
     return security.redact_obj(report)
 
 
+def spec_from_policy(name, policy, override=None):
+    """A harness policy spec describing how `policy` routes (live mode also carries the config override)."""
+    spec = {'name': name, 'worker_order': list(policy.get('worker_order') or []),
+            'never': list(policy.get('never') or [])}
+    if override:
+        spec['config'] = copy.deepcopy(override)
+    return spec
+
+
+def gate_config_change(cases, baseline_policy, candidate_override, mode='offline', profiles=None, confirm=False,
+                       use_recorded=True, **kwargs):
+    """Gate (#66): replay `cases` under the current policy and under it with `candidate_override` merged in.
+
+    Returns {'adopted', 'gate', 'report', 'merged_policy'}; merged_policy is None unless the candidate
+    strictly beats the baseline (report['gate']['adopt'])."""
+    if not isinstance(candidate_override, dict) or not candidate_override:
+        raise Refused('candidate config must be a non-empty JSON object')
+    merged = config.deep_merge(baseline_policy, candidate_override)
+    specs = [spec_from_policy('baseline', baseline_policy), spec_from_policy('candidate', merged, candidate_override)]
+    kwargs.setdefault('policy', baseline_policy)
+    report = run(cases, specs, mode=mode, profiles=profiles, confirm=confirm, use_recorded=use_recorded, **kwargs)
+    adopt = bool(report['gate']['adopt'])
+    return {'adopted': adopt, 'gate': report['gate'], 'report': report, 'merged_policy': merged if adopt else None}
+
+
+def apply_if_beats_baseline(config_path, candidate_override, cases, mode='offline', profiles=None, confirm=False,
+                            use_recorded=True, **kwargs):
+    """Merge `candidate_override` into the user config at `config_path` only if it beats the baseline.
+
+    Raises Refused (with .result set to the gate result) and leaves the file untouched otherwise. On
+    adoption the old file is backed up next to it and the new one is written atomically."""
+    path = Path(config_path) if config_path else config.config_file()
+    user = config.load_user_config(path)
+    baseline_policy = config.load_policy(path)
+    result = gate_config_change(cases, baseline_policy, candidate_override, mode=mode, profiles=profiles,
+                                confirm=confirm, use_recorded=use_recorded, **kwargs)
+    if not result['adopted']:
+        refusal = Refused('candidate does not beat the baseline: ' + '; '.join(result['gate']['reasons']))
+        refusal.result = result
+        raise refusal
+    updated = config.deep_merge(user, candidate_override)
+    config.validate(config.deep_merge(config.defaults(), updated))  # never write a config that will not load
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backup = None
+    if path.exists():
+        stamp = config.now_local(baseline_policy).strftime('%Y%m%d-%H%M%S')
+        backup = path.with_name(f'{path.name}.bak-{stamp}')
+        shutil.copy2(path, backup)
+    fd, tmp = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(json.dumps(updated, indent=2) + '\n')
+        if backup:
+            shutil.copymode(backup, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return dict(result, config_path=str(path), backup=str(backup) if backup else None)
+
+
 def render_markdown(report):
     names = [report['baseline'], report['candidate']]
     keys = ['cases', 'unavailable', 'pass_rate', 'quality_mean', 'tokens_total', 'tokens_mean', 'quota_percent_mean',
             'elapsed_seconds_median', 'elapsed_seconds_mean']
-    lines = [f'# Router eval: {names[0]} (baseline) vs {names[1]} ({report["mode"]})', '',
+    size_tag = f', size={report["size_override"]}' if report.get('size_override') else ''
+    lines = [f'# Router eval: {names[0]} (baseline) vs {names[1]} ({report["mode"]}{size_tag})', '',
              f'| metric | {names[0]} | {names[1]} | Delta |', '|---|---|---|---|']
     def cell(v):
         if v is None:
