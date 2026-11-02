@@ -27,6 +27,11 @@ class BriefTests(unittest.TestCase):
         self.assertEqual(ch.clean('Think step by step! Then update the README and add a test.'),
                          'Then update the README and add a test.')
         self.assertEqual(ch.clean('  indented line stays as is'), '  indented line stays as is')
+        ui_prompt = ch.build_prompt('Build a SwiftUI settings view.', 'medium', 120,
+                                    tail='Think step by step.\nStackwich tail')
+        self.assertIn('no purple gradients, no centered hero, no emoji icons', ui_prompt)
+        self.assertNotIn('Think step by step', ui_prompt)
+        self.assertNotIn('no purple gradients', prompt)
 
     def test_effort(self):
         for template in (['claude', '-p'], ['claude', '--effort', 'max'],
@@ -45,6 +50,8 @@ class BriefTests(unittest.TestCase):
         policy['run_task']['commands']['claude'] = ['claude', '--effort', 'max']
         policy['run_task']['claude_allow_raised_effort'] = True
         self.assertEqual(td.build_argv(policy, 'claude', '/tmp')[-1], 'max')
+        policy['run_task']['commands']['claude'] = ['claude', '--effort', 'high']
+        self.assertEqual(td.build_argv(policy, 'claude', '/tmp')[-1], 'high')
 
     def test_effort_before_option_terminator(self):
         for options in ([], ['--effort', 'max'], ['--effort=xhigh']):
