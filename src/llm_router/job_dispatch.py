@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import agent_map, alerts, brain, config, handoff, orchestrator as orch_module, security, stackwich, task_dag, triage
+from . import agent_map, alerts, brain, config, handoff, orchestrator as orch_module, risk_tiers, security, stackwich, task_dag, triage
 from . import task_dispatch as td
 
 Refused = td.Refused
@@ -417,6 +417,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
                'test_command': None, 'test_command_source': None, 'allow_no_tests': allow_no_tests,
                'tests_status': None, 'leak_check': None, 'blocked_by_leak_check': False, 'triage': None,
                'allowed_paths': scope, 'diff_scope': None,
+               'risk_tier': 'medium', 'approval_required': True,
                'attempts': [], 'workers': [], 'worktree_state': None, 'branch_state': None,
                'main_checkout_untouched': None, 'handoffs': [], 'warnings': [],
                'review_required': False, 'review': None}
@@ -814,6 +815,11 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         raise RuntimeError('worktree is not on the router branch')
     summary['commit'] = sha
     summary['diff_stat'] = _git(worktree, 'diff', '--stat', summary['base_sha'], sha).stdout.strip()
+    diff_text = _git(worktree, 'diff', '--no-color', summary['base_sha'], sha).stdout
+    risk = risk_tiers.classify_diff(worker_paths, diff_text=diff_text, policy=policy)
+    summary['risk_tier'] = risk['risk_tier']
+    summary['approval_required'] = risk['approval_required']
+    summary['risk_reasons'] = risk['reasons']
     summary['ok'] = True
     summary['status'] = 'committed'
     producer = last.get('worker')
