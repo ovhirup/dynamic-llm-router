@@ -190,13 +190,18 @@ def compare_cases(baseline_scores, candidate_scores):
 
 
 def run(cases, specs, mode='offline', profiles=None, policy=None, confirm=False, run_job=None, meter=None,
-        use_recorded=True):
-    """Replay `cases` under both specs and return the A/B report dict (nothing is written)."""
+        use_recorded=True, task_class=None):
+    """Replay `cases` under both specs and return the A/B report dict (nothing is written).
+
+    `task_class` restricts the run to cases of that class; each policy entry carries `by_class` metrics so a
+    capability update for one class is judged on that class's cases.
+    """
     specs = validate_specs(specs)
     if mode not in ('offline', 'live'):
         raise Refused('mode must be offline or live')
     if mode == 'live' and not confirm:
         raise Refused('live mode runs real workers and spends quota: pass --yes to confirm')
+    cases = eval_corpus.filter_by_class(cases, task_class)
     replayable = [c for c in cases if c.get('replayable')]
     skipped = [{'case_id': c.get('case_id'), 'why': c.get('not_replayable_because')}
                for c in cases if not c.get('replayable')]
@@ -207,14 +212,19 @@ def run(cases, specs, mode='offline', profiles=None, policy=None, confirm=False,
         if meter is None:
             from .handoff import meter_percent as meter
     report = {'mode': mode, 'baseline': specs[0]['name'], 'candidate': specs[1]['name'],
-              'cases': len(replayable), 'skipped': skipped, 'policies': {}}
+              'cases': len(replayable), 'skipped': skipped, 'task_class': task_class, 'policies': {}}
     for spec in specs:
         outcomes = [fake_outcome(c, spec, profiles or {}, use_recorded) if mode == 'offline'
                     else live_outcome(c, spec, policy, run_job, meter) for c in replayable]
         scores = [dict(eval_score.score(o, c['baseline'].get('changed_paths')), hops=o.get('hops'))
                   for o, c in zip(outcomes, replayable)]
-        report['policies'][spec['name']] = {'spec': spec, 'metrics': eval_score.aggregate(scores),
-                                            'scores': scores}
+        grouped = {}
+        for score, case in zip(scores, replayable):
+            if case.get('task_class'):
+                grouped.setdefault(case['task_class'], []).append(score)
+        report['policies'][spec['name']] = {
+            'spec': spec, 'metrics': eval_score.aggregate(scores), 'scores': scores,
+            'by_class': {name: eval_score.aggregate(class_scores) for name, class_scores in sorted(grouped.items())}}
     report['gate'] = eval_score.gate(report['policies'][specs[0]['name']]['metrics'],
                                      report['policies'][specs[1]['name']]['metrics'])
     report['comparison'] = compare_cases(report['policies'][specs[0]['name']]['scores'],

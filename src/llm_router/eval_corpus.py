@@ -7,6 +7,7 @@ recorded outcome as the baseline observation. The corpus is JSONL, redacted, and
 import json
 import re
 from datetime import datetime
+from importlib import resources
 from pathlib import Path
 
 from . import config, handoff, security
@@ -124,7 +125,8 @@ def case_from_job(job):
     attempts = [a for a in job.get('attempts') or [] if a.get('worker')]
     case = {
         'version': CORPUS_VERSION, 'case_id': job.get('job_id'), 'repo': job.get('repo'),
-        'base_sha': job.get('base_sha'), 'task': job.get('task'), 'task_text': task_text,
+        'base_sha': job.get('base_sha'), 'task': job.get('task'), 'task_class': job.get('task_class'),
+        'task_text': task_text,
         'test_command': job.get('test_command'), 'size': job.get('size') or 'full',
         'started_at': job.get('started_at'),
         'baseline': {
@@ -172,3 +174,16 @@ def capture(policy=None, source=None, out=None, limit=None):
 def load(path):
     """Cases from a corpus JSONL file (blank lines ignored)."""
     return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
+
+
+def default_eval_set():
+    """The packaged DLR benchmark eval set (examples/eval_set.jsonl): fixed replayable cases per task class."""
+    text = resources.files('llm_router').joinpath('examples', 'eval_set.jsonl').read_text()
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def filter_by_class(cases, task_class=None):
+    """Cases whose `task_class` matches (all cases when task_class is None)."""
+    if task_class is None:
+        return list(cases)
+    return [case for case in cases if case.get('task_class') == task_class]

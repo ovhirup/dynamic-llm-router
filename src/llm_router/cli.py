@@ -127,6 +127,11 @@ def build_parser():
     replay = eval_cmds.add_parser('run', help='Replay the corpus under two policies and write the A/B report')
     replay.add_argument('--policies', required=True, help='JSON file: [baseline spec, candidate spec]')
     replay.add_argument('--corpus', help='corpus file (default: <state>/logs/eval/corpus.jsonl)')
+    replay.add_argument('--eval-set', action='store_true',
+                        help='use the packaged DLR benchmark eval set (fixed cases per task class) when no --corpus')
+    replay.add_argument('--class', dest='task_class', default=None,
+                        choices=('feature', 'bugfix', 'review', 'mechanical', 'draft'),
+                        help='only replay cases of this task class')
     replay.add_argument('--mode', choices=('offline', 'live'), default='offline')
     replay.add_argument('--fake-workers', help='offline: JSON file of per-worker fake profiles')
     replay.add_argument('--no-recorded', action='store_true',
@@ -365,14 +370,20 @@ def main(argv=None):
         try:
             specs = json.loads(Path(args.policies).read_text())
             profiles = json.loads(Path(args.fake_workers).read_text()) if args.fake_workers else {}
-            cases = eval_corpus.load(args.corpus or eval_corpus.corpus_path(policy))
+            if args.eval_set and not args.corpus:
+                cases = eval_corpus.default_eval_set()
+            else:
+                cases = eval_corpus.load(args.corpus or eval_corpus.corpus_path(policy))
             report = eval_harness.run(cases, specs, mode=args.mode, profiles=profiles, policy=policy,
-                                      confirm=args.yes, use_recorded=not args.no_recorded)
+                                      confirm=args.yes, use_recorded=not args.no_recorded,
+                                      task_class=args.task_class)
         except (eval_harness.Refused, OSError, json.JSONDecodeError) as refusal:
             print(json.dumps({'ok': False, 'refused': str(refusal)}))
             return 3
         stamp = config.now_local(policy).strftime('%Y%m%d-%H%M%S')
-        _print({'gate': report['gate'], 'metrics': {name: entry['metrics'] for name, entry in report['policies'].items()},
+        _print({'gate': report['gate'], 'task_class': args.task_class, 'cases': report['cases'],
+                'metrics': {name: entry['metrics'] for name, entry in report['policies'].items()},
+                'by_class': {name: entry['by_class'] for name, entry in report['policies'].items()},
                 'skipped': len(report['skipped']), 'report': eval_harness.write_report(report, policy, stamp)})
         return 0 if report['gate']['adopt'] else 1
     if args.command in ('quota', 'status', 'alerts', 'install-agent', 'uninstall-agent'):
