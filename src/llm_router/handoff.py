@@ -50,12 +50,16 @@ def threshold_crossed(policy, percent):
     return type(percent) in (int, float) and percent >= threshold(policy)
 
 
-def meter_percent(worker):
-    """The worker's most-used window from its cached meter (never a live read), or None."""
-    from . import quota_service
+def meter_percent(worker, policy=None):
+    """The worker's most-used window from its cached meter (never a live read), or None.
+    For claude, falls back to the Claude mod hook token meter file when the observer cache is absent."""
+    from . import claude_token_meter, quota_service
     from .observers import common
     observation = common.load_cache(quota_service.cache_path(worker))
-    return quota_service.peak(quota_service.evidence_of(observation))[0]
+    cached = quota_service.peak(quota_service.evidence_of(observation))[0]
+    if cached is not None or worker != 'claude':
+        return cached
+    return claude_token_meter.read_claude_token_meter(policy).get('percent_used')
 
 
 # ---- schema -------------------------------------------------------------------------
