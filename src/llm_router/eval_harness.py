@@ -116,6 +116,22 @@ def live_outcome(case, spec, base_policy, run_job, meter):
         job = run_job(case['repo'], str(task), base=case['base_sha'], worker=spec.get('worker'),
                       size=case.get('size') or 'full', keep=False, policy=policy)
     workers = job.get('workers') or []
+    hops_list = job.get('hops') or []
+    all_runs_unavailable = bool(hops_list) and all(h.get('unavailable') for h in hops_list)
+    attempts = job.get('attempts') or []
+    refused_attempt = any(a.get('refused') for a in attempts if isinstance(a, dict))
+    status = job.get('status')
+    unavailable = (status in ('refused', 'handoff_to_orchestrator')
+                   or all_runs_unavailable
+                   or (not job.get('ok') and refused_attempt and not workers))
+    reason = None
+    if unavailable:
+        reason = (job.get('reason')
+                  or (hops_list[-1].get('reason') if hops_list else None)
+                  or next((a.get('refused') for a in reversed(attempts) if isinstance(a, dict) and a.get('refused')), None)
+                  or (job.get('warnings') or [None])[-1]
+                  or status
+                  or 'unavailable')
     after = {w: meter(w) for w in workers}
     spent = [after[w] - before[w] for w in workers
              if type(before.get(w)) in (int, float) and type(after.get(w)) in (int, float)]
@@ -130,12 +146,17 @@ def live_outcome(case, spec, base_policy, run_job, meter):
         quota_delta_status = 'unknown'
         quota_delta_reason = f'meter stale or unknown for {", ".join(missing)}'
     observed = eval_corpus.case_from_job(job)['baseline']
-    return {'case_id': case['case_id'], 'worker': workers[-1] if workers else None,
-            'tests_status': job.get('tests_status'), 'changed_paths': observed['changed_paths'],
+    return {'case_id': case['case_id'], 'worker': workers[-1] if workers else spec.get('worker'),
+            'tests_status': 'unavailable' if unavailable else job.get('tests_status'),
+            'changed_paths': observed['changed_paths'],
             'tokens': observed['tokens'], 'quota_percent': round(sum(spent), 2) if spent else None,
             'quota_delta_status': quota_delta_status, 'quota_delta_reason': quota_delta_reason,
             'elapsed_seconds': observed['elapsed_seconds'], 'reviewer_score': job.get('reviewer_score'),
-            'hops': workers, 'job_id': job.get('job_id'), 'status': job.get('status')}
+            'hops': workers or [h['worker'] for h in hops_list if h.get('worker')],
+            'job_id': job.get('job_id'),
+            'status': 'unavailable' if unavailable else status,
+            'unavailable': unavailable,
+            'reason': reason}
 
 
 def _delta(base, cand, digits=4):
@@ -218,12 +239,15 @@ def run(cases, specs, mode='offline', profiles=None, policy=None, confirm=False,
                     else live_outcome(c, spec, policy, run_job, meter) for c in replayable]
         scores = [dict(eval_score.score(o, c['baseline'].get('changed_paths')), hops=o.get('hops'))
                   for o, c in zip(outcomes, replayable)]
+        unavailable_rows = [{'case_id': s.get('case_id'), 'worker': s.get('worker'), 'reason': s.get('reason')}
+                            for s in scores if s.get('unavailable')]
         grouped = {}
         for score, case in zip(scores, replayable):
             if case.get('task_class'):
                 grouped.setdefault(case['task_class'], []).append(score)
         report['policies'][spec['name']] = {
             'spec': spec, 'metrics': eval_score.aggregate(scores), 'scores': scores,
+            'unavailable': unavailable_rows,
             'by_class': {name: eval_score.aggregate(class_scores) for name, class_scores in sorted(grouped.items())}}
     report['gate'] = eval_score.gate(report['policies'][specs[0]['name']]['metrics'],
                                      report['policies'][specs[1]['name']]['metrics'])
@@ -234,7 +258,7 @@ def run(cases, specs, mode='offline', profiles=None, policy=None, confirm=False,
 
 def render_markdown(report):
     names = [report['baseline'], report['candidate']]
-    keys = ['cases', 'pass_rate', 'quality_mean', 'tokens_total', 'tokens_mean', 'quota_percent_mean',
+    keys = ['cases', 'unavailable', 'pass_rate', 'quality_mean', 'tokens_total', 'tokens_mean', 'quota_percent_mean',
             'elapsed_seconds_median', 'elapsed_seconds_mean']
     lines = [f'# Router eval: {names[0]} (baseline) vs {names[1]} ({report["mode"]})', '',
              f'| metric | {names[0]} | {names[1]} | Delta |', '|---|---|---|---|']
@@ -252,6 +276,12 @@ def render_markdown(report):
         lines.append(f'| {key} | ' + ' | '.join(cell(v) for v in values) + f' | {signed(_delta(*values))} |')
     verdict = 'ADOPT' if report['gate']['adopt'] else 'KEEP BASELINE'
     lines += ['', f'**Gate: {verdict}** ({"; ".join(report["gate"]["reasons"])})', '']
+    unavail = [(n, row) for n in names for row in report['policies'][n].get('unavailable') or []]
+    if unavail:
+        lines.append('### Unavailable workers (excluded from pass rate and gate)')
+        for policy_name, row in unavail:
+            lines.append(f'- `{policy_name}` / `{row.get("case_id")}` ({row.get("worker")}): {row.get("reason")}')
+        lines.append('')
     comparison = report.get('comparison')
     if comparison:
         deltas = comparison['deltas']
