@@ -122,11 +122,11 @@ class SelectionTests(unittest.TestCase):
     def test_order_threshold_and_fallback(self):
         cache = {'codex': self.ev('codex', 90), 'grok-build': self.ev('grok-build', 20), 'cursor': self.ev('cursor', 5)}
         result = selection.select(10_000, policy=self.policy(), now=self.NOW, io=self.io(cache))
-        self.assertEqual(result['worker'], 'grok-build')
+        self.assertEqual(result['worker'], 'cursor')
         self.assertEqual(result['reasons'], {'codex': 'over_threshold', 'grok-build': 'quota_available',
-                                             'cursor': 'not_consulted', 'developer': 'developer_disabled_or_task_too_large'})
+                                             'cursor': 'quota_available', 'developer': 'developer_disabled_or_task_too_large'})
         both = selection.select(10_000, policy=self.policy(), now=self.NOW, io=self.io(cache), consult_all=True)
-        self.assertEqual(both['eligible'], ['grok-build', 'cursor'])
+        self.assertEqual(both['eligible'], ['cursor', 'grok-build'])
 
     def test_stale_future_malformed_exhausted_never_eligible(self):
         cases = {'stale': self.ev('codex', 5, observed=self.NOW - timedelta(hours=2)),

@@ -1,0 +1,47 @@
+{
+  "_comment": "Capability claims per worker and task class. Every claim must cite a source (https:// URL, eval:<report id>, or repo doc path); see docs/ROUTER_BRAIN.md (c).",
+  "workers": {
+    "claude": {
+      "feature": {"score": 0.9, "claim": "claude is strong at feature units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "bugfix": {"score": 0.9, "claim": "claude is strong at bugfix units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "review": {"score": 0.95, "claim": "claude is strong at review units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "mechanical": {"score": 0.8, "claim": "claude is strong at mechanical units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "draft": {"score": 0.85, "claim": "claude is strong at draft units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"}
+    },
+    "codex": {
+      "feature": {"score": 0.85, "claim": "codex is strong at feature units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "bugfix": {"score": 0.9, "claim": "codex is strong at bugfix units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "review": {"score": 0.8, "claim": "codex is strong at review units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "mechanical": {"score": 0.85, "claim": "codex is strong at mechanical units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "draft": {"score": 0.7, "claim": "codex is adequate at draft units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"}
+    },
+    "grok-build": {
+      "feature": {"score": 0.7, "claim": "grok-build is adequate at feature units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "bugfix": {"score": 0.7, "claim": "grok-build is adequate at bugfix units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "review": {"score": 0.6, "claim": "grok-build is adequate at review units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "mechanical": {"score": 0.75, "claim": "grok-build is adequate at mechanical units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "draft": {"score": 0.6, "claim": "grok-build is adequate at draft units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"}
+    },
+    "cursor": {
+      "feature": {"score": 0.8, "claim": "cursor is strong at feature units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "bugfix": {"score": 0.8, "claim": "cursor is strong at bugfix units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "review": {"score": 0.7, "claim": "cursor is adequate at review units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "mechanical": {"score": 0.85, "claim": "cursor is strong at mechanical units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "draft": {"score": 0.65, "claim": "cursor is adequate at draft units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"}
+    },
+    "aider-ollama": {
+      "feature": {"score": 0.4, "claim": "aider-ollama is limited at feature units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "bugfix": {"score": 0.45, "claim": "aider-ollama is limited at bugfix units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "review": {"score": 0.3, "claim": "aider-ollama is limited at review units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "mechanical": {"score": 0.7, "claim": "aider-ollama is adequate at mechanical units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "draft": {"score": 0.5, "claim": "aider-ollama is limited at draft units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"}
+    },
+    "developer": {
+      "feature": {"score": 1.0, "claim": "developer (human) is strong at feature units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "bugfix": {"score": 1.0, "claim": "developer (human) is strong at bugfix units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "review": {"score": 1.0, "claim": "developer (human) is strong at review units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "mechanical": {"score": 0.6, "claim": "developer (human) is adequate at mechanical units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"},
+      "draft": {"score": 0.8, "claim": "developer (human) is strong at draft units", "source": "docs/STRATEGY_WORKERS_FALLBACK.md", "verified_at": "2026-11-02"}
+    }
+  }
+}
