@@ -418,6 +418,61 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
     return summary
 
 
+RESEARCH_REFUSAL = 'research class is never routed to a worker; the orchestrator handles research directly'
+
+
+def bot_dispatch(repo, task_file, task_class='feature', size=None, base=None, branch=None,
+                 test_cmd=None, worker=None, keep=None, policy=None, run_job_fn=None, **kwargs):
+    """Map task_class + size to class_order, call run-job, and return one compact JSON summary
+    with action, worker, job_id and reason. Refuses research tasks before touching the repo."""
+    policy = policy or config.load_policy()
+    normalized_class = (task_class or 'feature').strip().lower()
+    resolved_size = size or ('draft' if normalized_class == 'draft' else 'full')
+    if normalized_class == 'research':
+        return {'ok': False, 'action': 'refused', 'worker': None, 'job_id': None,
+                'reason': RESEARCH_REFUSAL, 'refused': RESEARCH_REFUSAL,
+                'task_class': normalized_class, 'size': resolved_size}
+    if normalized_class not in config.TASK_CLASSES:
+        reason = f'unknown task class {task_class!r}: use one of {", ".join(config.TASK_CLASSES)}'
+        return {'ok': False, 'action': 'refused', 'worker': None, 'job_id': None,
+                'reason': reason, 'refused': reason, 'task_class': task_class, 'size': resolved_size}
+    if resolved_size not in ('draft', 'full'):
+        reason = f'size must be draft or full (got {resolved_size!r})'
+        return {'ok': False, 'action': 'refused', 'worker': None, 'job_id': None,
+                'reason': reason, 'refused': reason, 'task_class': normalized_class, 'size': resolved_size}
+    order = config.worker_order(policy, normalized_class)
+    runner = run_job_fn or run_job
+    try:
+        job = runner(repo, task_file, base=base, branch=branch, test_cmd=test_cmd,
+                     size=resolved_size, worker=worker, keep=keep, policy=policy,
+                     task_class=normalized_class, **kwargs)
+    except (Refused, config.ConfigError) as refusal:
+        reason = str(refusal)
+        return {'ok': False, 'action': 'refused', 'worker': None, 'job_id': None,
+                'reason': reason, 'refused': reason, 'task_class': normalized_class,
+                'size': resolved_size, 'class_order': order}
+    status = job.get('status')
+    chosen = (job.get('worker')
+              or (job['workers'][-1] if job.get('workers') else None)
+              or (config.ORCHESTRATOR if status == 'handoff_to_orchestrator' else None))
+    if status == 'handoff_to_orchestrator':
+        action = 'handoff_to_orchestrator'
+    elif status == 'refused':
+        action = 'refused'
+    elif job.get('ok'):
+        action = 'dispatched'
+    else:
+        action = 'failed'
+    reason = (job.get('reason')
+              or (job['warnings'][-1] if job.get('warnings') else None)
+              or status
+              or ('committed' if job.get('ok') else 'failed'))
+    return {'ok': bool(job.get('ok')), 'action': action, 'worker': chosen,
+            'job_id': job.get('job_id'), 'reason': reason, 'status': status,
+            'task_class': normalized_class, 'size': resolved_size, 'class_order': order,
+            'branch': job.get('branch'), 'commit': job.get('commit')}
+
+
 class _NoSleep:
     """`caffeinate -i -w <pid>` for the job only (run_job.caffeinate); exits with us. No window."""
 
