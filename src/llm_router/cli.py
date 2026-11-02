@@ -174,13 +174,14 @@ def build_parser():
     gate_help = {'review': 'Write the evidence bundle for a committed job',
                  'approve': 'Record an approval bound to the current head SHA',
                  'deny': 'Record a denial for the current head SHA',
+                 'undo': 'Undo an unused approval within its undo window (or before it is used)',
                  'push': 'Push the approved router branch (never force) and open a DRAFT PR',
                  'ci': 'Read gh pr checks for the job PR; --watch polls with backoff',
                  'merge': 'Merge with the repo merge_method: needs a merge approval + green required checks'}
     for name, text in gate_help.items():
         gate = commands.add_parser(name, help=text)
         gate.add_argument('job_id')
-        if name in ('approve', 'deny'):
+        if name in ('approve', 'deny', 'undo'):
             gate.add_argument('--action', choices=('push', 'merge'), required=True)
             gate.add_argument('--note')
         if name == 'approve':
@@ -370,6 +371,8 @@ def main(argv=None):
                                          note=args.note, policy=policy)
             elif args.command == 'deny':
                 result = pr_gate.deny(args.job_id, args.action, note=args.note, policy=policy)
+            elif args.command == 'undo':
+                result = pr_gate.undo(args.job_id, args.action, note=args.note, policy=policy)
             elif args.command == 'push':
                 result = pr_gate.push(args.job_id, policy=policy)
             elif args.command == 'ci':
