@@ -18,10 +18,51 @@ import subprocess
 import sys
 import tempfile
 
-from . import alerts, config, handoff, security, stackwich
+from . import alerts, config, handoff, security, stackwich, task_dag
 from . import task_dispatch as td
 
 Refused = td.Refused
+
+_SCOPE_HEADING = re.compile(r'^\s*#{1,6}\s*(?:allowed\s+(?:paths|files)|scope)\s*:?\s*$', re.I)
+_SCOPE_INLINE = re.compile(r'^\s*(?:allowed\s+(?:paths|files)|scope)\s*:\s*(.+)$', re.I)
+_HEADING = re.compile(r'^\s*#{1,6}\s+\S')
+_BULLET = re.compile(r'^\s*[-*]\s+(.+?)\s*$')
+
+
+def parse_allowed_paths(task_text):
+    """Repo-relative files or trailing-'/' directories declared in a task file, or None when undeclared."""
+    raw = []
+    in_section = False
+    for line in (task_text or '').splitlines():
+        if _SCOPE_HEADING.match(line):
+            in_section = True
+            continue
+        if in_section and _HEADING.match(line):
+            in_section = False
+        inline = _SCOPE_INLINE.match(line)
+        if inline:
+            for item in re.split(r'[,\s]+', inline.group(1).strip()):
+                cleaned = item.strip().strip('`\'"')
+                if cleaned:
+                    raw.append(cleaned)
+            continue
+        if in_section:
+            bullet = _BULLET.match(line)
+            if bullet:
+                cleaned = bullet.group(1).strip().strip('`\'"')
+                if cleaned:
+                    raw.append(cleaned)
+    if not raw:
+        return None
+    try:
+        return sorted({task_dag._scope_path(p) for p in raw})
+    except task_dag.DagError as error:
+        raise Refused(f'invalid allowed path in task file: {error}') from None
+
+
+def out_of_scope(paths, scope):
+    """Changed paths not covered by any scope entry (exact match or under a trailing-'/' directory)."""
+    return sorted(p for p in paths if not any(s == p or task_dag._covers(s, p) for s in scope))
 
 
 def _git(cwd, *args, check=False):
@@ -257,7 +298,7 @@ def hops(summary):
 
 def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full', worker=None,
             keep=None, policy=None, run_task=td.run_task, select=None, now=None, test_runner=td.run_bounded,
-            popen=subprocess.Popen, notifier=None, meter=None, task_class=None):
+            popen=subprocess.Popen, notifier=None, meter=None, task_class=None, allowed_paths=None):
     """keep: True (--keep), False (--prune) or None (keep on success, prune on failure).
     meter(worker) -> percent used or None (default: the cached meter, never a live read).
     task_class ranks workers by class_order.<task_class> (see selection.select)."""
@@ -277,6 +318,13 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
         raise Refused('bare repositories are not supported')
     task_path = Path(task_file).expanduser().resolve()
     task_text = task_path.read_text()
+    if allowed_paths is not None:
+        try:
+            scope = sorted({task_dag._scope_path(p) for p in allowed_paths})
+        except task_dag.DagError as error:
+            raise Refused(f'invalid allowed path: {error}') from None
+    else:
+        scope = parse_allowed_paths(task_text)
     settings = repo_settings(policy, repo)
     if test_cmd:
         test_source = 'cli'
@@ -320,6 +368,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
                'ok': False, 'status': None, 'commit': None, 'diff_stat': '', 'tests': [],
                'test_command': None, 'test_command_source': None, 'allow_no_tests': allow_no_tests,
                'tests_status': None, 'leak_check': None, 'blocked_by_leak_check': False,
+               'allowed_paths': scope, 'diff_scope': None,
                'attempts': [], 'workers': [], 'worktree_state': None, 'branch_state': None,
                'main_checkout_untouched': None, 'handoffs': [], 'warnings': []}
     with RepoLock(_path(policy, 'lock_dir', 'logs/locks'), repo), _NoSleep(policy, popen):
@@ -335,7 +384,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             if test_cmd or allow_no_tests:
                 _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd,
                           test_timeout, stamp, out_dir, run_task, select, test_runner, allow_no_tests,
-                          meter or handoff.meter_percent)
+                          meter or handoff.meter_percent, scope=scope)
             else:  # fail before spending a worker run on a change nothing would verify
                 summary.update(status='no_tests', tests_status='no_tests', reason=NO_TESTS_REASON)
                 summary['warnings'].append(NO_TESTS_REASON + ': set test_cmd, pass --test-cmd, or set '
@@ -452,7 +501,7 @@ class _NoSleep:
 
 def _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd, test_timeout,
               stamp, out_dir, run_task, select, test_runner, allow_no_tests=False,
-              meter=handoff.meter_percent):
+              meter=handoff.meter_percent, scope=None):
     # 'no_tests' passes only on the repo's explicit opt-in; anything else ('skipped', 'not_run') never does.
     passing = ('passed', 'no_tests') if allow_no_tests else ('passed',)
     extra = handoff.WORKER_INSTRUCTIONS  # every worker writes a handoff note at checkpoints and on stop
@@ -555,6 +604,22 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         if required:
             worker_paths.discard(stackwich.REPORT_PATH)
         changed = bool(worker_paths)
+        if scope:
+            outside = out_of_scope(worker_paths, scope)
+            diff_scope = {'status': 'fail' if outside else 'ok', 'allowed': list(scope),
+                          'changed': sorted(worker_paths), 'out_of_scope': outside}
+            summary['diff_scope'] = diff_scope
+            if outside:
+                if selected and selected not in summary['workers']:
+                    summary['workers'].append(selected)
+                summary.update(status='diff_out_of_scope', reason='diff_out_of_scope')
+                summary['warnings'].append('diff_out_of_scope: ' + ', '.join(outside))
+                summary['attempts'].append({'attempt': cycle, 'worker': selected, 'ok': False,
+                                            'changed': changed, 'runs': result.get('attempts'),
+                                            'reason': 'diff_out_of_scope', 'diff_scope': diff_scope,
+                                            'leak_check': (result.get('leak_check') or {}).get('status'),
+                                            'warnings': result.get('warnings')})
+                return
         if required:
             scan = _report_leak_check(policy, worktree, summary['base_sha'])
             if scan['status'] != 'clean':
