@@ -144,6 +144,9 @@ def build_parser():
     refresh.add_argument('--once', action='store_true', help='one serial pass (what the scheduler runs)')
     refresh.add_argument('--worker')
     commands.add_parser('status', help='Meters, freshness, resets, eligibility, open alerts')
+    usage = commands.add_parser('usage', aliases=['burn-down'],
+                                help='Token burn-down dashboard: used %, remaining, reset, burn rate and next worker')
+    usage.add_argument('--json', action='store_true', dest='as_json', help='print machine-readable JSON')
     alert = commands.add_parser('alerts', help='List or acknowledge open alerts')
     alert_cmds = alert.add_subparsers(dest='alerts_command')
     acknowledge = alert_cmds.add_parser('ack')
@@ -386,6 +389,14 @@ def main(argv=None):
                 'by_class': {name: entry['by_class'] for name, entry in report['policies'].items()},
                 'skipped': len(report['skipped']), 'report': eval_harness.write_report(report, policy, stamp)})
         return 0 if report['gate']['adopt'] else 1
+    if args.command in ('usage', 'burn-down'):
+        from . import burn_down
+        report = burn_down.usage_report(policy)
+        if args.as_json:
+            _print(report)
+        else:
+            print(burn_down.render_usage_table(report))
+        return 0
     if args.command in ('quota', 'status', 'alerts', 'install-agent', 'uninstall-agent'):
         from . import alerts as alerts_module, quota_service
         if args.command == 'quota':
