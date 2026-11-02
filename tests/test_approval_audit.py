@@ -21,8 +21,8 @@ class ApprovalAuditLogTests(unittest.TestCase):
             'gate_dir': str(self.base / 'gate'),
             'reviews_dir': str(self.base / 'reviews'),
         }
-        self.worker("open('out.txt','w').write('ok\\n')")
-        done = self.job(test_cmd='test -f out.txt')
+        self.worker("open('out.txt','w').write('ok\\n')", 'grok-build')
+        done = self.job(test_cmd='test -f out.txt', worker='grok-build')
         self.assertTrue(done['ok'], done)
         job_id = done['job_id']
 
