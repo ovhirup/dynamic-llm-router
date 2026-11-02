@@ -16,6 +16,7 @@ without babysitting terminals, and without ever leaking a private repo name or k
 > Works with Codex, Grok, Cursor and Claude Code CLIs; not affiliated with or endorsed by any of them.
 
 > **Routing strategy:** see [docs/ROUTING_STRATEGY.md](docs/ROUTING_STRATEGY.md), the master architecture (worker order, selection, parallel dispatch, switching, Router Brain).
+> Worker ranking and fallback rules: see [docs/STRATEGY_WORKERS_FALLBACK.md](docs/STRATEGY_WORKERS_FALLBACK.md).
 
 ![Architecture](docs/architecture.png)
 
@@ -220,7 +221,9 @@ cd tests && ../.venv/bin/python -m unittest discover -t . -s .
 ```
 
 Tests use fake workers, fake `gh`, fixture screens and temp git repos only; they never call a real agent CLI
-or the network. See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
+or the network. GitHub Actions (`.github/workflows/ci.yml`) runs `python -m unittest discover -t . -s . -v`
+across Ubuntu and macOS (Python 3.10–3.13) plus a full-history `llm-router scan . --history` leak check on
+every push and pull request with zero secrets required. See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

@@ -8,13 +8,72 @@ Rules (same safety model for every worker):
   unmetered_workers. `developer` is eligible only for draft-size tasks when enabled with an endpoint.
 """
 from datetime import datetime, timezone
+import http.client
+import json
 import math
+import os
 import re
+import urllib.request
 
 from . import claude_account, config, cooldown, quota_service, week_curve
 
-LOCAL_WORKERS = ('developer', 'aider-ollama', config.ORCHESTRATOR)  # never displaced by week-curve pacing
+LOCAL_WORKERS = ('developer', 'aider-ollama', 'nativ', config.ORCHESTRATOR)  # never displaced by week-curve pacing
 NAME = re.compile(r'[a-z][a-z0-9_-]{0,31}')
+HEALTH_TIMEOUT_SECONDS = 2
+HEALTH_MAX_BYTES = 1 << 20
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _default_opener(url, timeout):
+    """GET url without proxies or redirects; return (status, body bytes)."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+    with opener.open(urllib.request.Request(url, headers={'Accept': 'application/json'}), timeout=timeout) as response:
+        return response.status, response.read(HEALTH_MAX_BYTES + 1)
+
+
+def local_model_config(policy, worker):
+    """{'base_url', 'model'} for a worker from workers.<name> or run_task.local_models.<name>."""
+    found = dict((policy.get('run_task') or {}).get('local_models', {}).get(worker) or {})
+    opts = (policy.get('workers') or {}).get(worker) or {}
+    if isinstance(opts, dict):
+        found.update({k: opts[k] for k in ('base_url', 'model') if k in opts})
+    return found
+
+
+def check_local_worker(policy, worker, opener=None):
+    """(True, None) when the worker's local server lists its model at <base_url>/v1/models.
+
+    opener(url, timeout) -> (status, body bytes); raising means unreachable. Workers without a
+    base_url are not probed. Returns (False, 'server_not_running') for an unreachable server,
+    non-200 or invalid JSON, and (False, 'model_not_present') when the configured model is absent.
+    """
+    local = local_model_config(policy, worker)
+    base_url = local.get('base_url')
+    if not base_url:
+        return True, None
+    if not config.valid_base_url(base_url):
+        return False, 'invalid_base_url'
+    try:
+        status, body = (opener or _default_opener)(base_url.rstrip('/') + '/v1/models', HEALTH_TIMEOUT_SECONDS)
+        if status != 200 or len(body) > HEALTH_MAX_BYTES:
+            return False, 'server_not_running'
+        data = json.loads(body)
+    except (OSError, ValueError, http.client.HTTPException):
+        return False, 'server_not_running'
+    model = local.get('model')
+    if not model:
+        return True, None
+    listed = data.get('data') if isinstance(data, dict) else None
+    if not isinstance(listed, list):
+        return False, 'server_not_running'
+    ids = [entry.get('id') for entry in listed if isinstance(entry, dict) and isinstance(entry.get('id'), str)]
+    if any(i == model or i.endswith('/' + model) or model.endswith('/' + i) for i in ids):
+        return True, None
+    return False, 'model_not_present'
 
 
 class SelectionError(ValueError):
@@ -113,9 +172,89 @@ def developer_ready(policy, task_chars):
     return bool(options.get('enabled') and options.get('endpoint')) and task_chars <= options.get('draft_max_chars', 0)
 
 
+HEALTH_WORKERS = ('aider-ollama', 'nativ')
+OLLAMA_DEFAULT = 'http://127.0.0.1:11434'
+
+
+def _worker_cfg(policy, worker):
+    cfg = (policy.get('workers') or {}).get(worker)
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def configured_model(policy, worker):
+    """The local model from workers.<w>.model, else `--model [ollama_chat/]<m>` in its command."""
+    model = _worker_cfg(policy, worker).get('model')
+    if not isinstance(model, str) or not model:
+        argv = ((policy.get('run_task') or {}).get('commands') or {}).get(worker) or []
+        model = None
+        for i, arg in enumerate(argv):
+            if arg == '--model' and i + 1 < len(argv) and isinstance(argv[i + 1], str):
+                model = argv[i + 1]
+            elif isinstance(arg, str) and arg.startswith('--model='):
+                model = arg.split('=', 1)[1]
+        if not model:
+            return None
+    if worker == 'aider-ollama':
+        for prefix in ('ollama_chat/', 'ollama/'):
+            if model.startswith(prefix):
+                return model[len(prefix):]
+    return model
+
+
+def health_url(policy, worker):
+    base = _worker_cfg(policy, worker).get('base_url')
+    if worker == 'aider-ollama':
+        base = base or os.environ.get('OLLAMA_API_BASE') or OLLAMA_DEFAULT
+        return base.rstrip('/') + '/api/tags'
+    base = (base or '').rstrip('/')
+    base = base[:-3] if base.endswith('/v1') else base
+    return base + '/v1/models' if base else None
+
+
+def wants_health_check(policy, worker, health_opener):
+    """Probe only when asked: an injected opener, health_check: true, or a configured base_url."""
+    if worker not in HEALTH_WORKERS:
+        return False
+    cfg = _worker_cfg(policy, worker)
+    return health_opener is not None or cfg.get('health_check') is True or bool(cfg.get('base_url'))
+
+
+def health_reason(policy, worker, health_opener=None, timeout=3):
+    """None when the local server lists the configured model, else 'server_unreachable' / 'model_not_present'.
+
+    health_opener(url, timeout) returns (status, body); body is bytes, str or already-parsed JSON.
+    """
+    if worker == 'nativ':
+        ok, why = check_local_worker(policy, worker, health_opener)
+        if ok:
+            return None
+        return 'server_unreachable' if why in ('server_not_running', 'invalid_base_url') else why
+    url = health_url(policy, worker)
+    if not url:
+        return 'server_unreachable'
+    try:
+        status, body = (health_opener or _default_opener)(url, timeout)
+        if status != 200:
+            return 'server_unreachable'
+        payload = json.loads(body) if isinstance(body, (bytes, str)) else body
+    except Exception:
+        return 'server_unreachable'
+    if not isinstance(payload, dict):
+        return 'server_unreachable'
+    key, field = ('models', 'name') if worker == 'aider-ollama' else ('data', 'id')
+    rows = payload.get(key)
+    names = {row.get(field) for row in rows if isinstance(row, dict)} if isinstance(rows, list) else set()
+    model = configured_model(policy, worker)
+    if model is None:
+        return None if names else 'model_not_present'
+    if worker == 'aider-ollama' and ':' not in model:
+        names |= {n.split(':', 1)[0] for n in names if isinstance(n, str) and n.endswith(':latest')}
+    return None if model in names else 'model_not_present'
+
+
 def select(task_chars, policy=None, cached_only=False, now=None, io=None, consult_all=False,
            consult_cursor=False, threshold_overrides=None, claude_profile_loader=None, cooldowns=None,
-           task_class=None, grok_bot_evidence=None):
+           task_class=None, grok_bot_evidence=None, health_opener=None):
     """Return {'worker', 'reason', 'eligible', 'meters', 'reasons', 'sources', 'versions', ...}.
 
     Workers cooling down after a quota error (see cooldown.py) are skipped until their reset.
@@ -123,6 +262,9 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
     order and is never quota-gated, so a class job is handed back to the orchestrator, not refused.
     Workers sharing the grok-bot pool are paced by week_curve.gate(): an unknown pool is tried last
     among cloud workers and ahead-of-curve drops one rank; neither bans.
+    Local aider-ollama / nativ workers are probed (health_reason) when health_opener is given or the
+    worker sets health_check: true or base_url; Nativ also uses check_local_worker() for OpenAI-style
+    /v1/models probes. A down server or a missing model makes them ineligible.
     """
     policy = policy or config.load_policy()
     clock_injected = now is not None
@@ -155,6 +297,11 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
             account = claude_account.check(policy, claude_profile_loader)
             if account is not None and account != 'personal':
                 reasons[worker] = f'claude_account_{account}'
+                continue
+        if wants_health_check(policy, worker, health_opener):
+            unhealthy = health_reason(policy, worker, health_opener)
+            if unhealthy is not None:
+                reasons[worker] = unhealthy
                 continue
         if worker == 'developer':
             ok = developer_ready(policy, task_chars)
