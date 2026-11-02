@@ -47,12 +47,58 @@ def _elapsed(job):
     return float(sum(times)) if times else None
 
 
+def _usage_tokens(usage):
+    """Total tokens from a usage dict (`total_tokens`, or sum of input/output/cache tokens), else None."""
+    if not isinstance(usage, dict):
+        return None
+    if type(usage.get('total_tokens')) in (int, float):
+        return int(usage['total_tokens'])
+    parts = [usage.get(k) for k in ('input_tokens', 'output_tokens',
+                                    'cache_read_input_tokens', 'cache_creation_input_tokens')
+             if type(usage.get(k)) in (int, float)]
+    return int(sum(parts)) if parts else None
+
+
+def extract_tokens_from_text(text):
+    """Extract total token usage from a worker output log (e.g. Claude/Grok stream-json lines), or None."""
+    total, seen = 0, False
+    for line in (text or '').splitlines():
+        line = line.strip()
+        if not line or '{' not in line:
+            continue
+        start = line.find('{')
+        try:
+            obj = json.loads(line[start:])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if type(obj.get('tokens')) in (int, float):
+            total, seen = total + int(obj['tokens']), True
+            continue
+        u = _usage_tokens(obj.get('usage'))
+        if u is None and isinstance(obj.get('message'), dict):
+            u = _usage_tokens(obj['message'].get('usage'))
+        if u is not None:
+            total, seen = total + u, True
+    return total if seen else None
+
+
 def _tokens(job):
-    """Total tokens if any worker run recorded them (`tokens` or `usage.total_tokens`), else None."""
+    """Total tokens if any worker run recorded them (`tokens`, `usage`, or output log stream-json), else None."""
+    if type(job.get('tokens')) in (int, float):
+        return job['tokens']
     total, seen = 0, False
     for attempt in job.get('attempts') or []:
         for run in attempt.get('runs') or []:
-            value = run.get('tokens', (run.get('usage') or {}).get('total_tokens'))
+            value = run.get('tokens')
+            if type(value) not in (int, float):
+                value = _usage_tokens(run.get('usage'))
+            if type(value) not in (int, float) and run.get('output_path'):
+                try:
+                    value = extract_tokens_from_text(Path(run['output_path']).read_text(errors='replace'))
+                except OSError:
+                    value = None
             if type(value) in (int, float):
                 total, seen = total + value, True
     return total if seen else None

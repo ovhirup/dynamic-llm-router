@@ -18,7 +18,8 @@ NOTE_FILE = '.llm-router-handoff.md'
 SECTIONS = ('Goal', 'Files touched', 'Diff summary', 'Test status', 'Decisions', 'Next steps',
             'Gotchas', 'Meter', 'Switch reason')
 REQUIRED = ('Goal', 'Files touched', 'Test status', 'Next steps', 'Switch reason')
-HEADER_KEYS = ('job_id', 'worker', 'created_at', 'source', 'switch_reason', 'branch', 'worktree')
+HEADER_KEYS = ('job_id', 'worker', 'created_at', 'source', 'switch_reason', 'branch', 'worktree',
+               'definition_of_done', 'stopping_rule')
 DEFAULT_THRESHOLD = 85
 TAIL_CHARS = 2000
 
