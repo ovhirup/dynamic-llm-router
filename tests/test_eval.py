@@ -123,6 +123,15 @@ class ScoreTests(unittest.TestCase):
         self.assertFalse(eval_score.gate(base, dict(base, cases=1, tokens_total=1))['adopt'])
         self.assertFalse(eval_score.gate(base, dict(base, tokens_total=None))['adopt'])  # no evidence
 
+    def test_gate_never_adopts_when_both_sides_have_zero_pass_rate(self):
+        zero_base = {'cases': 2, 'pass_rate': 0.0, 'quality_mean': 0.0, 'tokens_total': 200,
+                     'quota_percent_mean': 2.0, 'elapsed_seconds_median': 30.0}
+        faster_zero = dict(zero_base, tokens_total=50, quota_percent_mean=0.5, elapsed_seconds_median=2.0)
+        verdict = eval_score.gate(zero_base, faster_zero)
+        self.assertFalse(verdict['adopt'])
+        self.assertEqual(verdict['verdict'], 'inconclusive')
+        self.assertIn('0% pass rate', verdict['reasons'][0])
+
 
 class OfflineHarnessTests(EvalFixture):
     def test_ab_report_adopts_cheaper_faster_candidate(self):
@@ -140,6 +149,47 @@ class OfflineHarnessTests(EvalFixture):
         self.assertEqual(report['gate']['reasons'], ['fewer tokens', 'lower quota %', 'faster'])
         hops = [s['hops'] for s in report['policies']['baseline']['scores']]
         self.assertEqual(hops, [['grok-build', 'codex'], ['grok-build', 'codex']])
+
+    def test_report_includes_per_case_comparison(self):
+        report = eval_harness.run(self.cases, self.specs, profiles=self.profiles)
+        comparison = report['comparison']
+        self.assertEqual([row['case_id'] for row in comparison['cases']], [FIRST, SECOND])
+        self.assertEqual(comparison['wins'] + comparison['losses'] + comparison['ties'], 2)
+        self.assertEqual(comparison['deltas']['tokens'], 18000 - 57000)
+        self.assertEqual(comparison['deltas']['passed'], 0)
+        for row in comparison['cases']:
+            self.assertTrue(row['baseline_passed'] and row['candidate_passed'])
+            self.assertEqual(row['baseline_worker'], 'codex')
+            self.assertEqual(row['candidate_worker'], 'cursor')
+            self.assertEqual(row['tokens_delta'], row['candidate_tokens'] - row['baseline_tokens'])
+            self.assertIn(row['winner'], ('candidate', 'baseline', 'tie'))
+        markdown = eval_harness.render_markdown(report)
+        self.assertIn('## Per-case comparison', markdown)
+        self.assertIn('| metric | baseline | cursor-first | Delta |', markdown)
+        self.assertIn('| tokens_total | 57000 | 18000 | -39000 |', markdown)
+        self.assertIn(f'| {FIRST} | codex | yes |', markdown)
+        self.assertIn(f'Candidate wins {comparison["wins"]}, losses {comparison["losses"]}', markdown)
+
+    def test_compare_cases_counts_wins_losses_ties(self):
+        def row(case_id, worker, passed, quality, tokens, elapsed):
+            return {'case_id': case_id, 'worker': worker, 'passed': passed, 'quality': quality,
+                    'tokens': tokens, 'elapsed_seconds': elapsed}
+
+        base = [row('a', 'codex', False, 0.3, 100, 10.0), row('b', 'codex', True, 0.9, 100, 10.0),
+                row('c', 'codex', True, 0.8, 100, 10.0), row('d', 'codex', True, 0.8, 100, 10.0),
+                row('e', 'codex', True, 0.8, None, 10.0)]
+        cand = [row('a', 'cursor', True, 0.8, 300, 20.0), row('b', 'cursor', True, 0.7, 50, 5.0),
+                row('c', 'cursor', True, 0.8, 60, 10.0), row('d', 'cursor', True, 0.8, 100, 10.0),
+                row('e', 'cursor', True, 0.8, 500, 12.5)]
+        result = eval_harness.compare_cases(base, cand)
+        self.assertEqual([r['winner'] for r in result['cases']],
+                         ['candidate', 'baseline', 'candidate', 'tie', 'baseline'])
+        self.assertEqual((result['wins'], result['losses'], result['ties']), (2, 2, 1))
+        first = result['cases'][0]
+        self.assertEqual((first['baseline_worker'], first['candidate_worker']), ('codex', 'cursor'))
+        self.assertEqual((first['quality_delta'], first['tokens_delta'], first['elapsed_delta']), (0.5, 200, 10.0))
+        self.assertIsNone(result['cases'][4]['tokens_delta'])  # unknown baseline tokens: no delta
+        self.assertEqual(result['deltas'], {'passed': 1, 'quality': 0.3, 'tokens': 110, 'elapsed_seconds': 7.5})
 
     def test_reversed_comparison_keeps_baseline(self):
         report = eval_harness.run(self.cases, list(reversed(self.specs)), profiles=self.profiles)
@@ -204,7 +254,67 @@ class LiveHarnessTests(EvalFixture):
         self.assertEqual(self.policy['run_job'].get('max_retries', 1), load_policy()['run_job'].get('max_retries', 1))
         first = report['policies']['pinned']['scores'][0]
         self.assertEqual((first['tokens'], first['elapsed_seconds'], first['quota_percent']), (700, 60.0, 2.5))
+        self.assertEqual(first['quota_delta_status'], 'ok')
         self.assertEqual(report['policies']['pinned']['metrics']['pass_rate'], 1.0)
+
+    def test_unavailable_workers_excluded_from_pass_rate_and_gate_and_listed_in_report(self):
+        def fake_run_job(repo, task_file, **kwargs):
+            if kwargs.get('worker') == 'codex':
+                return {
+                    'job_id': 'unavail-1', 'workers': [], 'tests_status': None,
+                    'status': 'refused', 'ok': False,
+                    'warnings': ['codex meter unknown or stale: forced full-size work must be paced'],
+                    'attempts': [{'attempt': 1, 'refused': 'codex meter unknown or stale'}],
+                    'hops': [{'cycle': 1, 'worker': 'codex', 'reason': 'quota_error', 'ok': False, 'unavailable': True}],
+                }
+            return {
+                'job_id': 'ok-1', 'workers': ['claude'], 'tests_status': 'passed',
+                'status': 'committed', 'ok': True, 'diff_stat': ' out.txt | 1 +\n 1 file changed',
+                'started_at': '2026-10-31T10:00:00+00:00', 'finished_at': '2026-10-31T10:01:00+00:00',
+                'attempts': [{'worker': 'claude', 'runs': [{'worker': 'claude', 'tokens': 500}]}],
+            }
+
+        specs = [{'name': 'claude', 'worker': 'claude'}, {'name': 'codex', 'worker': 'codex'}]
+        report = eval_harness.run(self.cases, specs, mode='live', confirm=True, policy=self.policy,
+                                  run_job=fake_run_job, meter=lambda w: 10.0)
+        codex_entry = report['policies']['codex']
+        self.assertEqual(codex_entry['metrics']['cases'], 0)
+        self.assertEqual(codex_entry['metrics']['unavailable'], 2)
+        self.assertEqual(len(codex_entry['unavailable']), 2)
+        self.assertTrue(all(s['status'] == 'unavailable' and s['quality'] is None for s in codex_entry['scores']))
+        self.assertFalse(report['gate']['adopt'])
+        md = eval_harness.render_markdown(report)
+        self.assertIn('Unavailable workers (excluded from pass rate and gate)', md)
+        self.assertIn('quota_error', md)
+
+    def test_extracts_claude_stream_json_tokens_and_records_unknown_meter_delta_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / 'claude.log'
+            log_path.write_text(
+                '$ exit=0 timed_out=False elapsed=12.0s\n--- stdout\n'
+                + json.dumps({'type': 'result', 'result': 'done', 'usage': {
+                    'input_tokens': 100, 'output_tokens': 250,
+                    'cache_read_input_tokens': 1000, 'cache_creation_input_tokens': 400,
+                }}) + '\n--- stderr\n\n'
+            )
+
+            def fake_run_job(repo, task_file, **kwargs):
+                return {
+                    'job_id': 'claude-live-1', 'workers': ['claude'], 'tests_status': 'passed',
+                    'status': 'committed', 'diff_stat': ' out.txt | 1 +\n 1 file changed',
+                    'started_at': '2026-10-31T10:00:00+00:00', 'finished_at': '2026-10-31T10:00:12+00:00',
+                    'attempts': [{'worker': 'claude', 'runs': [{'worker': 'claude', 'output_path': str(log_path)}]}],
+                }
+
+            specs = [{'name': 'claude', 'worker': 'claude'}, {'name': 'claude-2', 'worker': 'claude'}]
+            report = eval_harness.run(self.cases, specs, mode='live', confirm=True, policy=self.policy,
+                                      run_job=fake_run_job, meter=lambda w: None)
+            first = report['policies']['claude']['scores'][0]
+            self.assertEqual(first['tokens'], 1750)
+            self.assertIsNone(first['quota_percent'])
+            self.assertEqual(first['quota_delta_status'], 'unknown')
+            self.assertIn('meter stale or unknown for claude', first['quota_delta_reason'])
+            self.assertEqual(report['policies']['claude']['metrics']['tokens_total'], 3500)
 
 
 class CliTests(EvalFixture):
@@ -231,6 +341,67 @@ class CliTests(EvalFixture):
                              '--corpus', str(self.corpus)])
         self.assertEqual(code, 3)
         self.assertIn('--yes', json.loads(out.getvalue())['refused'])
+
+
+CLASSES = {'feature', 'bugfix', 'review', 'mechanical', 'draft'}
+
+
+class EvalSetTests(unittest.TestCase):
+    SPECS = [{'name': 'base', 'worker_order': ['grok-build', 'codex']}, {'name': 'cand', 'worker': 'codex'}]
+
+    def test_default_eval_set_covers_every_class_and_is_replayable(self):
+        cases = eval_corpus.default_eval_set()
+        self.assertEqual({case['task_class'] for case in cases}, CLASSES)
+        required = ('case_id', 'task_class', 'repo', 'base_sha', 'task', 'task_text', 'test_command', 'size',
+                    'baseline')
+        for case in cases:
+            self.assertTrue(case['replayable'], case['case_id'])
+            for key in required:
+                self.assertTrue(case.get(key), f'{case["case_id"]} missing {key}')
+        self.assertEqual(len({case['case_id'] for case in cases}), len(cases))
+        bugfix = eval_corpus.filter_by_class(cases, 'bugfix')
+        self.assertTrue(bugfix)
+        self.assertTrue(all(case['task_class'] == 'bugfix' for case in bugfix))
+        self.assertEqual(len(eval_corpus.filter_by_class(cases)), len(cases))
+
+    def test_case_from_job_keeps_task_class(self):
+        self.assertEqual(eval_corpus.case_from_job({'job_id': 'j', 'task_class': 'review'})['task_class'], 'review')
+        self.assertIsNone(eval_corpus.case_from_job({'job_id': 'j'})['task_class'])
+
+    def test_run_reports_by_class_metrics_and_filters_by_class(self):
+        cases = eval_corpus.default_eval_set()
+        report = eval_harness.run(cases, self.SPECS, profiles={'codex': {'pass_rate': 1.0}})
+        for name in ('base', 'cand'):
+            by_class = report['policies'][name]['by_class']
+            self.assertEqual(set(by_class), CLASSES)
+            self.assertEqual(sum(m['cases'] for m in by_class.values()), report['cases'])
+        only = eval_harness.run(cases, self.SPECS, profiles={'codex': {'pass_rate': 1.0}}, task_class='review')
+        expected = len(eval_corpus.filter_by_class(cases, 'review'))
+        self.assertEqual(only['cases'], expected)
+        self.assertEqual(only['task_class'], 'review')
+        self.assertEqual(set(only['policies']['cand']['by_class']), {'review'})
+        self.assertEqual(only['policies']['cand']['by_class']['review']['cases'], expected)
+
+
+class EvalSetCliTests(EvalFixture):
+    def test_eval_run_class_uses_packaged_eval_set(self):
+        policies = Path(self.tmp.name) / 'policies.json'
+        policies.write_text(json.dumps(EvalSetTests.SPECS))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(['eval', 'run', '--policies', str(policies), '--eval-set', '--class', 'mechanical',
+                             '--fake-workers', str(FIXTURES / 'fake_workers.json')])
+        self.assertIn(code, (0, 1))
+        result = json.loads(out.getvalue())
+        self.assertEqual(result['task_class'], 'mechanical')
+        self.assertEqual(result['cases'], len(eval_corpus.filter_by_class(eval_corpus.default_eval_set(), 'mechanical')))
+        self.assertEqual(set(result['by_class']['cand']), {'mechanical'})
+        saved = json.loads(Path(result['report']['json']).read_text())
+        self.assertEqual(set(saved['policies']['base']['by_class']), {'mechanical'})
+
+    def test_unknown_class_is_rejected(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli.main(['eval', 'run', '--policies', 'x.json', '--eval-set', '--class', 'nope'])
 
 
 if __name__ == '__main__':
