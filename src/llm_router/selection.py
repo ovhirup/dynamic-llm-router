@@ -8,6 +8,7 @@ Rules (same safety model for every worker):
   unmetered_workers. `developer` is eligible only for draft-size tasks when enabled with an endpoint.
 """
 from datetime import datetime, timezone
+import http.client
 import json
 import math
 import os
@@ -16,8 +17,63 @@ import urllib.request
 
 from . import claude_account, config, cooldown, quota_service, week_curve
 
-LOCAL_WORKERS = ('developer', 'aider-ollama', config.ORCHESTRATOR)  # never displaced by week-curve pacing
+LOCAL_WORKERS = ('developer', 'aider-ollama', 'nativ', config.ORCHESTRATOR)  # never displaced by week-curve pacing
 NAME = re.compile(r'[a-z][a-z0-9_-]{0,31}')
+HEALTH_TIMEOUT_SECONDS = 2
+HEALTH_MAX_BYTES = 1 << 20
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _default_opener(url, timeout):
+    """GET url without proxies or redirects; return (status, body bytes)."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+    with opener.open(urllib.request.Request(url, headers={'Accept': 'application/json'}), timeout=timeout) as response:
+        return response.status, response.read(HEALTH_MAX_BYTES + 1)
+
+
+def local_model_config(policy, worker):
+    """{'base_url', 'model'} for a worker from workers.<name> or run_task.local_models.<name>."""
+    found = dict((policy.get('run_task') or {}).get('local_models', {}).get(worker) or {})
+    opts = (policy.get('workers') or {}).get(worker) or {}
+    if isinstance(opts, dict):
+        found.update({k: opts[k] for k in ('base_url', 'model') if k in opts})
+    return found
+
+
+def check_local_worker(policy, worker, opener=None):
+    """(True, None) when the worker's local server lists its model at <base_url>/v1/models.
+
+    opener(url, timeout) -> (status, body bytes); raising means unreachable. Workers without a
+    base_url are not probed. Returns (False, 'server_not_running') for an unreachable server,
+    non-200 or invalid JSON, and (False, 'model_not_present') when the configured model is absent.
+    """
+    local = local_model_config(policy, worker)
+    base_url = local.get('base_url')
+    if not base_url:
+        return True, None
+    if not config.valid_base_url(base_url):
+        return False, 'invalid_base_url'
+    try:
+        status, body = (opener or _default_opener)(base_url.rstrip('/') + '/v1/models', HEALTH_TIMEOUT_SECONDS)
+        if status != 200 or len(body) > HEALTH_MAX_BYTES:
+            return False, 'server_not_running'
+        data = json.loads(body)
+    except (OSError, ValueError, http.client.HTTPException):
+        return False, 'server_not_running'
+    model = local.get('model')
+    if not model:
+        return True, None
+    listed = data.get('data') if isinstance(data, dict) else None
+    if not isinstance(listed, list):
+        return False, 'server_not_running'
+    ids = [entry.get('id') for entry in listed if isinstance(entry, dict) and isinstance(entry.get('id'), str)]
+    if any(i == model or i.endswith('/' + model) or model.endswith('/' + i) for i in ids):
+        return True, None
+    return False, 'model_not_present'
 
 
 class SelectionError(ValueError):
@@ -163,16 +219,16 @@ def wants_health_check(policy, worker, health_opener):
     return health_opener is not None or cfg.get('health_check') is True or bool(cfg.get('base_url'))
 
 
-def _default_opener(url, timeout):
-    with urllib.request.urlopen(url, timeout=timeout) as response:  # local model server only
-        return response.status, response.read()
-
-
 def health_reason(policy, worker, health_opener=None, timeout=3):
     """None when the local server lists the configured model, else 'server_unreachable' / 'model_not_present'.
 
     health_opener(url, timeout) returns (status, body); body is bytes, str or already-parsed JSON.
     """
+    if worker == 'nativ':
+        ok, why = check_local_worker(policy, worker, health_opener)
+        if ok:
+            return None
+        return 'server_unreachable' if why in ('server_not_running', 'invalid_base_url') else why
     url = health_url(policy, worker)
     if not url:
         return 'server_unreachable'
@@ -207,7 +263,8 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
     Workers sharing the grok-bot pool are paced by week_curve.gate(): an unknown pool is tried last
     among cloud workers and ahead-of-curve drops one rank; neither bans.
     Local aider-ollama / nativ workers are probed (health_reason) when health_opener is given or the
-    worker sets health_check: true or base_url; a down server or a missing model makes them ineligible.
+    worker sets health_check: true or base_url; Nativ also uses check_local_worker() for OpenAI-style
+    /v1/models probes. A down server or a missing model makes them ineligible.
     """
     policy = policy or config.load_policy()
     clock_injected = now is not None

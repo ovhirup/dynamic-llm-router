@@ -285,6 +285,74 @@ class WorkerTests(unittest.TestCase):
             load_policy(worker_order=['sample'], workers={'sample': {'command': ['fake-worker']}})
 
 
+class NativWorkerTests(unittest.TestCase):
+    MODEL = 'mlx-community/Qwen2.5-Coder-14B-Instruct-4bit'
+
+    def policy(self, **opts):
+        from importlib import resources
+        preset = json.loads(resources.files('llm_router').joinpath('examples/workers/nativ.json').read_text())
+        preset['workers']['nativ'].update(opts)
+        return load_policy(worker_order=['nativ'], workers=preset['workers'],
+                           unmetered_workers=preset['unmetered_workers'])
+
+    def opener(self, status=200, ids=None, error=None):
+        calls = []
+        def opener(url, timeout):
+            calls.append((url, timeout))
+            if error:
+                raise error
+            return status, json.dumps({'object': 'list', 'data': [{'id': i} for i in (ids or [])]}).encode()
+        opener.calls = calls
+        return opener
+
+    def test_preset_materialises_local_model_and_argv(self):
+        policy = self.policy()
+        self.assertEqual(policy['run_task']['local_models']['nativ'],
+                         {'base_url': 'http://127.0.0.1:8080', 'model': self.MODEL})
+        self.assertEqual(policy['run_task']['prompt_delivery']['nativ'], 'file')
+        self.assertEqual(policy['run_task']['concurrency']['nativ'], 1)
+        self.assertIn('nativ', selection.LOCAL_WORKERS)
+        argv = td.build_argv(policy, 'nativ', Path('/tmp'), prompt_file='/tmp/p.md')
+        self.assertIn('http://127.0.0.1:8080/v1', argv)
+        self.assertIn('openai/' + self.MODEL, argv)
+        self.assertEqual(argv[-1], '/tmp/p.md')
+
+    def test_invalid_fields_rejected(self):
+        for opts in ({'base_url': 'ftp://host'}, {'base_url': 'localhost:8080'}, {'base_url': 7},
+                     {'model': ''}, {'model': 3}):
+            with self.subTest(opts=opts), self.assertRaises(config.ConfigError):
+                self.policy(**opts)
+
+    def test_eligible_when_models_lists_model(self):
+        policy = self.policy()
+        opener = self.opener(ids=[self.MODEL])
+        result = selection.select(100, policy=policy, io={}, health_opener=opener)
+        self.assertEqual(result['worker'], 'nativ')
+        self.assertEqual(result['reasons']['nativ'], 'unmetered')
+        self.assertEqual(opener.calls, [('http://127.0.0.1:8080/v1/models', 2)])
+        self.assertEqual(selection.check_local_worker(policy, 'nativ', self.opener(ids=['Qwen2.5-Coder-14B-Instruct-4bit'])),
+                         (True, None))
+
+    def test_ineligible_when_server_not_running(self):
+        policy = self.policy()
+        for opener in (self.opener(error=ConnectionRefusedError(61, 'refused')), self.opener(status=503),
+                       lambda url, timeout: (200, b'not json')):
+            with self.subTest(opener=opener):
+                result = selection.select(100, policy=policy, io={}, health_opener=opener)
+                self.assertIsNone(result['worker'])
+                self.assertNotIn('nativ', result['eligible'])
+                self.assertEqual(result['reasons']['nativ'], 'server_unreachable')
+
+    def test_ineligible_when_model_missing(self):
+        result = selection.select(100, policy=self.policy(), io={}, health_opener=self.opener(ids=['other/model']))
+        self.assertEqual(result['reasons']['nativ'], 'model_not_present')
+        self.assertEqual(result['eligible'], [])
+
+    def test_default_opener_unreachable(self):
+        policy = self.policy(base_url='http://127.0.0.1:9')
+        self.assertEqual(selection.check_local_worker(policy, 'nativ'), (False, 'server_not_running'))
+
+
 class LocalModelHealthTests(unittest.TestCase):
     """Issue #17: local model servers are probed (mocked HTTP only) before a worker is eligible."""
 
@@ -403,6 +471,9 @@ class InitTests(unittest.TestCase):
         self.assertFalse(self.target.exists())
         self.assertEqual(report['config']['worker_order'], ['aider', 'opencode'])
         self.assertIn('process list', ' '.join(report['warnings']))
+        report = self.init(workers='nativ', dry_run=True)
+        self.assertEqual(report['config']['workers']['nativ']['base_url'], 'http://127.0.0.1:8080')
+        self.assertEqual(report['config']['unmetered_workers'], ['nativ'])
         report = self.init(workers='codex,aider', non_interactive=True)
         self.assertEqual(len(report['written']), 3)
         self.assertEqual((self.target / 'config.json').stat().st_mode & 0o777, 0o600)

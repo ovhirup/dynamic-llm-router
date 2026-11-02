@@ -260,6 +260,12 @@ def build_argv(policy, worker, cwd, prompt_file=None, prompt=None, repo=None, en
                    if '{' + name + '}' in template})
     if worker == 'claude':
         values['{claude_effort}'] = chosen_effort
+    local = (policy['run_task'].get('local_models') or {}).get(worker) or {}
+    for field in ('base_url', 'model'):
+        if any('{' + field + '}' in arg for arg in template):
+            if not local.get(field):
+                raise Refused(f'{worker}: template uses {{{field}}} but no {field} is configured')
+            values['{' + field + '}'] = str(local[field]).rstrip('/') if field == 'base_url' else str(local[field])
     argv = []
     for arg in template:
         for key, value in values.items():
