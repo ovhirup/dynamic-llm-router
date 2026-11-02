@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import alerts, brain, config, handoff, security, stackwich, task_dag
+from . import alerts, brain, config, handoff, orchestrator as orch_module, security, stackwich, task_dag
 from . import task_dispatch as td
 
 Refused = td.Refused
@@ -344,11 +344,12 @@ def hops(summary):
 def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full', worker=None,
             keep=None, policy=None, run_task=td.run_task, select=None, now=None, test_runner=td.run_bounded,
             popen=subprocess.Popen, notifier=None, meter=None, task_class=None,
-            reviewer=None, allowed_paths=None):
+            orchestrator=None, reviewer=None, allowed_paths=None):
     """keep: True (--keep), False (--prune) or None (keep on success, prune on failure).
     meter(worker) -> percent used or None (default: the cached meter, never a live read).
     task_class ranks workers by class_order.<task_class> (see selection.select)."""
     policy = policy or config.load_policy()
+    detected_orch = orch_module.detect_orchestrator(explicit=orchestrator)
     if task_class is not None:
         config.worker_order(policy, task_class)  # unknown class -> ConfigError before any worktree
         run_task = functools.partial(run_task, task_class=task_class)
@@ -410,6 +411,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = {'job_id': job_id, 'repo': str(repo), 'task': task_path.name, 'base': base_ref,
                'base_sha': base_sha, 'branch': branch, 'worktree': str(worktree), 'size': size,
+               'orchestrator': detected_orch['orchestrator'], 'orchestrator_reason': detected_orch['reason'],
                'started_at': started.isoformat(timespec='seconds'), 'finished_at': None,
                'ok': False, 'status': None, 'commit': None, 'diff_stat': '', 'tests': [],
                'test_command': None, 'test_command_source': None, 'allow_no_tests': allow_no_tests,
