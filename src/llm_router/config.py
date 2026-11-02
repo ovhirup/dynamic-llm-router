@@ -143,6 +143,20 @@ def blocked_worker(policy, name):
     return Path(executable).name in security.shim_names(policy.get('never') or [])
 
 
+def valid_base_url(value):
+    """An http(s) URL with a host and no query, fragment, credentials or whitespace."""
+    from urllib.parse import urlsplit
+    if not isinstance(value, str) or not value or any(c.isspace() for c in value):
+        return False
+    try:
+        parts = urlsplit(value)
+        parts.port
+    except ValueError:
+        return False
+    return (parts.scheme in ('http', 'https') and bool(parts.hostname) and not parts.query
+            and not parts.fragment and parts.username is None and '{' not in value and '}' not in value)
+
+
 def materialise_workers(policy):
     from . import security
     run = policy['run_task']
@@ -175,7 +189,27 @@ def materialise_workers(policy):
                                 'hard_timeout_seconds': 40, 'freshness_seconds': 1800,
                                 'usage_threshold_percent': 85}, opts['quota'])
             policy.setdefault('quota', {})[name] = quota
-    stackwich = run.setdefault('stackwich', {})
+        if 'base_url' in opts or 'model' in opts:
+            local = dict(run.get('local_models', {}).get(name) or {})
+            if 'base_url' in opts:
+                local['base_url'] = opts['base_url']
+            if 'model' in opts:
+                local['model'] = opts['model']
+            run.setdefault('local_models', {})[name] = local
+    local_models = run.setdefault('local_models', {})
+    if not isinstance(local_models, dict):
+        raise ConfigError('run_task.local_models must be an object')
+    for name, local in local_models.items():
+        if name.startswith('_'):
+            continue
+        if not isinstance(local, dict) or set(local) - {'base_url', 'model'}:
+            raise ConfigError(f'{name}: local model config allows only base_url and model')
+        if 'base_url' in local and not valid_base_url(local['base_url']):
+            raise ConfigError(f'{name}: base_url must be an http:// or https:// URL')
+        if 'model' in local and (not isinstance(local['model'], str) or not local['model'].strip()
+                                 or any(c.isspace() for c in local['model'])):
+            raise ConfigError(f'{name}: model must be a non-empty string')
+    stackwich =run.setdefault('stackwich', {})
     if not isinstance(stackwich, dict):
         raise ConfigError('run_task.stackwich must be an object')
     for name, options in stackwich.items():
