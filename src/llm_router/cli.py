@@ -20,6 +20,8 @@ def build_parser():
     parser.add_argument('--version', action='version', version=f'llm-router {__version__}')
     parser.add_argument('--config', help='config JSON file (default: $LLM_ROUTER_CONFIG or <config dir>/config.json)')
     commands = parser.add_subparsers(dest='command', required=True)
+    from . import allocation_cli
+    allocation_cli.register(commands)
 
     commands.add_parser('paths', help='Show config/state locations and which binaries resolve')
     init = commands.add_parser('init', help='Write example config files into the config dir (never overwrites)')
@@ -155,6 +157,8 @@ def build_parser():
     replay.add_argument('--fake-workers', help='offline: JSON file of per-worker fake profiles')
     replay.add_argument('--no-recorded', action='store_true',
                         help='offline: never replay recorded outcomes, use fake profiles for every worker')
+    replay.add_argument('--size', choices=('draft', 'full'), default=None,
+                        help='override task size (e.g. --size draft for stale-meter runs); recorded in report')
     replay.add_argument('--yes', action='store_true', help='live: confirm running real workers')
     adopt = eval_cmds.add_parser('apply', help='Gate a candidate config fragment against the active policy and '
                                                'write it to the config only if it beats the baseline')
@@ -354,6 +358,9 @@ def doctor(policy):
 def main(argv=None):
     parser, gate_help = build_parser()
     args = parser.parse_args(argv)
+    if args.command == 'plan':
+        from . import allocation_cli
+        return allocation_cli.run(args)
     if args.command == 'init':
         try:
             _print(init_config(force=args.force, workers=args.workers, never=args.never, meters=args.meters,
@@ -459,12 +466,13 @@ def main(argv=None):
                 cases = eval_corpus.load(args.corpus or eval_corpus.corpus_path(policy))
             report = eval_harness.run(cases, specs, mode=args.mode, profiles=profiles, policy=policy,
                                       confirm=args.yes, use_recorded=not args.no_recorded,
-                                      task_class=args.task_class)
+                                      task_class=args.task_class, size=args.size)
         except (eval_harness.Refused, OSError, json.JSONDecodeError) as refusal:
             print(json.dumps({'ok': False, 'refused': str(refusal)}))
             return 3
         stamp = config.now_local(policy).strftime('%Y%m%d-%H%M%S')
         _print({'gate': report['gate'], 'task_class': args.task_class, 'cases': report['cases'],
+                'size_override': report.get('size_override'),
                 'metrics': {name: entry['metrics'] for name, entry in report['policies'].items()},
                 'by_class': {name: entry['by_class'] for name, entry in report['policies'].items()},
                 'skipped': len(report['skipped']), 'report': eval_harness.write_report(report, policy, stamp)})
@@ -522,7 +530,7 @@ def main(argv=None):
                                               test_cmd=args.test_cmd, size=args.size, worker=args.worker,
                                               keep=True if args.keep else False if args.prune else None,
                                               policy=policy, task_class=args.task_class,
-                                              orchestrator=args.orchestrator)
+                                              orchestrator=args.orchestrator, role=args.role)
             elif args.command == 'jobs':
                 if getattr(args, 'live_feed', False):
                     from . import live_jobs_feed
@@ -587,13 +595,8 @@ def main(argv=None):
         _print(result)
         return 0 if result['ok'] or result.get('status') == 'handoff_to_orchestrator' else 1
     if args.command == 'select':
-        from . import roles, selection
-        chars = 0 if args.size == 'draft' else (policy.get('developer') or {}).get('draft_max_chars', 4000) + 1
-        base_sel = selection.select(chars, policy=policy, cached_only=args.cached_only, task_class=args.task_class)
-        if args.role:
-            role_pick = roles.select_for_role(
-                args.role, policy=policy, eligible=base_sel.get('eligible'), meters=base_sel.get('meters'))
-            base_sel.update(worker=role_pick['worker'], role=args.role, role_pick=role_pick)
+        from . import allocation_cli
+        base_sel = allocation_cli.select_result(args, policy)
         _print(base_sel)
         return 0
     parser.error('unknown command')

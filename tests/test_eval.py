@@ -342,6 +342,34 @@ class CliTests(EvalFixture):
         self.assertEqual(code, 3)
         self.assertIn('--yes', json.loads(out.getvalue())['refused'])
 
+    def test_eval_size_override_forces_draft_and_records_in_report(self):
+        seen_sizes = []
+
+        def fake_run_job(repo, task_file, **kwargs):
+            seen_sizes.append(kwargs.get('size'))
+            return {
+                'job_id': f'draft-{len(seen_sizes)}', 'workers': ['cursor'], 'tests_status': 'passed',
+                'status': 'committed', 'diff_stat': ' out.txt | 1 +\n 1 file changed',
+                'started_at': '2026-10-31T10:00:00+00:00', 'finished_at': '2026-10-31T10:00:30+00:00',
+                'attempts': [{'worker': 'cursor', 'runs': [{'worker': 'cursor', 'tokens': 300}]}],
+            }
+
+        report = eval_harness.run(self.cases, self.specs, mode='live', confirm=True, policy=self.policy,
+                                  run_job=fake_run_job, meter=lambda w: None, size='draft')
+        self.assertEqual(report['size_override'], 'draft')
+        self.assertEqual(seen_sizes, ['draft', 'draft', 'draft', 'draft'])
+        self.assertIn('size=draft', eval_harness.render_markdown(report))
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(['eval', 'run', '--size', 'draft', '--policies', str(FIXTURES / 'policies.json'),
+                             '--corpus', str(self.corpus), '--fake-workers', str(FIXTURES / 'fake_workers.json')])
+        self.assertEqual(code, 0)
+        cli_result = json.loads(out.getvalue())
+        self.assertEqual(cli_result['size_override'], 'draft')
+        saved = json.loads(Path(cli_result['report']['json']).read_text())
+        self.assertEqual(saved['size_override'], 'draft')
+
 
 class ConfigGateTests(EvalFixture):
     """#66: a routing/config change is adopted only if it beats the baseline in the harness."""
