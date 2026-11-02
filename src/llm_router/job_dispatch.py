@@ -18,10 +18,96 @@ import subprocess
 import sys
 import tempfile
 
-from . import alerts, config, handoff, risk_tiers, security, stackwich
+from . import agent_map, alerts, brain, config, handoff, orchestrator as orch_module, risk_tiers, security, stackwich, task_dag, triage
 from . import task_dispatch as td
 
 Refused = td.Refused
+
+# Output from these (weaker or local) workers needs a stronger-model review before the owner sees it.
+REVIEWED_WORKERS = ('codex', 'cursor', 'local', 'developer', 'nativ')
+REVIEW_PROMPT_FILE = '.llm-router-review-prompt.md'
+DEFAULT_REVIEWER = 'grok-bot'
+
+
+def review_required(worker):
+    return worker in REVIEWED_WORKERS or str(worker or '').startswith('aider')
+
+
+def build_review_prompt(summary, diff, paths, tests_status):
+    scope = '\n'.join(f'- {path}' for path in sorted(paths)) or '- (none)'
+    return (f'# Stronger-model review: job {summary["job_id"]}\n\n'
+            f'Workers: {", ".join(summary.get("workers") or []) or "unknown"}\n'
+            f'Branch: {summary.get("branch")}\nBase: {summary.get("base_sha")}\n'
+            f'Commit: {summary.get("commit")}\n\n'
+            f'## Declared scope / changed paths\n{scope}\n\n'
+            f'## Test status\n{tests_status}\n\n'
+            '## Instructions\nReview the diff for correctness, scope creep, leaked secrets and missing tests. '
+            'Answer with a verdict of `approve` or `reject` and short notes.\n\n'
+            f'## Diff\n```diff\n{diff}\n```\n')
+
+
+def _stronger_review(summary, worktree, paths, reviewer):
+    """Write the review prompt into the worktree's git dir and record the review (or mark it pending)."""
+    git_dir = Path(_git(worktree, 'rev-parse', '--absolute-git-dir', check=True).stdout.strip())
+    diff = _git(worktree, 'diff', f'{summary["base_sha"]}..{summary["commit"]}').stdout
+    prompt_path = git_dir / REVIEW_PROMPT_FILE
+    prompt_path.unlink(missing_ok=True)
+    fd = os.open(prompt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w') as handle:
+        handle.write(build_review_prompt(summary, diff, paths, summary.get('tests_status')))
+    os.chmod(prompt_path, 0o600)
+    if reviewer is None:
+        return {'status': 'pending', 'reviewer': DEFAULT_REVIEWER, 'prompt_file': str(prompt_path)}
+    try:
+        review = dict(reviewer(summary, diff, prompt_path) or {})
+    except Exception as error:  # an unreviewed change is never treated as approved
+        return {'status': 'error', 'reviewer': getattr(reviewer, '__name__', 'reviewer'),
+                'prompt_file': str(prompt_path),
+                'notes': f'{type(error).__name__}: {security.redact(str(error))[:300]}'}
+    review.setdefault('prompt_file', str(prompt_path))
+    return review
+
+
+_SCOPE_HEADING = re.compile(r'^\s*#{1,6}\s*(?:allowed\s+(?:paths|files)|scope)\s*:?\s*$', re.I)
+_SCOPE_INLINE = re.compile(r'^\s*(?:allowed\s+(?:paths|files)|scope)\s*:\s*(.+)$', re.I)
+_HEADING = re.compile(r'^\s*#{1,6}\s+\S')
+_BULLET = re.compile(r'^\s*[-*]\s+(.+?)\s*$')
+
+
+def parse_allowed_paths(task_text):
+    """Repo-relative files or trailing-'/' directories declared in a task file, or None when undeclared."""
+    raw = []
+    in_section = False
+    for line in (task_text or '').splitlines():
+        if _SCOPE_HEADING.match(line):
+            in_section = True
+            continue
+        if in_section and _HEADING.match(line):
+            in_section = False
+        inline = _SCOPE_INLINE.match(line)
+        if inline:
+            for item in re.split(r'[,\s]+', inline.group(1).strip()):
+                cleaned = item.strip().strip('`\'"')
+                if cleaned:
+                    raw.append(cleaned)
+            continue
+        if in_section:
+            bullet = _BULLET.match(line)
+            if bullet:
+                cleaned = bullet.group(1).strip().strip('`\'"')
+                if cleaned:
+                    raw.append(cleaned)
+    if not raw:
+        return None
+    try:
+        return sorted({task_dag._scope_path(p) for p in raw})
+    except task_dag.DagError as error:
+        raise Refused(f'invalid allowed path in task file: {error}') from None
+
+
+def out_of_scope(paths, scope):
+    """Changed paths not covered by any scope entry (exact match or under a trailing-'/' directory)."""
+    return sorted(p for p in paths if not any(s == p or task_dag._covers(s, p) for s in scope))
 
 
 def _git(cwd, *args, check=False):
@@ -257,11 +343,13 @@ def hops(summary):
 
 def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full', worker=None,
             keep=None, policy=None, run_task=td.run_task, select=None, now=None, test_runner=td.run_bounded,
-            popen=subprocess.Popen, notifier=None, meter=None, task_class=None):
+            popen=subprocess.Popen, notifier=None, meter=None, task_class=None,
+            orchestrator=None, reviewer=None, allowed_paths=None):
     """keep: True (--keep), False (--prune) or None (keep on success, prune on failure).
     meter(worker) -> percent used or None (default: the cached meter, never a live read).
     task_class ranks workers by class_order.<task_class> (see selection.select)."""
     policy = policy or config.load_policy()
+    detected_orch = orch_module.detect_orchestrator(explicit=orchestrator)
     if task_class is not None:
         config.worker_order(policy, task_class)  # unknown class -> ConfigError before any worktree
         run_task = functools.partial(run_task, task_class=task_class)
@@ -277,6 +365,13 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
         raise Refused('bare repositories are not supported')
     task_path = Path(task_file).expanduser().resolve()
     task_text = task_path.read_text()
+    if allowed_paths is not None:
+        try:
+            scope = sorted({task_dag._scope_path(p) for p in allowed_paths})
+        except task_dag.DagError as error:
+            raise Refused(f'invalid allowed path: {error}') from None
+    else:
+        scope = parse_allowed_paths(task_text)
     settings = repo_settings(policy, repo)
     if test_cmd:
         test_source = 'cli'
@@ -316,13 +411,16 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = {'job_id': job_id, 'repo': str(repo), 'task': task_path.name, 'base': base_ref,
                'base_sha': base_sha, 'branch': branch, 'worktree': str(worktree), 'size': size,
+               'orchestrator': detected_orch['orchestrator'], 'orchestrator_reason': detected_orch['reason'],
                'started_at': started.isoformat(timespec='seconds'), 'finished_at': None,
                'ok': False, 'status': None, 'commit': None, 'diff_stat': '', 'tests': [],
                'test_command': None, 'test_command_source': None, 'allow_no_tests': allow_no_tests,
-               'tests_status': None, 'leak_check': None, 'blocked_by_leak_check': False,
+               'tests_status': None, 'leak_check': None, 'blocked_by_leak_check': False, 'triage': None,
+               'allowed_paths': scope, 'diff_scope': None,
                'risk_tier': 'medium', 'approval_required': True,
                'attempts': [], 'workers': [], 'worktree_state': None, 'branch_state': None,
-               'main_checkout_untouched': None, 'handoffs': [], 'warnings': []}
+               'main_checkout_untouched': None, 'handoffs': [], 'warnings': [],
+               'review_required': False, 'review': None}
     with RepoLock(_path(policy, 'lock_dir', 'logs/locks'), repo), _NoSleep(policy, popen):
         before = main_state(repo)
         worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -336,7 +434,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             if test_cmd or allow_no_tests:
                 _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd,
                           test_timeout, stamp, out_dir, run_task, select, test_runner, allow_no_tests,
-                          meter or handoff.meter_percent)
+                          meter or handoff.meter_percent, reviewer=reviewer, scope=scope)
             else:  # fail before spending a worker run on a change nothing would verify
                 summary.update(status='no_tests', tests_status='no_tests', reason=NO_TESTS_REASON)
                 summary['warnings'].append(NO_TESTS_REASON + ': set test_cmd, pass --test-cmd, or set '
@@ -354,11 +452,23 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             if after != before:
                 summary['ok'] = False
                 summary['warnings'].append('main checkout state changed during the job: review it')
+    if not summary['ok']:
+        cause = td.failure_fields(summary['attempts'])
+        for key in ('failure_reason', 'stderr_tail', 'error'):
+            if cause.get(key) and not summary.get(key):
+                summary[key] = cause[key]
     summary['hops'] = hops(summary)
     summary['finished_at'] = td.now_local(policy).isoformat(timespec='seconds')
     summary = security.redact_obj(summary)
     jobs_dir = _path(policy, 'jobs_dir', 'logs/jobs')
     jobs_dir.mkdir(parents=True, exist_ok=True)
+    (jobs_dir / f'{job_id}.json').write_text(json.dumps(summary, indent=2))
+    try:  # the vault note is a by-product: never fail the job over it
+        note_path = brain.write_job_outcome(policy, summary)
+    except OSError as error:
+        note_path = None
+        summary['warnings'].append(f'vault note not written: {security.redact(str(error))[:200]}')
+    summary['vault_note'] = str(note_path) if note_path else None
     (jobs_dir / f'{job_id}.json').write_text(json.dumps(summary, indent=2))
     td.append_ledger(td._router_path(policy, 'ledger', 'logs/ledger.csv'),
                      [started.strftime('%Y-%m-%d %H:%M'), 'run-job', f'run-job {job_id} {task_path.name}',
@@ -368,6 +478,61 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
                       f'worktree={summary["worktree_state"]}'])
     alerts.job_alert(policy, summary, notifier=notifier)
     return summary
+
+
+RESEARCH_REFUSAL = 'research class is never routed to a worker; the orchestrator handles research directly'
+
+
+def bot_dispatch(repo, task_file, task_class='feature', size=None, base=None, branch=None,
+                 test_cmd=None, worker=None, keep=None, policy=None, run_job_fn=None, **kwargs):
+    """Map task_class + size to class_order, call run-job, and return one compact JSON summary
+    with action, worker, job_id and reason. Refuses research tasks before touching the repo."""
+    policy = policy or config.load_policy()
+    normalized_class = (task_class or 'feature').strip().lower()
+    resolved_size = size or ('draft' if normalized_class == 'draft' else 'full')
+    if normalized_class == 'research':
+        return {'ok': False, 'action': 'refused', 'worker': None, 'job_id': None,
+                'reason': RESEARCH_REFUSAL, 'refused': RESEARCH_REFUSAL,
+                'task_class': normalized_class, 'size': resolved_size}
+    if normalized_class not in config.TASK_CLASSES:
+        reason = f'unknown task class {task_class!r}: use one of {", ".join(config.TASK_CLASSES)}'
+        return {'ok': False, 'action': 'refused', 'worker': None, 'job_id': None,
+                'reason': reason, 'refused': reason, 'task_class': task_class, 'size': resolved_size}
+    if resolved_size not in ('draft', 'full'):
+        reason = f'size must be draft or full (got {resolved_size!r})'
+        return {'ok': False, 'action': 'refused', 'worker': None, 'job_id': None,
+                'reason': reason, 'refused': reason, 'task_class': normalized_class, 'size': resolved_size}
+    order = config.worker_order(policy, normalized_class)
+    runner = run_job_fn or run_job
+    try:
+        job = runner(repo, task_file, base=base, branch=branch, test_cmd=test_cmd,
+                     size=resolved_size, worker=worker, keep=keep, policy=policy,
+                     task_class=normalized_class, **kwargs)
+    except (Refused, config.ConfigError) as refusal:
+        reason = str(refusal)
+        return {'ok': False, 'action': 'refused', 'worker': None, 'job_id': None,
+                'reason': reason, 'refused': reason, 'task_class': normalized_class,
+                'size': resolved_size, 'class_order': order}
+    status = job.get('status')
+    chosen = (job.get('worker')
+              or (job['workers'][-1] if job.get('workers') else None)
+              or (config.ORCHESTRATOR if status == 'handoff_to_orchestrator' else None))
+    if status == 'handoff_to_orchestrator':
+        action = 'handoff_to_orchestrator'
+    elif status == 'refused':
+        action = 'refused'
+    elif job.get('ok'):
+        action = 'dispatched'
+    else:
+        action = 'failed'
+    reason = (job.get('reason')
+              or (job['warnings'][-1] if job.get('warnings') else None)
+              or status
+              or ('committed' if job.get('ok') else 'failed'))
+    return {'ok': bool(job.get('ok')), 'action': action, 'worker': chosen,
+            'job_id': job.get('job_id'), 'reason': reason, 'status': status,
+            'task_class': normalized_class, 'size': resolved_size, 'class_order': order,
+            'branch': job.get('branch'), 'commit': job.get('commit')}
 
 
 class _NoSleep:
@@ -398,19 +563,22 @@ class _NoSleep:
 
 def _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd, test_timeout,
               stamp, out_dir, run_task, select, test_runner, allow_no_tests=False,
-              meter=handoff.meter_percent):
+              meter=handoff.meter_percent, reviewer=None, scope=None):
     # 'no_tests' passes only on the repo's explicit opt-in; anything else ('skipped', 'not_run') never does.
     passing = ('passed', 'no_tests') if allow_no_tests else ('passed',)
-    extra = handoff.WORKER_INSTRUCTIONS  # every worker writes a handoff note at checkpoints and on stop
+    repo_map = agent_map.load_repo_map(worktree)
+    base_instructions = '\n\n'.join(filter(None, [handoff.WORKER_INSTRUCTIONS, repo_map]))
+    extra = base_instructions  # every worker writes a handoff note at checkpoints and on stop
     test_artifacts, worker_paths = set(), set()
 
-    def save_note(worker, reason, worker_note=None, tests=None, test_log=None):
+    def save_note(worker, reason, worker_note=None, tests=None, test_log=None, triage_info=None):
         """Write a handoff note (the worker's if valid, else a router one) into the job's handoffs dir."""
         note, path = handoff.checkpoint(
             policy, summary['job_id'], worktree, summary['base_sha'], worker, reason,
             changed_paths(worktree) - test_artifacts - {handoff.NOTE_FILE}, worker_note=worker_note,
             goal=task_text[:1500], test_status=(tests or {}).get('status'), test_log=test_log,
-            meter=meter(worker) if worker else None, branch=summary['branch'])
+            meter=meter(worker) if worker else None, branch=summary['branch'],
+            triage_info=triage_info or summary.get('triage'))
         summary['handoffs'].append({'path': str(path), 'worker': worker, 'source': note.get('source'),
                                     'switch_reason': reason})
         return note
@@ -461,6 +629,9 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
             summary['attempts'].append({'attempt': cycle, 'handoff_to_orchestrator': result.get('task_file')})
             return
         runs = result.get('attempts', [])
+        parsed_triage = triage.extract_from_runs(runs)
+        if parsed_triage is not None:
+            summary['triage'] = parsed_triage
         used |= {r['worker'] for r in runs if r.get('worker')}
         failed |= {r['worker'] for r in runs if r.get('worker') and not r.get('ok')}
         claude_quota = any(r.get('worker') == 'claude' and r.get('quota_error') for r in runs)
@@ -501,6 +672,22 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         if required:
             worker_paths.discard(stackwich.REPORT_PATH)
         changed = bool(worker_paths)
+        if scope:
+            outside = out_of_scope(worker_paths, scope)
+            diff_scope = {'status': 'fail' if outside else 'ok', 'allowed': list(scope),
+                          'changed': sorted(worker_paths), 'out_of_scope': outside}
+            summary['diff_scope'] = diff_scope
+            if outside:
+                if selected and selected not in summary['workers']:
+                    summary['workers'].append(selected)
+                summary.update(status='diff_out_of_scope', reason='diff_out_of_scope')
+                summary['warnings'].append('diff_out_of_scope: ' + ', '.join(outside))
+                summary['attempts'].append({'attempt': cycle, 'worker': selected, 'ok': False,
+                                            'changed': changed, 'runs': result.get('attempts'),
+                                            'reason': 'diff_out_of_scope', 'diff_scope': diff_scope,
+                                            'leak_check': (result.get('leak_check') or {}).get('status'),
+                                            'warnings': result.get('warnings')})
+                return
         if required:
             scan = _report_leak_check(policy, worktree, summary['base_sha'])
             if scan['status'] != 'clean':
@@ -547,9 +734,15 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         summary['tests_status'] = tests['status']
         summary['attempts'].append({'attempt': cycle, 'worker': selected, 'ok': result.get('ok'),
                                     'changed': changed, 'runs': result.get('attempts'),
+                                    'triage': parsed_triage,
                                     'tests': tests['status'], 'stackwich': evidence,
                                     'leak_check': (result.get('leak_check') or {}).get('status'),
                                     'warnings': result.get('warnings')})
+        if not result.get('ok'):
+            cause = td.failure_fields(runs)
+            for key in ('failure_reason', 'stderr_tail'):
+                if cause.get(key):
+                    summary['attempts'][-1][key] = cause[key]
         if selected and selected not in summary['workers']:
             summary['workers'].append(selected)
         if result['ok'] and changed and tests['status'] in passing and (
@@ -567,7 +760,7 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
                   else f'tests {tests["status"]}' if tests['status'] not in passing else 'retry')
         log = out_dir / f'{stamp}-a{cycle}-tests.log'
         note = save_note(selected, reason, worker_note, tests, log if log.exists() else None)
-        extra = '\n\n'.join(filter(None, [handoff.WORKER_INSTRUCTIONS, handoff.render_for_prompt(note),
+        extra = '\n\n'.join(filter(None, [base_instructions, handoff.render_for_prompt(note),
                                           _retry_note(result, tests)]))
         if required:
             extra += '\nStackwich errors: ' + '; '.join(evidence['errors'])
@@ -629,6 +822,13 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
     summary['risk_reasons'] = risk['reasons']
     summary['ok'] = True
     summary['status'] = 'committed'
+    producer = last.get('worker')
+    summary['review_required'] = any(review_required(w) for w in [producer, *summary['workers']] if w)
+    if summary['review_required']:
+        summary['review'] = _stronger_review(summary, worktree, worker_paths, reviewer)
+        if summary['review'].get('verdict') == 'reject':
+            summary['ok'] = False
+            summary['status'] = 'review_rejected'
 
 
 def _finish(policy, summary, repo, worktree, branch, base_sha, keep):
@@ -636,7 +836,7 @@ def _finish(policy, summary, repo, worktree, branch, base_sha, keep):
         summary['status'] = 'failed'
     success = summary['ok']
     leak = summary['blocked_by_leak_check']
-    blocked = summary['status'] in ('blocked_by_stackwich', 'no_tests')
+    blocked = summary['status'] in ('blocked_by_stackwich', 'no_tests', 'review_rejected')
     prune = keep is False or (keep is None and not success and not leak and not blocked)
     if summary['status'] == 'blocked_by_stackwich' and keep is None:
         summary['warnings'].append('Stackwich blocked: worktree kept for review')

@@ -11,18 +11,20 @@ from pathlib import Path
 import re
 import subprocess
 
-from . import claude_handoff, config, security
+from . import claude_handoff, config, security, triage
 from .claude_handoff import build_prompt, clean, continuation_limit, effort, inspect  # noqa: F401
 
 NOTE_FILE = '.llm-router-handoff.md'
 SECTIONS = ('Goal', 'Files touched', 'Diff summary', 'Test status', 'Decisions', 'Next steps',
             'Gotchas', 'Meter', 'Switch reason')
 REQUIRED = ('Goal', 'Files touched', 'Test status', 'Next steps', 'Switch reason')
-HEADER_KEYS = ('job_id', 'worker', 'created_at', 'source', 'switch_reason', 'branch', 'worktree')
+HEADER_KEYS = ('job_id', 'worker', 'created_at', 'source', 'switch_reason', 'branch', 'worktree', 'triage',
+               'definition_of_done', 'stopping_rule')
 DEFAULT_THRESHOLD = 85
 TAIL_CHARS = 2000
 
 WORKER_INSTRUCTIONS = (
+    triage.TRIAGE_INSTRUCTIONS + '\n\n' +
     f'Handoff note: at each checkpoint (after every commit-worthy step) and when you stop, write or update '
     f'`{NOTE_FILE}` at the checkout root (the router collects it; it is never committed). Use these '
     'markdown sections: ' + ', '.join(f'## {name}' for name in SECTIONS if name not in ('Meter', 'Switch reason')) +
@@ -62,8 +64,11 @@ def render(note):
     lines = ['---']
     lines += [f'{key}: {note[key]}' for key in HEADER_KEYS if note.get(key) not in (None, '')]
     lines += ['---', '']
+    sections = note.get('sections') or {}
     for name in SECTIONS:
-        lines += [f'## {name}', (note.get('sections', {}).get(name) or '').strip(), '']
+        lines += [f'## {name}', (sections.get(name) or '').strip(), '']
+    if 'Triage' in sections and (sections.get('Triage') or '').strip():
+        lines += ['## Triage', sections['Triage'].strip(), '']
     return '\n'.join(lines)
 
 
@@ -164,26 +169,27 @@ def _tail(path, chars=TAIL_CHARS):
 
 
 def synthesise(worktree, base_sha, worker, switch_reason, diff_paths, goal='', test_status=None,
-               test_log=None, meter=None):
+               test_log=None, meter=None, triage_info=None):
     """A router-written note from git state, for a missing or invalid worker note."""
     stat = _git(worktree, 'diff', '--stat', base_sha).stdout.strip() if base_sha else ''
     commits = _git(worktree, 'log', '--oneline', '-5', f'{base_sha}..HEAD').stdout.strip() if base_sha else ''
     tail = _tail(test_log)
     tests = (test_status or 'not_run') + (f'\nLast failure (log tail):\n{tail}' if tail else '')
     return {'worker': worker, 'source': 'router', 'switch_reason': switch_reason,
-            'sections': {'Goal': (goal or '').strip() or '(see task)',
-                         'Files touched': '\n'.join(sorted(diff_paths)) or 'none',
-                         'Diff summary': stat or 'no changes',
-                         'Test status': tests,
-                         'Decisions': 'Recent commits:\n' + commits if commits else 'none recorded (router note)',
-                         'Next steps': 'Continue the task from the current worktree state; make the tests pass.',
-                         'Gotchas': 'The previous worker left no valid handoff note; this one was written by the router.',
-                         'Meter': f'{meter:g}%' if type(meter) in (int, float) else 'unknown',
-                         'Switch reason': switch_reason}}
+            'sections': dict({'Goal': (goal or '').strip() or '(see task)',
+                              'Files touched': '\n'.join(sorted(diff_paths)) or 'none',
+                              'Diff summary': stat or 'no changes',
+                              'Test status': tests,
+                              'Decisions': 'Recent commits:\n' + commits if commits else 'none recorded (router note)',
+                              'Next steps': 'Continue the task from the current worktree state; make the tests pass.',
+                              'Gotchas': 'The previous worker left no valid handoff note; this one was written by the router.',
+                              'Meter': f'{meter:g}%' if type(meter) in (int, float) else 'unknown',
+                              'Switch reason': switch_reason},
+                             **({'Triage': triage.format_for_handoff(triage_info)} if triage_info else {}))}
 
 
 def checkpoint(policy, job_id, worktree, base_sha, worker, switch_reason, diff_paths, worker_note=None,
-               goal='', test_status=None, test_log=None, meter=None, branch=None, now=None):
+               goal='', test_status=None, test_log=None, meter=None, branch=None, now=None, triage_info=None):
     """Validate the worker's collected note (else synthesise one), stamp router facts, write it.
 
     Returns (note, path). The worker's note is copied, never mutated."""
@@ -191,13 +197,15 @@ def checkpoint(policy, job_id, worktree, base_sha, worker, switch_reason, diff_p
     errors = validate_note(note, diff_paths)
     if errors or note is None:
         note = synthesise(worktree, base_sha, worker, switch_reason, diff_paths, goal, test_status,
-                          test_log, meter)
+                          test_log, meter, triage_info=triage_info)
         note['sections']['Gotchas'] += '\nWorker note rejected: ' + '; '.join(errors)
     else:
         note['source'] = 'worker'
         sections = note['sections']
         sections['Switch reason'] = switch_reason
         sections.setdefault('Meter', f'{meter:g}%' if type(meter) in (int, float) else 'unknown')
+        if triage_info and not (sections.get('Triage') or '').strip():
+            sections['Triage'] = triage.format_for_handoff(triage_info)
         if not (sections.get('Diff summary') or '').strip() and base_sha:
             sections['Diff summary'] = _git(worktree, 'diff', '--stat', base_sha).stdout.strip() or 'no changes'
     note.update(job_id=job_id, worker=worker, switch_reason=switch_reason, branch=branch,

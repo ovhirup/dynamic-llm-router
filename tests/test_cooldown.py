@@ -1,9 +1,10 @@
 """Quota/429 cooldowns: a failed worker is skipped by select() until its meter resets (frozen clock)."""
 from datetime import datetime, timedelta, timezone
 import json
+import tempfile
 import unittest
 
-from helpers import load_policy
+from helpers import FakeWorkerHarness, load_policy
 from llm_router import config, cooldown, selection
 
 NOW = datetime(2026, 10, 18, 12, tzinfo=timezone.utc)
@@ -61,6 +62,23 @@ class CooldownTests(unittest.TestCase):
 
     def test_falls_back_to_most_used_window_reset_when_not_exhausted(self):
         self.assertEqual(cooldown.record('codex', now=NOW, observation=observation(RESET, percent=90)), RESET)
+
+    def test_fake_quota_worker_output_cools_worker_and_select_fails_over(self):
+        run = FakeWorkerHarness('quota', stderr='Usage limit reached; limit resets Oct 18, 3:00 PM').run()
+        self.assertEqual(run['returncode'], 1)
+        self.assertRegex(run['stderr'], load_policy()['run_task']['quota_error_pattern'])
+        until = cooldown.record('codex', now=NOW, observation={}, text=run['stderr'], zone=timezone.utc)
+        self.assertEqual(until, RESET)
+        self.assertEqual(self.select(NOW + timedelta(hours=1))['worker'], 'grok-build')
+        self.assertEqual(self.select(RESET)['worker'], 'codex')
+
+    def test_fake_auth_and_fail_workers_do_not_match_quota_pattern(self):
+        import re
+        pattern = re.compile(load_policy()['run_task']['quota_error_pattern'])
+        with tempfile.TemporaryDirectory() as tmp:
+            for mode in ('auth', 'fail', 'ok', 'no_change'):
+                with self.subTest(mode=mode):
+                    self.assertFalse(pattern.search(FakeWorkerHarness(mode).run(cwd=tmp)['stderr']))
 
     def test_corrupt_state_is_ignored(self):
         cooldown.path().parent.mkdir(parents=True, exist_ok=True)
