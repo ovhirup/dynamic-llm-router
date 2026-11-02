@@ -129,9 +129,10 @@ def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=N
                 results.append(record)
                 continue
             state, handle = acquire_slot(policy, entry['worker'])
-            if state == 'full':
+            if state in ('full', 'local_busy'):
                 record.update(ok=False, status='deferred_slot_full',
-                              reason=f"{entry['worker']} concurrency cap reached")
+                              reason=(f"{entry['worker']} concurrency cap reached" if state == 'full'
+                                      else 'local_busy: another local model job is running'))
                 summary['deferred'].append(dict(record))
                 results.append(record)
                 continue

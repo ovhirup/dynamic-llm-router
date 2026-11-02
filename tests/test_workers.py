@@ -224,6 +224,60 @@ class WorkerTests(unittest.TestCase):
             rows = list(csv.DictReader(handle))
         self.assertEqual(rows[-1]['used_percent'], '10')
 
+    def local_policy(self):
+        policy = load_policy(worker_order=['aider-ollama'], workers={'aider-ollama': {'command': ['fake-worker']}},
+                             unmetered_workers=['aider-ollama'],
+                             run_task={'ledger': str(self.base / 'ledger.csv'), 'shim_dir': str(self.base / 'shims'),
+                                       'block_log': str(self.base / 'blocked.log'),
+                                       'slot_dir': str(self.base / 'slots')})
+        return policy
+
+    def test_local_model_workers_detected(self):
+        for name in ('developer', 'aider-ollama', 'aider-ollama-qwen', 'nativ', 'nativ-14b', 'local'):
+            self.assertTrue(td.is_local_model_worker(name), name)
+        for name in ('codex', 'claude', 'sample'):
+            self.assertFalse(td.is_local_model_worker(name), name)
+
+    def test_second_local_model_job_refused_local_busy(self):
+        policy = self.local_policy()
+        self.assertEqual(td.acquire_slot(policy, 'codex'), ('uncapped', None))
+        state, held = td.acquire_slot(policy, 'aider-ollama')
+        self.assertEqual(state, 'held')
+        try:
+            self.assertEqual(td.acquire_slot(policy, 'aider-ollama'), ('local_busy', None))
+            self.assertEqual(td.acquire_slot(policy, 'developer'), ('local_busy', None))
+            self.assertEqual(td.acquire_slot(policy, 'codex'), ('uncapped', None))  # remote workers unaffected
+            runner = lambda *a, **k: {'returncode': 0, 'timed_out': False, 'stdout': 'done', 'stderr': '',
+                                      'elapsed_seconds': 0}
+            with self.assertRaisesRegex(td.Refused, 'local_busy'):
+                td.run_task(self.task, self.repo, policy=policy, runner=runner, worker='aider-ollama',
+                            output_root=self.base / 'out')
+        finally:
+            held.close()
+        # Released: the developer slot (cap 1) and the local lock are both free again.
+        state, held = td.acquire_slot(policy, 'developer')
+        self.assertEqual(state, 'held')
+        held.close()
+        result = td.run_task(self.task, self.repo, policy=policy, runner=runner, worker='aider-ollama',
+                             output_root=self.base / 'out')
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['worker'], 'aider-ollama')
+        state, held = td.acquire_slot(policy, 'aider-ollama')  # the run released the local lock
+        self.assertEqual(state, 'held')
+        held.close()
+
+    def test_local_busy_releases_per_worker_slot(self):
+        policy = self.local_policy()
+        state, held = td.acquire_slot(policy, 'aider-ollama')
+        try:
+            self.assertEqual(td.acquire_slot(policy, 'developer'), ('local_busy', None))
+        finally:
+            held.close()
+        # developer's own cap-1 slot was not leaked by the local_busy refusal.
+        state, held = td.acquire_slot(policy, 'developer')
+        self.assertEqual(state, 'held')
+        held.close()
+
     def test_auto_ineligible_and_generic_requires_unmetered(self):
         policy = self.policy(ineligible={'sample': 'fixture'})
         self.assertIsNone(selection.select(10000, policy=policy, io={})['worker'])
