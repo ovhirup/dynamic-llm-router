@@ -35,6 +35,8 @@ def build_parser():
     selection.add_argument('--size', choices=('draft', 'full'), default='full')
     selection.add_argument('--cached-only', action='store_true')
     selection.add_argument('--class', dest='task_class', choices=config.TASK_CLASSES)
+    selection.add_argument('--role', choices=('planner', 'coder', 'searcher', 'judge', 'advisor'),
+                           help='pick worker by role (planner, coder, searcher, judge, advisor)')
 
     task = commands.add_parser('run-task', help='Run a task file headless in a clean git checkout')
     task.add_argument('--task-file', required=True)
@@ -53,6 +55,8 @@ def build_parser():
     job.add_argument('--size', choices=('draft', 'full'), default='full')
     job.add_argument('--worker')
     job.add_argument('--class', dest='task_class', choices=config.TASK_CLASSES)
+    job.add_argument('--role', choices=('planner', 'coder', 'searcher', 'judge', 'advisor'),
+                     help='role for this job (planner, coder, searcher, judge, advisor)')
     keep = job.add_mutually_exclusive_group()
     keep.add_argument('--keep', action='store_true', help='keep the worktree even on failure')
     keep.add_argument('--prune', action='store_true', help='remove the worktree even on success')
@@ -508,9 +512,14 @@ def main(argv=None):
         _print(result)
         return 0 if result['ok'] or result.get('status') == 'handoff_to_orchestrator' else 1
     if args.command == 'select':
-        from . import selection
+        from . import roles, selection
         chars = 0 if args.size == 'draft' else (policy.get('developer') or {}).get('draft_max_chars', 4000) + 1
-        _print(selection.select(chars, policy=policy, cached_only=args.cached_only, task_class=args.task_class))
+        base_sel = selection.select(chars, policy=policy, cached_only=args.cached_only, task_class=args.task_class)
+        if args.role:
+            role_pick = roles.select_for_role(
+                args.role, policy=policy, eligible=base_sel.get('eligible'), meters=base_sel.get('meters'))
+            base_sel.update(worker=role_pick['worker'], role=args.role, role_pick=role_pick)
+        _print(base_sel)
         return 0
     parser.error('unknown command')
     return 2
