@@ -9,7 +9,7 @@ import time
 import unittest
 from pathlib import Path
 
-from helpers import load_policy, TERM
+from helpers import FakeWorkerHarness, load_policy, TERM
 from llm_router import job_dispatch as jd
 from llm_router import cooldown, task_dispatch as td
 from test_task_dispatch import repo
@@ -44,7 +44,7 @@ class JobTests(unittest.TestCase):
         self.policy = policy
         # Never reach a real CLI from unit tests: every worker starts as a failing fake.
         for name in ('codex', 'grok-build', 'cursor'):
-            self.worker("import sys; sys.exit(3)", name)
+            FakeWorkerHarness('fail').install(self.policy, name)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -55,6 +55,9 @@ class JobTests(unittest.TestCase):
     def worker(self, code, name='codex'):
         tail = [a for a in self.policy['run_task']['commands'][name] if a in ('-', '{prompt_file}', '{prompt_pointer}')]
         self.policy['run_task']['commands'][name] = [sys.executable, '-c', code] + tail
+
+    def fake(self, mode, name='codex', **options):
+        return FakeWorkerHarness(mode, **options).install(self.policy, name)
 
     def job(self, **kw):
         kw.setdefault('select', self.select)
@@ -125,8 +128,8 @@ class JobTests(unittest.TestCase):
                 'meters': {'codex': 10, 'grok-build': 10, 'cursor': 10}, 'reason': 'test'}
 
     def test_quota_error_fails_over_to_next_worker(self):
-        self.worker("import sys; print('Usage limit reached', file=sys.stderr); sys.exit(1)")
-        self.worker("open('out.txt','w').write('hi\\n')", 'grok-build')
+        self.fake('quota')
+        self.fake('ok', 'grok-build')
         result = self.job(test_cmd='test -f out.txt', select=self.select_all)
         self.assertTrue(result['ok'], result)
         runs = result['attempts'][0]['runs']
@@ -172,9 +175,8 @@ class JobTests(unittest.TestCase):
         self.assertIn('no eligible worker', result['attempts'][1]['refused'])  # nobody re-runs
 
     def test_auth_error_marks_worker_unavailable_and_fails_over(self):
-        self.worker("import sys; print('Failed to authenticate: OAuth session expired and could not be "
-                    "refreshed', file=sys.stderr); sys.exit(1)")
-        self.worker("open('out.txt','w').write('hi\\n')", 'grok-build')
+        self.fake('auth')
+        self.fake('ok', 'grok-build')
         result = self.job(test_cmd='test -f out.txt')
         self.assertTrue(result['ok'], result)
         runs = result['attempts'][0]['runs']
@@ -188,11 +190,10 @@ class JobTests(unittest.TestCase):
 
     def test_live_case_auth_then_timeout_fails_over_to_third_worker(self):
         # 31 Oct: claude auth failed in 3s, aider timed out, and the router refused the retry.
-        self.worker("import sys; print('OAuth session expired', file=sys.stderr); sys.exit(1)")
-        self.worker("import time, sys; print('quota exhausted? no, just slow'); sys.stdout.flush(); time.sleep(30)",
-                    'grok-build')
+        self.fake('auth', stderr='OAuth session expired')
+        self.fake('timeout', 'grok-build', stderr='quota exhausted? no, just slow')
         self.policy['run_task']['timeouts_seconds']['grok-build'] = 1
-        self.worker("open('out.txt','w').write('hi\\n')", 'cursor')
+        self.fake('ok', 'cursor')
         result = self.job(test_cmd='test -f out.txt', select=self.select_all)
         self.assertTrue(result['ok'], result)
         self.assertEqual([(h['worker'], h['reason']) for h in result['hops']],
@@ -201,7 +202,7 @@ class JobTests(unittest.TestCase):
         self.assertNotIn('grok-build', cooldown.active())  # a timeout is not a quota cooldown
 
     def test_exhausted_failover_is_reported_not_refused(self):
-        self.worker("import sys; print('OAuth session expired', file=sys.stderr); sys.exit(1)")
+        self.fake('auth', stderr='OAuth session expired')
         result = self.job(test_cmd='true')  # eligible: codex, grok-build (both fail)
         self.assertFalse(result['ok'])
         self.assertEqual((result['status'], result['failover']), ('failed', 'exhausted'))
@@ -274,7 +275,7 @@ class JobTests(unittest.TestCase):
         self.assertEqual(git(Path(result['worktree']), 'diff', '--cached', '--name-only'), '')
 
     def test_no_change_is_failure(self):
-        self.worker("pass")
+        self.fake('no_change')
         result = self.job(test_cmd='true')
         self.assertFalse(result['ok'])
         self.assertEqual([a['changed'] for a in result['attempts']], [False, False])
