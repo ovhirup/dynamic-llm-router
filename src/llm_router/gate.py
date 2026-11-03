@@ -13,20 +13,27 @@ def _count(label: str, line: str) -> int:
     return int(match.group(1)) if match else 0
 
 
+def _is_summary_line(line: str) -> bool:
+    return bool(re.search(r'\d+ (passed|failed|skipped|error|xpassed|xfailed)', line))
+
+
 def parse_pytest_summary(output: str) -> dict:
-    """Extract passed/failed/skipped/subtests from pytest's final summary line."""
-    counts = {'passed': 0, 'failed': 0, 'skipped': 0, 'subtests': 0, 'errors': 0}
-    for line in reversed(output.splitlines()):
-        line = line.strip()
-        if not re.search(r'\d+ (passed|failed|skipped|error)', line):
-            continue
-        counts['subtests'] = _count('subtests passed', line)
-        without_subtests = re.sub(r'\d+ subtests passed,?\s*', '', line)
-        counts['passed'] = _count('passed', without_subtests)
-        counts['failed'] = _count('failed', line)
-        counts['skipped'] = _count('skipped', line)
-        counts['errors'] = _count('error', line)
+    """Extract pytest result counts from summary lines in the combined output."""
+    counts = {'passed': 0, 'failed': 0, 'skipped': 0, 'subtests': 0, 'errors': 0,
+              'xpassed': 0, 'xfailed': 0}
+    summary_lines = [ln.strip() for ln in output.splitlines() if _is_summary_line(ln.strip())]
+    if not summary_lines:
         return counts
+    last = summary_lines[-1]
+    counts['subtests'] = _count('subtests passed', last)
+    without_subtests = re.sub(r'\d+ subtests passed,?\s*', '', last)
+    counts['passed'] = _count('passed', without_subtests)
+    for line in summary_lines:
+        counts['failed'] = max(counts['failed'], _count('failed', line))
+        counts['skipped'] = max(counts['skipped'], _count('skipped', line))
+        counts['errors'] = max(counts['errors'], _count('error', line))
+        counts['xpassed'] = max(counts['xpassed'], _count('xpassed', line))
+        counts['xfailed'] = max(counts['xfailed'], _count('xfailed', line))
     return counts
 
 
@@ -39,6 +46,10 @@ def evaluate_pytest(exit_code: int, output: str) -> dict:
         reasons.append(f"{summary['failed']} failed, {summary['errors']} errors")
     if summary['skipped']:
         reasons.append(f"{summary['skipped']} skipped")
+    if summary['xpassed']:
+        reasons.append(f"{summary['xpassed']} xpassed")
+    if summary['xfailed']:
+        reasons.append(f"{summary['xfailed']} xfailed")
     if summary['passed'] == 0 and summary['skipped'] == 0 and exit_code == 0:
         reasons.append('no tests reported passed')
     ok = not reasons

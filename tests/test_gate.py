@@ -35,6 +35,26 @@ class ParsePytestSummaryTests(unittest.TestCase):
         verdict = gate.evaluate_pytest(0, '1 passed, 1 skipped in 0.01s\n')
         self.assertFalse(verdict['ok'])
 
+    def test_evaluate_fails_on_xpassed_with_exit_zero(self):
+        verdict = gate.evaluate_pytest(0, '1 xpassed, 1 passed in 0.01s\n')
+        self.assertFalse(verdict['ok'])
+        self.assertTrue(any('xpassed' in r for r in verdict['reasons']))
+
+    def test_evaluate_fails_on_xfailed_with_exit_zero(self):
+        verdict = gate.evaluate_pytest(0, '1 xfailed, 2 passed in 0.01s\n')
+        self.assertFalse(verdict['ok'])
+        self.assertTrue(any('xfailed' in r for r in verdict['reasons']))
+
+    def test_evaluate_fails_on_errors_only_summary(self):
+        verdict = gate.evaluate_pytest(1, '2 errors in 0.01s\n')
+        self.assertFalse(verdict['ok'])
+
+    def test_evaluate_fails_when_skipped_only_on_earlier_summary_line(self):
+        """Later 'N passed' decoy line must not hide an earlier skipped count."""
+        out = '1 skipped in 0.01s\n2 passed in 0.01s\n'
+        verdict = gate.evaluate_pytest(0, out)
+        self.assertFalse(verdict['ok'])
+
 
 class GateRunTests(unittest.TestCase):
     def _run_gate(self, test_path, **kwargs):
