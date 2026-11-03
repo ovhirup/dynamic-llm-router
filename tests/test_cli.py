@@ -31,6 +31,17 @@ class CliTests(unittest.TestCase):
                 cli.main([name, '--help'])
             self.assertEqual(done.exception.code, 0)
 
+    def test_every_help_string_renders(self):
+        # argparse %-formats help text: a bare '%' crashes `--help` everywhere and, on Python 3.14+, every command
+        import argparse
+        parser, _ = cli.build_parser()
+        self.assertIn('llm-router', parser.format_help())
+        subparsers = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        for name, sub in subparsers.choices.items():
+            with self.subTest(command=name):
+                sub.format_help()
+        self.assertIn('used %,', parser.format_help())  # '%%' renders as a literal '%'
+
     def test_init_never_overwrites(self):
         import os
         saved = os.environ['LLM_ROUTER_CONFIG_DIR']
