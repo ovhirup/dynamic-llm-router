@@ -24,6 +24,8 @@ def build_parser():
     from . import allocation_cli, batch_runner
     allocation_cli.register(commands)
     batch_runner.register(commands)
+    from . import gate as quality_gate
+    quality_gate.register_parser(commands)
 
     commands.add_parser('paths', help='Show config/state locations and which binaries resolve')
     init = commands.add_parser('init', help='Write example config files into the config dir (never overwrites)')
@@ -462,6 +464,9 @@ def save_switch_preference(mode, target=None, preferred=None):
 def main(argv=None):
     parser, gate_help = build_parser()
     args = parser.parse_args(argv)
+    if args.command == 'gate':
+        from . import gate as quality_gate
+        return quality_gate.cli_main(args)
     if args.command == 'plan':
         from . import allocation_cli
         return allocation_cli.run(args)
