@@ -102,6 +102,25 @@ def verify_fail_first(policy, worktree, base_sha, worker_paths, test_cmd, test_t
             'product_paths': product_paths,
             'base_tests': base_tests,
         }
+    if base_tests.get('status') == 'timeout':
+        return {
+            'ok': False,
+            'status': 'check_proves_nothing',
+            'reason': 'check proves nothing: baseline test run timed out before demonstrating failure on base',
+            'test_paths': test_paths,
+            'product_paths': product_paths,
+            'base_tests': base_tests,
+        }
+    if base_tests.get('status') != 'failed':
+        return {
+            'ok': False,
+            'status': 'check_proves_nothing',
+            'reason': (f'check proves nothing: baseline tests must fail on base '
+                       f'(got {base_tests.get("status")!r})'),
+            'test_paths': test_paths,
+            'product_paths': product_paths,
+            'base_tests': base_tests,
+        }
     return {
         'ok': True,
         'status': 'red_on_base',
