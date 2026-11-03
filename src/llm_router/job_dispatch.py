@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import agent_map, alerts, brain, config, feedback, forget_restart, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, tool_gateway, triage
+from . import agent_map, alerts, brain, config, fail_first, feedback, forget_restart, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, tool_gateway, triage
 from . import task_dispatch as td
 
 Refused = td.Refused
@@ -445,7 +445,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
                 _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd,
                           test_timeout, stamp, out_dir, run_task, select, test_runner, allow_no_tests,
                           meter or (lambda w: handoff.meter_percent(w, policy=policy)),
-                          reviewer=reviewer, scope=scope)
+                          reviewer=reviewer, scope=scope, task_class=task_class)
             else:  # fail before spending a worker run on a change nothing would verify
                 summary.update(status='no_tests', tests_status='no_tests', reason=NO_TESTS_REASON)
                 summary['warnings'].append(NO_TESTS_REASON + ': set test_cmd, pass --test-cmd, or set '
@@ -582,12 +582,15 @@ class _NoSleep:
 
 def _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd, test_timeout,
               stamp, out_dir, run_task, select, test_runner, allow_no_tests=False,
-              meter=handoff.meter_percent, reviewer=None, scope=None):
+              meter=handoff.meter_percent, reviewer=None, scope=None, task_class=None):
     # 'no_tests' passes only on the repo's explicit opt-in; anything else ('skipped', 'not_run') never does.
     passing = ('passed', 'no_tests') if allow_no_tests else ('passed',)
     repo_map = agent_map.load_repo_map(worktree)
     repo_lessons = lessons.render_for_prompt(policy, summary.get('repo') or worktree)
     base_instructions = '\n\n'.join(filter(None, [handoff.WORKER_INSTRUCTIONS, repo_map, repo_lessons]))
+    require_fail_first = fail_first.is_bug_task(task_text, task_class=task_class, policy=policy)
+    if require_fail_first:
+        summary['fail_first'] = {'required': True, 'status': 'pending'}
     extra = base_instructions  # every worker writes a handoff note at checkpoints and on stop
     test_artifacts, worker_paths = set(), set()
 
@@ -728,11 +731,28 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         evidence = stackwich.evidence(worktree, worker_paths, cycle) if required else None
         before = stackwich.fingerprints(worktree, worker_paths) if required else None
         tests = {'status': 'not_run'}
+        ff_check = None
         if result['ok'] and changed:
+            if require_fail_first and test_cmd:
+                ff_check = fail_first.verify_fail_first(
+                    policy, worktree, summary['base_sha'], worker_paths, test_cmd, test_timeout,
+                    out_dir / f'{stamp}-a{cycle}-base-tests.log',
+                    lambda pol, cwd, cmd, tout, lpath: run_tests(pol, cwd, cmd, tout, lpath, test_runner),
+                    _git,
+                )
             tests = run_tests(policy, worktree, test_cmd, test_timeout,
                               out_dir / f'{stamp}-a{cycle}-tests.log', test_runner)
             tests['source'] = summary.get('test_command_source')
             test_artifacts |= changed_paths(worktree) - worker_paths - {stackwich.REPORT_PATH}
+            if ff_check is not None:
+                ff_check['after_status'] = tests['status']
+                if ff_check['ok'] and tests['status'] == 'passed':
+                    ff_check['status'] = 'verified'
+                summary['fail_first'] = ff_check
+                if not ff_check['ok']:
+                    tests = dict(tests, status='check_proves_nothing', reason=ff_check.get('reason'))
+                    summary['reason'] = ff_check.get('reason')
+                    summary['warnings'].append(ff_check.get('reason'))
         if required:
             scan = _report_leak_check(policy, worktree, summary['base_sha'])
             if scan['status'] != 'clean':
