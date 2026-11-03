@@ -33,7 +33,7 @@ import subprocess
 import threading
 import time
 
-from . import config, security
+from . import claude_handoff, config, security
 from . import job_dispatch as jd
 from . import task_dispatch as td
 from .job_dispatch import Refused, _git
@@ -44,6 +44,7 @@ MAX_FIX_ROUNDS = 3
 PROTECTED_BRANCHES = ('main', 'master')
 PROMPT_NAME = '.llm-router-batch-prompt.md'
 MAX_DIFF_CHARS = 60_000
+NO_HOOKS = ('-c', 'core.hooksPath=/dev/null')  # code under test can write hooks into the shared .git
 RESULT_LINE = re.compile(r'\s*RESULT\s+wrong=(\d+)\s+crash=(\d+)\s*')
 SKIPPED = re.compile(r'(?<!\d)[1-9]\d*\s+skipped\b|\bskip(?:ped)?=[1-9]|^(?:--- SKIP\b|SKIPPED \[)', re.I | re.M)
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
@@ -124,28 +125,27 @@ def _snapshot(worktree):
             _git(worktree, 'status', '--porcelain', '--untracked-files=normal').stdout)
 
 
-def last_stdout(log):
-    """The last run's stdout section of a run_task worker log (`--- stdout` ... `--- stderr`), else the log."""
-    start = log.rfind('--- stdout\n')
-    if start < 0:
-        return log
-    body = log[start + len('--- stdout\n'):]
-    end = body.find('\n--- stderr\n')
-    return body[:end] if end >= 0 else body
-
-
 def default_verifier(job, prompt, policy):
-    """Run the `judge` role headless in the job worktree, never on the producing worker. The output file is
-    named per job and round, so concurrent jobs never read each other's report."""
+    """Run the `judge` role headless in the job worktree, never on the producing worker. The verdict is read from
+    the final worker process's own stdout, captured as data: the combined log stores stdout and stderr unescaped,
+    so anything the code under test prints could forge a stdout section there. Stream-JSON stdout is reduced to
+    its final answer text by claude_handoff.inspect (verified for claude; other formats fall back to an empty
+    verdict, which blocks the job). Output files are named per job and round."""
     task_file = _prompt_file(Path(job['worktree']), prompt)
+    stdouts = []
+
+    def capture(*args, **kwargs):
+        done = td.run_bounded(*args, **kwargs)
+        stdouts.append(claude_handoff.inspect(done.get('stdout') or '', done.get('stderr') or '',
+                                              done.get('returncode') or 0)['text'])
+        return done
     try:
         result = td.run_task(task_file, job['worktree'], allow_dirty=True, policy=policy, role='judge',
-                             exclude=tuple(w for w in [job.get('worker')] if w),
+                             exclude=tuple(w for w in [job.get('worker')] if w), runner=capture,
                              stamp=f"{job['job_id']}-verify{len(job['verifications']) + 1}")
     except td.Refused as refusal:
         return {'status': 'unavailable', 'reason': str(refusal)}
-    output = result.get('output_path')
-    text = last_stdout(Path(output).read_text()) if output and Path(output).is_file() else ''
+    text = stdouts[-1] if stdouts else ''
     if not result.get('ok'):
         return {'status': 'unavailable', 'reason': result.get('reason') or 'verifier run failed', 'text': text,
                 'worker': result.get('worker')}
@@ -174,6 +174,7 @@ class Batch:
                                                           policy['run_job']['test_timeout_seconds'])
         self.lock = threading.Lock()
         self.start_lock, self.last_stamp = threading.Lock(), None
+        self.staging_restored_from = None
 
     # ---- progress log (read by the Notch) ----
     def update(self, job, state, **fields):
@@ -317,7 +318,7 @@ class Batch:
         else:
             identity = self.policy['run_job']['commit_identity']
             _git(worktree, 'add', '-A', check=True)
-            done = _git(worktree, '-c', f'user.name={identity["name"]}', '-c', f'user.email={identity["email"]}',
+            done = _git(worktree, *NO_HOOKS, '-c', f'user.name={identity["name"]}', '-c', f'user.email={identity["email"]}',
                         'commit', '-q', '-m', f"router: batch {self.batch_id} fix round {round_no} ({job['key']})")
             if done.returncode != 0:
                 return dict(record, status='commit_failed', reason=security.redact(done.stderr.strip())[:300])
@@ -331,45 +332,83 @@ class Batch:
         return record
 
     # ---- staging: merge one verified job at a time, keep it only when the full suite passes ----
-    def merge_all(self, root):
+    def merge_all(self, root, start_sha):
+        """start_sha: the staging tip recorded under the repo lock before any job ran. Job code ran against the
+        shared .git meanwhile, so the branch is put back on it rather than trusted. Every git call here runs with
+        hooks off, and each merge must have exactly (previous tip, verified job commit) as parents."""
+        staging_ref = f'refs/heads/{self.staging}'
+        current = jd.resolve_base(self.repo, staging_ref)
+        if current != start_sha:  # put staging back even when nothing is verified or no worktree opens
+            self.staging_restored_from = current or None
+            _git(self.repo, *NO_HOOKS, 'update-ref', staging_ref, start_sha)
         verified = [job for job in self.jobs if job['state'] == 'verified']
         if not verified:
             return
         worktree = root / f"{jd.slugify(self.repo.name)}-staging-{self.batch_id}"
-        added = _git(self.repo, 'worktree', 'add', '-q', str(worktree), self.staging)
+        added = _git(self.repo, *NO_HOOKS, 'worktree', 'add', '-q', str(worktree), self.staging)
         if added.returncode != 0:  # e.g. staging is checked out elsewhere: nothing is merged
             reason = 'cannot open staging worktree: ' + security.redact(added.stderr.strip())[:300]
             for job in verified:
                 self.update(job, 'not_merged', status='staging_unavailable', reason=reason)
             return
         identity = self.policy['run_job']['commit_identity']
+
+        def rev(ref):
+            return _git(worktree, 'rev-parse', '-q', '--verify', ref).stdout.strip()
+
+        def at(sha):  # both the staging worktree and the staging branch ref are exactly at sha
+            return rev('HEAD') == sha and jd.resolve_base(self.repo, staging_ref) == sha
+
+        def restore(sha):  # put staging back on sha with no leftovers, whatever code under test did to it
+            _git(self.repo, *NO_HOOKS, 'update-ref', staging_ref, sha)
+            _git(worktree, *NO_HOOKS, 'checkout', '-q', '-f', self.staging)
+            _git(worktree, *NO_HOOKS, 'reset', '-q', '--hard', sha)
+            _git(worktree, 'clean', '-ffdxq')
         try:
+            expected = start_sha
             for job in verified:
                 self.update(job, 'merging')
+                restore(expected)  # also clears files the previous job's staging tests left behind
+                if not at(expected):
+                    self.update(job, 'not_merged', status='staging_moved',
+                                reason='staging could not be put back on its expected commit')
+                    continue
                 if jd.resolve_base(self.repo, f"refs/heads/{job['branch']}") != job['verified_sha']:
                     self.update(job, 'not_merged', status='branch_moved',
                                 reason='job branch moved after verification; nothing merged')
                     continue
-                before = _git(worktree, 'rev-parse', 'HEAD').stdout.strip()
-                merged = _git(worktree, '-c', f'user.name={identity["name"]}', '-c', f'user.email={identity["email"]}',
-                              'merge', '--no-ff', '--no-edit', '-m',
+                merged = _git(worktree, *NO_HOOKS, '-c', f'user.name={identity["name"]}',
+                              '-c', f'user.email={identity["email"]}', 'merge', '--no-ff', '--no-edit', '-m',
                               f"router: batch {self.batch_id} merge {job['branch']} ({job['key']})", job['verified_sha'])
                 if merged.returncode != 0:
-                    _git(worktree, 'merge', '--abort')
+                    _git(worktree, *NO_HOOKS, 'merge', '--abort')
                     self.update(job, 'not_merged', status='merge_conflict',
                                 reason=security.redact(merged.stdout.strip() or merged.stderr.strip())[-300:])
                     continue
+                merge_sha = rev('HEAD')
+                if rev(f'{merge_sha}^1') != expected or rev(f'{merge_sha}^2') != job['verified_sha'] or \
+                        rev(f'{merge_sha}^3'):
+                    restore(expected)
+                    self.update(job, 'not_merged', status='staging_tampered',
+                                reason='merge commit parents are not (staging tip, verified commit); merge undone')
+                    continue
                 tests = self.run_tests(worktree, f"{job['key']}-staging")
                 job['staging_tests'] = tests['status']
+                if not at(merge_sha):  # the merged code moved HEAD or the branch while its tests ran
+                    restore(expected)
+                    self.update(job, 'not_merged', status='staging_tampered',
+                                reason='HEAD or the staging branch moved during the staging test run; merge undone')
+                    continue
                 if tests['status'] != 'passed':
-                    _git(worktree, 'reset', '-q', '--hard', before)  # undo only the merge this runner just made
+                    restore(expected)  # undo only the merge this runner just made
                     self.update(job, 'not_merged', status=f"staging_tests_{tests['status']}",
                                 reason='full test suite did not pass after the merge; staging left unchanged')
                     continue
-                head = _git(worktree, 'rev-parse', 'HEAD').stdout.strip()
-                self.update(job, 'merged', status='merged', staging_commit=head)
+                expected = merge_sha
+                self.update(job, 'merged', status='merged', staging_commit=merge_sha)
+            restore(expected)
         finally:
-            _git(self.repo, 'worktree', 'remove', '--force', str(worktree))
+            _git(self.repo, *NO_HOOKS, 'worktree', 'remove', '--force', str(worktree))
 
 
 def run_batch(repo, issues=(), task_files=(), max_parallel=None, base='main', staging_branch=None, test_cmd=None,
@@ -449,7 +488,7 @@ def run_batch(repo, issues=(), task_files=(), max_parallel=None, base='main', st
             options['test_runner'] = test_runner
         with ThreadPoolExecutor(max_workers=cap) as pool:
             list(pool.map(lambda job: batch.run_one(job, run_job or jd.run_job, options), jobs))
-        batch.merge_all(root)
+        batch.merge_all(root, staging_sha)
     for job in jobs:
         if job['state'] not in ('merged', 'not_merged'):
             batch.update(job, 'not_merged', status=job.get('status'), reason=job.get('reason'))
@@ -457,6 +496,7 @@ def run_batch(repo, issues=(), task_files=(), max_parallel=None, base='main', st
 
     summary = {'batch_id': batch_id, 'repo': str(repo), 'base': base, 'base_sha': base_sha,
                'staging_branch': staging, 'staging_start': staging_sha,
+               'staging_restored_from': batch.staging_restored_from,
                'staging_head': jd.resolve_base(repo, f'refs/heads/{staging}'), 'test_command': test_cmd,
                'max_parallel': cap, 'started_at': started.isoformat(timespec='seconds'),
                'finished_at': _now(policy), 'pushed': False,
