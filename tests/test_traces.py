@@ -105,5 +105,33 @@ class TraceEngineeringTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())['root_cause_span']['span_id'], 's1')
 
 
+class TraceRunJobPersistenceTests(unittest.TestCase):
+    """run_job must persist its JSON summary even when trace recording fails."""
+    setUp = __import__('test_job_dispatch').JobTests.setUp
+    tearDown = __import__('test_job_dispatch').JobTests.tearDown
+    select = __import__('test_job_dispatch').JobTests.select
+    worker = __import__('test_job_dispatch').JobTests.worker
+
+    def job(self, **kw):
+        from llm_router import job_dispatch as jd
+        kw.setdefault('select', self.select)
+        return jd.run_job(self.repo, self.task, policy=self.policy, **kw)
+
+    def test_trace_write_failure_still_persists_job_json(self):
+        from unittest.mock import patch
+        from llm_router import job_dispatch as jd
+
+        self.worker("open('out.txt','w').write('hi\\n')")
+        with patch.object(jd.traces, 'record_span', side_effect=OSError('disk full')):
+            result = self.job(test_cmd='test -f out.txt')
+        self.assertTrue(result['ok'], result)
+        job_path = Path(self.policy['run_job']['jobs_dir']) / f"{result['job_id']}.json"
+        self.assertTrue(job_path.is_file())
+        saved = json.loads(job_path.read_text())
+        self.assertEqual(saved['status'], 'committed')
+        self.assertNotIn('trace_id', saved)
+        self.assertTrue(any('trace not recorded' in w for w in saved.get('warnings', [])))
+
+
 if __name__ == '__main__':
     unittest.main()
