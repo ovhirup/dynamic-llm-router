@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from pathlib import Path
 
 from helpers import load_policy, TERM
@@ -111,14 +112,13 @@ class LeakCheckTests(unittest.TestCase):
 
 
 class RunTaskSecurityTests(unittest.TestCase):
-    MARK = 'PROMPT-ARGV-MARKER-' + 'q7z'
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name)
+        self.prompt_marker = f'PROMPT-ARGV-MARKER-{uuid.uuid4()}'
         self.repo = repo(base / 'target')
         self.task = base / 'task.md'
-        self.task.write_text(f'Do the thing {self.MARK} and API_KEY=' f'abcd{"9" * 20}\n')
+        self.task.write_text(f'Do the thing {self.prompt_marker} and API_KEY=' f'abcd{"9" * 20}\n')
         self.policy = copy.deepcopy(load_policy(never=['claude']))
         self.policy['run_task']['ledger'] = str(base / 'ledger.csv')
         self.policy['run_task']['private_terms_file'] = str(base / 'terms.txt')
@@ -134,22 +134,69 @@ class RunTaskSecurityTests(unittest.TestCase):
         return {'eligible': ['codex', 'grok-build', 'cursor'], 'meters': {'codex': 10, 'grok-build': 10, 'cursor': 10},
                 'reason': 'test'}
 
-    def run_with(self, worker, code, watch=True):
+    def _worker_descendant_pids(self, roots):
+        """PIDs in the worker process tree spawned by this test's run_task call."""
+        seen, frontier = set(), [pid for pid in roots if pid]
+        while frontier:
+            pid = frontier.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            children = subprocess.run(['pgrep', '-P', str(pid)], capture_output=True, text=True)
+            if children.returncode != 0:
+                continue
+            for line in children.stdout.split():
+                line = line.strip()
+                if line.isdigit():
+                    frontier.append(int(line))
+        return seen
+
+    def _cmdline_contains_marker(self, pid):
+        proc = subprocess.run(
+            ['ps', '-ww', '-p', str(pid), '-o', 'command='],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            return False
+        return self.prompt_marker in (proc.stdout or '')
+
+    def _marker_visible_in_worker_argv(self, worker_roots):
+        for pid in self._worker_descendant_pids(worker_roots):
+            if self._cmdline_contains_marker(pid):
+                return True
+        return False
+
+    def run_with(self, worker, code, watch=True, argv_expose_marker=False):
         policy = copy.deepcopy(self.policy)
         template = policy['run_task']['commands'][worker]
-        policy['run_task']['commands'][worker] = [sys.executable, '-c', code] + [
+        argv = [sys.executable, '-c', code] + [
             arg for arg in template if arg in ('{prompt_file}', '{prompt_pointer}', '-')]
+        if argv_expose_marker:
+            argv.append(self.prompt_marker)
+        policy['run_task']['commands'][worker] = argv
         seen, result = [], {}
+        worker_roots = []
+        real_popen = subprocess.Popen
+
+        def tracking_popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            worker_roots.append(proc.pid)
+            return proc
+
+        def run_bounded_tracked(*args, **kwargs):
+            kwargs['popen'] = tracking_popen
+            return td.run_bounded(*args, **kwargs)
 
         def go():
-            result['summary'] = td.run_task(self.task, self.repo, worker=worker, select=self.select,
-                                            policy=policy, output_root=self.out)
+            result['summary'] = td.run_task(
+                self.task, self.repo, worker=worker, select=self.select,
+                policy=policy, output_root=self.out, runner=run_bounded_tracked,
+            )
         thread = threading.Thread(target=go)
         thread.start()
         while thread.is_alive():
-            # pgrep -f matches full command lines but prints only PIDs (no other process's args).
-            found = subprocess.run(['pgrep', '-f', self.MARK], capture_output=True, text=True)
-            seen.append(found.returncode == 0)
+            if watch:
+                seen.append(self._marker_visible_in_worker_argv(worker_roots))
             time.sleep(0.1)
         thread.join()
         return result['summary'], seen
@@ -161,7 +208,14 @@ class RunTaskSecurityTests(unittest.TestCase):
         self.assertEqual(summary['attempts'][0]['prompt_delivery'], 'stdin')
         self.assertGreater(len(seen), 5)
         self.assertFalse(any(seen))
-        self.assertIn(self.MARK, (self.repo / 'got.txt').read_text())
+        self.assertIn(self.prompt_marker, (self.repo / 'got.txt').read_text())
+
+    def test_argv_watch_detects_marker_in_worker_command_line(self):
+        """Positive control: watcher must fail when the marker is deliberately on argv."""
+        code = 'import time; time.sleep(1.5)'
+        _, seen = self.run_with('codex', code, argv_expose_marker=True)
+        self.assertGreater(len(seen), 5)
+        self.assertTrue(any(seen))
 
     def test_file_delivery_0600_and_removed(self):
         code = ("import os,stat,sys,time; p=sys.argv[1]; "
@@ -170,7 +224,7 @@ class RunTaskSecurityTests(unittest.TestCase):
         mode, path, body = (self.repo / 'got.txt').read_text().split('|', 2)
         self.assertEqual(mode, '0o600')
         self.assertIn('/.git/router-prompts/', path)
-        self.assertIn(self.MARK, body)
+        self.assertIn(self.prompt_marker, body)
         self.assertFalse(Path(path).exists())
         self.assertFalse(any(seen))
         self.assertNotIn('router-prompts', ' '.join(summary['untracked']))
@@ -180,7 +234,7 @@ class RunTaskSecurityTests(unittest.TestCase):
                 "open('got.txt','w').write(open(p).read()); time.sleep(1.5)")
         summary, seen = self.run_with('cursor', code)
         self.assertEqual(summary['attempts'][0]['prompt_delivery'], 'pointer')
-        self.assertIn(self.MARK, (self.repo / 'got.txt').read_text())
+        self.assertIn(self.prompt_marker, (self.repo / 'got.txt').read_text())
         self.assertFalse(any(seen))
 
     def test_private_term_written_by_worker_is_flagged(self):
