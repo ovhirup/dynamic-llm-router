@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import agent_map, alerts, brain, config, feedback, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, tool_gateway, triage
+from . import agent_map, alerts, brain, config, feedback, forget_restart, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, tool_gateway, triage
 from . import task_dispatch as td
 
 Refused = td.Refused
@@ -611,6 +611,10 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
 
     required, pinned, evidence = False, None, None
     retries = policy['run_job'].get('max_retries', 1)
+    forget_after = policy['run_job'].get('forget_after_attempts')
+    tracker = (forget_restart.CandidateTracker(forget_after=forget_after)
+               if forget_after is not None else None)
+    summary['forget_restarts'] = []
     attempt_number = 0
     used, failed = set(), set()
     fingerprints, dead_ends = [], []
@@ -797,18 +801,30 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         dead_ends.append(f'attempt {cycle} ({selected or "none"}): {reason} — {fp["error_line"]}')
         retry_feedback.save_retry_state(
             _path(policy, 'handoffs_dir', 'handoffs'), summary['job_id'], fingerprints, dead_ends)
-        if retry_feedback.same_failure_twice(fingerprints):
+        diff_now = _git(worktree, 'diff', '--no-color', summary['base_sha']).stdout if changed else ''
+        if tracker is not None:
+            tracker.record(cycle, selected, diff_now, changed_paths=worker_paths, tests=tests)
+        if retry_feedback.same_failure_twice(fingerprints) and not (tracker and tracker.should_forget(cycle)):
             summary['warnings'].append(f'same_failure_twice ({fp["id"]}): stopping retries after identical failure')
             summary.update(status='blocked_by_stackwich' if required else 'failed',
                            reason='same_failure_twice', same_failure_twice=True)
             return
         log = out_dir / f'{stamp}-a{cycle}-tests.log'
         note = save_note(selected, reason, worker_note, tests, log if log.exists() else None)
-        extra = '\n\n'.join(filter(None, [
-            base_instructions,
-            handoff.render_for_prompt(note),
-            _retry_note(result, tests, fence_paths=worker_paths, dead_ends=dead_ends, task_goal=task_text[:500]),
-        ]))
+        if tracker is not None and tracker.should_forget(cycle):
+            best = tracker.best()
+            summary['forget_restarts'].append({
+                'after_attempt': cycle,
+                'best_attempt': best['attempt'] if best else None,
+                'best_score': best['score'] if best else None,
+            })
+            extra = tracker.build_fresh_seed_prompt(handoff_instructions=base_instructions)
+        else:
+            extra = '\n\n'.join(filter(None, [
+                base_instructions,
+                handoff.render_for_prompt(note),
+                _retry_note(result, tests, fence_paths=worker_paths, dead_ends=dead_ends, task_goal=task_text[:500]),
+            ]))
         if required:
             extra += '\nStackwich errors: ' + '; '.join(evidence['errors'])
         attempt_number += 1
