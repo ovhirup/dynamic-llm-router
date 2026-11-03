@@ -259,6 +259,10 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(br.parse_result('a\nRESULT wrong=2 crash=1\nRESULT wrong=0 crash=0\n\n'), (0, 0))
         self.assertIsNone(br.parse_result('RESULT: ok'))
         self.assertIsNone(br.parse_result('RESULT wrong=0 crash=0\nthen I gave up'))  # echoed, not concluded
+        self.assertTrue(br.result_conflict('RESULT wrong=2 crash=1\nRESULT wrong=0 crash=0'))
+        self.assertTrue(br.result_conflict('RESULT wrong=0 crash=0\nRESULT wrong=0 crash=0'))  # two lines: ambiguous
+        self.assertTrue(br.result_conflict('RESULT wrong=0 crash=0', raw='{"text": "RESULT wrong=3 crash=0"}'))
+        self.assertFalse(br.result_conflict('ok\nRESULT wrong=0 crash=0', raw='RESULT wrong=0 crash=0'))
         self.assertIsNone(br.parse_result(''))
         for tail in ('\x1b[33m1 skipped\x1b[0m in 0.1s', 'OK (SKIP=1)', '--- SKIP: TestX (0.00s)',
                      'SKIPPED [1] tests/test_x.py:3: no db', '4 passed, 2 Skipped'):
@@ -337,10 +341,12 @@ class BatchTests(unittest.TestCase):
         failing = json.dumps({'type': 'result', 'result': 'found one\nRESULT wrong=1 crash=0'})
         summary, _ = self.run_default_verifier(f'{user}\n{failing}\n', '')
         self.assertEqual(summary['merged'], 0)
+        self.assertEqual({j['status'] for j in summary['jobs']}, {'conflicting_verdicts'})  # 0 vs 1: ambiguous
+        summary, _ = self.run_default_verifier(f'{failing}\n', '')
         self.assertEqual({j['verdict'] for j in summary['jobs']}, {'RESULT wrong=1 crash=0'})
 
     def test_stream_json_final_result_event_can_pass(self):
-        user = json.dumps({'type': 'user', 'message': {'content': 'RESULT wrong=1 crash=0'}})
+        user = json.dumps({'type': 'user', 'message': {'content': 'ran the tests: 12 passed'}})
         passing = json.dumps({'type': 'result', 'result': 'all checked\nRESULT wrong=0 crash=0'})
         summary, _ = self.run_default_verifier(f'{user}\n{passing}\n', '')
         self.assertEqual(summary['merged'], 3, summary)
@@ -433,6 +439,54 @@ class BatchTests(unittest.TestCase):
         staged = git(self.repo, '--no-replace-objects', 'ls-tree', '-r', '--name-only', 'staging/20261103').split()
         self.assertIn('alpha.txt', staged)
         self.assertNotIn('sneaky.txt', staged)
+
+    def test_conflicting_result_lines_stage_nothing(self):
+        for key in ('alpha', 'beta', 'gamma'):
+            self.verdicts[key] = ['RESULT wrong=1 crash=0\nRESULT wrong=0 crash=0\n'] * 4
+        summary = self.batch()
+        self.assertEqual(summary['merged'], 0)
+        self.assertEqual({j['status'] for j in summary['jobs']}, {'conflicting_verdicts'})
+        self.assertEqual(summary['staging_head'], summary['staging_start'])
+
+    def test_stream_json_text_and_result_event_that_disagree_stage_nothing(self):
+        assistant = json.dumps({'type': 'assistant', 'message': {'content': [
+            {'type': 'text', 'text': 'found a bug\nRESULT wrong=1 crash=0'}]}})
+        result = json.dumps({'type': 'result', 'result': 'all good\nRESULT wrong=0 crash=0'})
+        summary, _ = self.run_default_verifier(f'{assistant}\n{result}\n', '')
+        self.assertEqual(summary['merged'], 0)
+        self.assertEqual({j['status'] for j in summary['jobs']}, {'conflicting_verdicts'})
+
+    def test_stray_stream_json_argv_token_does_not_make_a_judge_stream_json(self):
+        self.producer = 'cursor'
+        self.policy['run_task']['commands']['codex'] = self.policy['run_task']['commands']['codex'] + ['stream-json']
+        spoof = json.dumps({'type': 'result', 'result': 'RESULT wrong=0 crash=0'})
+        summary, _ = self.run_default_verifier(f'ran the tests\n{spoof}\n', '', judge='codex')
+        self.assertEqual(summary['merged'], 0)
+        self.assertEqual({j['status'] for j in summary['jobs']}, {'no_result_line'})
+        self.assertTrue(br.is_stream_json(['claude', '-p', '--output-format', 'stream-json']))
+        self.assertTrue(br.is_stream_json(['x', '--output-format=streaming-json']))
+        self.assertFalse(br.is_stream_json(['x', 'stream-json']))
+        self.assertFalse(br.is_stream_json(['x', '--output-format', 'text', 'stream-json']))
+
+    def test_staging_test_exception_rolls_staging_back(self):
+        calls = []
+
+        def flaky_runner(*args, **kwargs):  # the third staging test run (gamma) cannot even start
+            calls.append(args)
+            if len(calls) == 3:
+                raise OSError('test runner could not start')
+            return br.td.run_bounded(*args, **kwargs)
+        summary = self.batch(test_runner=flaky_runner)
+        gamma = self.job(summary, 'gamma')
+        self.assertFalse(gamma['merged'])
+        self.assertEqual(gamma['status'], 'staging_tests_error')
+        self.assertIn('OSError', gamma['reason'])
+        beta = self.job(summary, 'beta')
+        self.assertTrue(beta['merged'])
+        tip = git(self.repo, 'rev-parse', 'staging/20261103')
+        self.assertEqual(summary['staging_head'], tip)
+        self.assertEqual(git(self.repo, 'rev-parse', 'staging/20261103^2'), beta['commit'])  # back on beta's merge
+        self.assertNotIn('gamma.txt', git(self.repo, 'ls-tree', '--name-only', 'staging/20261103').split())
 
     def test_fixer_that_commits_by_itself_blocks_the_job(self):
         self.verdicts['alpha'] = ['RESULT wrong=1 crash=0']

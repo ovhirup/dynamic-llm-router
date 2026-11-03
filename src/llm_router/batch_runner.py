@@ -50,6 +50,7 @@ MAX_DIFF_CHARS = 60_000
 SAFE_GIT = ('--no-replace-objects', '-c', 'core.hooksPath=/dev/null')
 STREAM_JSON = ('stream-json', 'streaming-json')
 RESULT_LINE = re.compile(r'\s*RESULT\s+wrong=(\d+)\s+crash=(\d+)\s*')
+RESULT_ANY = re.compile(r'RESULT\s+wrong=(\d+)\s+crash=(\d+)')
 SKIPPED = re.compile(r'(?<!\d)[1-9]\d*\s+skipped\b|\bskip(?:ped)?=[1-9]|^(?:--- SKIP\b|SKIPPED \[)', re.I | re.M)
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 
@@ -78,6 +79,24 @@ def _git(cwd, *args, check=False):
 
 def batch_dir(policy, batch_id):
     return config.policy_path(policy, 'batch', 'dir', 'logs/batches') / batch_id
+
+
+def result_conflict(text, raw=''):
+    """True when the verdict is ambiguous: more than one RESULT line in the answer, or RESULT values anywhere in the
+    judge's answer or raw output (stream-JSON events included) that disagree. An ambiguous verdict never passes."""
+    lines = [line for line in (text or '').splitlines() if RESULT_LINE.fullmatch(line)]
+    values = {m.groups() for source in (text or '', raw or '') for m in RESULT_ANY.finditer(source)}
+    return len(lines) > 1 or len(values) > 1
+
+
+def is_stream_json(command):
+    """True only when the command's --output-format option value is a stream-JSON format, never for a stray token."""
+    for k, arg in enumerate(command):
+        if arg == '--output-format' and k + 1 < len(command) and command[k + 1] in STREAM_JSON:
+            return True
+        if arg.startswith('--output-format=') and arg.split('=', 1)[1] in STREAM_JSON:
+            return True
+    return False
 
 
 def parse_result(text):
@@ -141,7 +160,7 @@ def verdict_text(policy, worker, done):
     any other worker's stdout is used as is, so a JSON-looking line it echoes from test output is never trusted."""
     stdout = done.get('stdout') or ''
     command = (policy.get('run_task') or {}).get('commands', {}).get(worker) or []
-    if not any(arg in STREAM_JSON for arg in command):
+    if not is_stream_json(command):
         return stdout
     return claude_handoff.inspect(stdout, done.get('stderr') or '', done.get('returncode') or 0)['text']
 
@@ -167,10 +186,11 @@ def default_verifier(job, prompt, policy):
         return {'status': 'unavailable', 'reason': str(refusal)}
     # run_task stops at the first worker that succeeds, so the last runner call is the reporting worker's
     text = verdict_text(policy, result.get('worker'), stdouts[-1]) if stdouts else ''
+    raw = (stdouts[-1].get('stdout') or '') if stdouts else ''
     if not result.get('ok'):
         return {'status': 'unavailable', 'reason': result.get('reason') or 'verifier run failed', 'text': text,
                 'worker': result.get('worker')}
-    return {'status': 'done', 'text': text, 'worker': result.get('worker')}
+    return {'status': 'done', 'text': text, 'raw': raw, 'worker': result.get('worker')}
 
 
 def default_fixer(job, prompt, policy):
@@ -306,6 +326,8 @@ class Batch:
             return dict(record, status='verifier_unavailable', reason=result.get('reason'))
         if result.get('worker') and result.get('worker') == job.get('worker'):
             return dict(record, status='verifier_is_producer', reason='the producing worker cannot verify its own job')
+        if result_conflict(result.get('text'), result.get('raw')):
+            return dict(record, status='conflicting_verdicts', reason='judge output has conflicting RESULT values')
         parsed = parse_result(result.get('text'))
         if parsed is None:
             return dict(record, status='no_result_line', reason='verifier report has no RESULT line')
@@ -385,48 +407,63 @@ class Batch:
             _git(worktree, 'checkout', '-q', '-f', self.staging)
             _git(worktree, 'reset', '-q', '--hard', sha)
             _git(worktree, 'clean', '-ffdxq')
+        def merge_one(job, expected):
+            """Merge one verified job onto `expected`; returns the new staging tip (unchanged when not merged)."""
+            restore(expected)  # also clears files the previous job's staging tests left behind
+            if not at(expected):
+                self.update(job, 'not_merged', status='staging_moved',
+                            reason='staging could not be put back on its expected commit')
+                return expected
+            if jd.resolve_base(self.repo, f"refs/heads/{job['branch']}") != job['verified_sha']:
+                self.update(job, 'not_merged', status='branch_moved',
+                            reason='job branch moved after verification; nothing merged')
+                return expected
+            merged = _git(worktree, '-c', f'user.name={identity["name"]}',
+                          '-c', f'user.email={identity["email"]}', 'merge', '--no-ff', '--no-edit', '-m',
+                          f"router: batch {self.batch_id} merge {job['branch']} ({job['key']})", job['verified_sha'])
+            if merged.returncode != 0:
+                _git(worktree, 'merge', '--abort')
+                self.update(job, 'not_merged', status='merge_conflict',
+                            reason=security.redact(merged.stdout.strip() or merged.stderr.strip())[-300:])
+                return expected
+            merge_sha = rev('HEAD')
+            if rev(f'{merge_sha}^1') != expected or rev(f'{merge_sha}^2') != job['verified_sha'] or \
+                    rev(f'{merge_sha}^3'):
+                restore(expected)
+                self.update(job, 'not_merged', status='staging_tampered',
+                            reason='merge commit parents are not (staging tip, verified commit); merge undone')
+                return expected
+            try:
+                tests = self.run_tests(worktree, f"{job['key']}-staging")
+            except Exception as error:  # a test run that cannot even start is a failed run, never a pass
+                restore(expected)
+                job['staging_tests'] = 'error'
+                self.update(job, 'not_merged', status='staging_tests_error',
+                            reason=security.redact(f'staging test run raised {type(error).__name__}: {error}')[:300])
+                return expected
+            job['staging_tests'] = tests['status']
+            if not at(merge_sha):  # the merged code moved HEAD or the branch while its tests ran
+                restore(expected)
+                self.update(job, 'not_merged', status='staging_tampered',
+                            reason='HEAD or the staging branch moved during the staging test run; merge undone')
+                return expected
+            if tests['status'] != 'passed':
+                restore(expected)  # undo only the merge this runner just made
+                self.update(job, 'not_merged', status=f"staging_tests_{tests['status']}",
+                            reason='full test suite did not pass after the merge; staging left unchanged')
+                return expected
+            self.update(job, 'merged', status='merged', staging_commit=merge_sha)
+            return merge_sha
         try:
             expected = start_sha
             for job in verified:
                 self.update(job, 'merging')
-                restore(expected)  # also clears files the previous job's staging tests left behind
-                if not at(expected):
-                    self.update(job, 'not_merged', status='staging_moved',
-                                reason='staging could not be put back on its expected commit')
-                    continue
-                if jd.resolve_base(self.repo, f"refs/heads/{job['branch']}") != job['verified_sha']:
-                    self.update(job, 'not_merged', status='branch_moved',
-                                reason='job branch moved after verification; nothing merged')
-                    continue
-                merged = _git(worktree, '-c', f'user.name={identity["name"]}',
-                              '-c', f'user.email={identity["email"]}', 'merge', '--no-ff', '--no-edit', '-m',
-                              f"router: batch {self.batch_id} merge {job['branch']} ({job['key']})", job['verified_sha'])
-                if merged.returncode != 0:
-                    _git(worktree, 'merge', '--abort')
-                    self.update(job, 'not_merged', status='merge_conflict',
-                                reason=security.redact(merged.stdout.strip() or merged.stderr.strip())[-300:])
-                    continue
-                merge_sha = rev('HEAD')
-                if rev(f'{merge_sha}^1') != expected or rev(f'{merge_sha}^2') != job['verified_sha'] or \
-                        rev(f'{merge_sha}^3'):
+                try:
+                    expected = merge_one(job, expected)
+                except Exception as error:  # anything else going wrong mid-merge also leaves staging unchanged
                     restore(expected)
-                    self.update(job, 'not_merged', status='staging_tampered',
-                                reason='merge commit parents are not (staging tip, verified commit); merge undone')
-                    continue
-                tests = self.run_tests(worktree, f"{job['key']}-staging")
-                job['staging_tests'] = tests['status']
-                if not at(merge_sha):  # the merged code moved HEAD or the branch while its tests ran
-                    restore(expected)
-                    self.update(job, 'not_merged', status='staging_tampered',
-                                reason='HEAD or the staging branch moved during the staging test run; merge undone')
-                    continue
-                if tests['status'] != 'passed':
-                    restore(expected)  # undo only the merge this runner just made
-                    self.update(job, 'not_merged', status=f"staging_tests_{tests['status']}",
-                                reason='full test suite did not pass after the merge; staging left unchanged')
-                    continue
-                expected = merge_sha
-                self.update(job, 'merged', status='merged', staging_commit=merge_sha)
+                    self.update(job, 'not_merged', status='staging_error',
+                                reason=security.redact(f'{type(error).__name__}: {error}')[:300])
             restore(expected)
         finally:
             _git(self.repo, 'worktree', 'remove', '--force', str(worktree))
