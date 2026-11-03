@@ -197,7 +197,7 @@ def build_parser():
     refresh.add_argument('--worker')
     commands.add_parser('status', help='Meters, freshness, resets, eligibility, open alerts')
     usage = commands.add_parser('usage', aliases=['burn-down'],
-                                help='Token burn-down dashboard: used %, remaining, reset, burn rate and next worker')
+                                help='Token burn-down dashboard: used %%, remaining, reset, burn rate and next worker')
     usage.add_argument('--json', action='store_true', dest='as_json', help='print machine-readable JSON')
     alert = commands.add_parser('alerts', help='List or acknowledge open alerts')
     alert_cmds = alert.add_subparsers(dest='alerts_command')
