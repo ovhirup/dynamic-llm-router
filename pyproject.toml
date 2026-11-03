@@ -7,7 +7,7 @@ name = "dynamic-llm-router"
 version = "0.4.0"
 description = "Quota-aware router that dispatches coding tasks to headless agent CLIs (Codex, Grok Build, Cursor) with pacing, worktrees, leak checks and a human-approved PR gate."
 readme = "README.md"
-license = "MIT"
+license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Dynamic LLM Router contributors" }]
