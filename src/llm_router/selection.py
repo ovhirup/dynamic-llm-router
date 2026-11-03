@@ -16,7 +16,7 @@ import os
 import re
 import urllib.request
 
-from . import claude_account, config, cooldown, quota_service, week_curve
+from . import claude_account, config, cooldown, decision_router, quota_service, week_curve
 
 LOCAL_WORKERS = ('developer', 'aider-ollama', 'nativ', config.ORCHESTRATOR)  # never displaced by week-curve pacing
 NAME = re.compile(r'[a-z][a-z0-9_-]{0,31}')
@@ -255,7 +255,8 @@ def health_reason(policy, worker, health_opener=None, timeout=3):
 
 def select(task_chars, policy=None, cached_only=False, now=None, io=None, consult_all=False,
            consult_cursor=False, threshold_overrides=None, claude_profile_loader=None, cooldowns=None,
-           task_class=None, grok_bot_evidence=None, health_opener=None, role=None):
+           task_class=None, grok_bot_evidence=None, health_opener=None, role=None,
+           task_text='', decision_model=None):
     """Return {'worker', 'reason', 'eligible', 'meters', 'reasons', 'sources', 'versions', ...}.
 
     Workers cooling down after a quota error (see cooldown.py) are skipped until their reset.
@@ -380,6 +381,11 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
     worker = eligible[0] if eligible else None
     reason = ('handoff_to_orchestrator' if worker == config.ORCHESTRATOR else 'preferred_eligible_worker' if worker
               else 'no_eligible_worker' if order else 'no_workers_configured')
+    shadow = decision_router.score_candidates(
+        task_text, eligible, meters=meters, task_class=task_class,
+        selected_worker=worker if worker != config.ORCHESTRATOR else None,
+        model=decision_model,
+    )
     return {'worker': worker, 'reason': reason, 'task_class': task_class,
             'allocation': allocation, 'usage_snapshot': snapshot, 'evidences': evidences,
             'hint': None if order else 'run llm-router init',
@@ -387,7 +393,8 @@ def select(task_chars, policy=None, cached_only=False, now=None, io=None, consul
             'cli_versions': versions, 'version_warnings': warnings,
             'never': sorted(never), 'ineligible': policy.get('ineligible') or {},
             'cooldowns': {name: until.isoformat() for name, until in cooled.items()},
-            'grok_bot': dict(grok_budget, verdict=grok_verdict)}
+            'grok_bot': dict(grok_budget, verdict=grok_verdict),
+            'decision_shadow': shadow}
 
 
 def read_meter(policy, worker, now=None, io=None):

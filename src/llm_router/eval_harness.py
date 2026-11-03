@@ -22,7 +22,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from . import config, eval_corpus, eval_score, security
+from . import config, decision_router, eval_corpus, eval_score, security
 
 MAX_HOPS = 3
 DEFAULT_PROFILE = {'pass_rate': 0.5, 'tokens': 20000, 'quota_percent': 2.0, 'elapsed_seconds': 300.0,
@@ -245,16 +245,25 @@ def run(cases, specs, mode='offline', profiles=None, policy=None, confirm=False,
         outcomes = [dict(fake_outcome(c, spec, profiles or {}, use_recorded), size=size or c.get('size') or 'full')
                     if mode == 'offline'
                     else live_outcome(c, spec, policy, run_job, meter, size=size) for c in replayable]
-        scores = [dict(eval_score.score(o, c['baseline'].get('changed_paths')), hops=o.get('hops'), size=o.get('size'))
-                  for o, c in zip(outcomes, replayable)]
+        candidates = order_for(spec)
+        shadows = [
+            decision_router.score_candidates(c.get('task_text', ''), candidates, selected_worker=o.get('worker'))
+            for o, c in zip(outcomes, replayable)
+        ]
+        scores = [
+            dict(eval_score.score(o, c['baseline'].get('changed_paths')), hops=o.get('hops'), size=o.get('size'),
+                 shadow_pick=sh['shadow_pick'], agrees_with_selected=sh['agrees_with_selected'])
+            for o, c, sh in zip(outcomes, replayable, shadows)
+        ]
         unavailable_rows = [{'case_id': s.get('case_id'), 'worker': s.get('worker'), 'reason': s.get('reason')}
                             for s in scores if s.get('unavailable')]
         grouped = {}
         for score, case in zip(scores, replayable):
             if case.get('task_class'):
                 grouped.setdefault(case['task_class'], []).append(score)
+        metrics = dict(eval_score.aggregate(scores), shadow_agreement_rate=decision_router.agreement_rate(shadows))
         report['policies'][spec['name']] = {
-            'spec': spec, 'metrics': eval_score.aggregate(scores), 'scores': scores,
+            'spec': spec, 'metrics': metrics, 'scores': scores,
             'unavailable': unavailable_rows,
             'by_class': {name: eval_score.aggregate(class_scores) for name, class_scores in sorted(grouped.items())}}
     report['gate'] = eval_score.gate(report['policies'][specs[0]['name']]['metrics'],
