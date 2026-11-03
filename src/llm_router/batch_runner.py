@@ -36,7 +36,7 @@ import time
 from . import claude_handoff, config, security
 from . import job_dispatch as jd
 from . import task_dispatch as td
-from .job_dispatch import Refused, _git
+from .job_dispatch import Refused
 
 MIN_JOBS, MAX_JOBS = 3, 5
 DEFAULT_MAX_PARALLEL = 2
@@ -44,7 +44,11 @@ MAX_FIX_ROUNDS = 3
 PROTECTED_BRANCHES = ('main', 'master')
 PROMPT_NAME = '.llm-router-batch-prompt.md'
 MAX_DIFF_CHARS = 60_000
-NO_HOOKS = ('-c', 'core.hooksPath=/dev/null')  # code under test can write hooks into the shared .git
+# Code under test shares the repo's .git: every router git call ignores replace refs (which could swap the content a
+# verified sha points at) and hooks it may have planted. Ref -> sha lookups (jd.resolve_base) read refs, not
+# objects, so replace refs cannot change them.
+SAFE_GIT = ('--no-replace-objects', '-c', 'core.hooksPath=/dev/null')
+STREAM_JSON = ('stream-json', 'streaming-json')
 RESULT_LINE = re.compile(r'\s*RESULT\s+wrong=(\d+)\s+crash=(\d+)\s*')
 SKIPPED = re.compile(r'(?<!\d)[1-9]\d*\s+skipped\b|\bskip(?:ped)?=[1-9]|^(?:--- SKIP\b|SKIPPED \[)', re.I | re.M)
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
@@ -63,6 +67,13 @@ RESULT wrong=<n> crash=<n>
 
 def _now(policy):
     return td.now_local(policy).isoformat(timespec='seconds')
+
+
+def _git(cwd, *args, check=False):
+    done = jd._git(cwd, *SAFE_GIT, *args)
+    if check and done.returncode != 0:
+        raise Refused(f'git {args[0]} failed: ' + security.redact(done.stderr.strip())[:300])
+    return done
 
 
 def batch_dir(policy, batch_id):
@@ -125,19 +136,28 @@ def _snapshot(worktree):
             _git(worktree, 'status', '--porcelain', '--untracked-files=normal').stdout)
 
 
+def verdict_text(policy, worker, done):
+    """The judge's answer text: stream-JSON workers are reduced to their final answer by claude_handoff.inspect;
+    any other worker's stdout is used as is, so a JSON-looking line it echoes from test output is never trusted."""
+    stdout = done.get('stdout') or ''
+    command = (policy.get('run_task') or {}).get('commands', {}).get(worker) or []
+    if not any(arg in STREAM_JSON for arg in command):
+        return stdout
+    return claude_handoff.inspect(stdout, done.get('stderr') or '', done.get('returncode') or 0)['text']
+
+
 def default_verifier(job, prompt, policy):
     """Run the `judge` role headless in the job worktree, never on the producing worker. The verdict is read from
     the final worker process's own stdout, captured as data: the combined log stores stdout and stderr unescaped,
-    so anything the code under test prints could forge a stdout section there. Stream-JSON stdout is reduced to
-    its final answer text by claude_handoff.inspect (verified for claude; other formats fall back to an empty
-    verdict, which blocks the job). Output files are named per job and round."""
+    so anything the code under test prints could forge a stdout section there. Only a stream-JSON judge's stdout
+    goes through claude_handoff.inspect (verified for claude; other formats fall back to an empty verdict, which
+    blocks the job). Output files are named per job and round."""
     task_file = _prompt_file(Path(job['worktree']), prompt)
     stdouts = []
 
     def capture(*args, **kwargs):
         done = td.run_bounded(*args, **kwargs)
-        stdouts.append(claude_handoff.inspect(done.get('stdout') or '', done.get('stderr') or '',
-                                              done.get('returncode') or 0)['text'])
+        stdouts.append(done)
         return done
     try:
         result = td.run_task(task_file, job['worktree'], allow_dirty=True, policy=policy, role='judge',
@@ -145,7 +165,8 @@ def default_verifier(job, prompt, policy):
                              stamp=f"{job['job_id']}-verify{len(job['verifications']) + 1}")
     except td.Refused as refusal:
         return {'status': 'unavailable', 'reason': str(refusal)}
-    text = stdouts[-1] if stdouts else ''
+    # run_task stops at the first worker that succeeds, so the last runner call is the reporting worker's
+    text = verdict_text(policy, result.get('worker'), stdouts[-1]) if stdouts else ''
     if not result.get('ok'):
         return {'status': 'unavailable', 'reason': result.get('reason') or 'verifier run failed', 'text': text,
                 'worker': result.get('worker')}
@@ -318,7 +339,7 @@ class Batch:
         else:
             identity = self.policy['run_job']['commit_identity']
             _git(worktree, 'add', '-A', check=True)
-            done = _git(worktree, *NO_HOOKS, '-c', f'user.name={identity["name"]}', '-c', f'user.email={identity["email"]}',
+            done = _git(worktree, '-c', f'user.name={identity["name"]}', '-c', f'user.email={identity["email"]}',
                         'commit', '-q', '-m', f"router: batch {self.batch_id} fix round {round_no} ({job['key']})")
             if done.returncode != 0:
                 return dict(record, status='commit_failed', reason=security.redact(done.stderr.strip())[:300])
@@ -340,12 +361,12 @@ class Batch:
         current = jd.resolve_base(self.repo, staging_ref)
         if current != start_sha:  # put staging back even when nothing is verified or no worktree opens
             self.staging_restored_from = current or None
-            _git(self.repo, *NO_HOOKS, 'update-ref', staging_ref, start_sha)
+            _git(self.repo, 'update-ref', staging_ref, start_sha)
         verified = [job for job in self.jobs if job['state'] == 'verified']
         if not verified:
             return
         worktree = root / f"{jd.slugify(self.repo.name)}-staging-{self.batch_id}"
-        added = _git(self.repo, *NO_HOOKS, 'worktree', 'add', '-q', str(worktree), self.staging)
+        added = _git(self.repo, 'worktree', 'add', '-q', str(worktree), self.staging)
         if added.returncode != 0:  # e.g. staging is checked out elsewhere: nothing is merged
             reason = 'cannot open staging worktree: ' + security.redact(added.stderr.strip())[:300]
             for job in verified:
@@ -360,9 +381,9 @@ class Batch:
             return rev('HEAD') == sha and jd.resolve_base(self.repo, staging_ref) == sha
 
         def restore(sha):  # put staging back on sha with no leftovers, whatever code under test did to it
-            _git(self.repo, *NO_HOOKS, 'update-ref', staging_ref, sha)
-            _git(worktree, *NO_HOOKS, 'checkout', '-q', '-f', self.staging)
-            _git(worktree, *NO_HOOKS, 'reset', '-q', '--hard', sha)
+            _git(self.repo, 'update-ref', staging_ref, sha)
+            _git(worktree, 'checkout', '-q', '-f', self.staging)
+            _git(worktree, 'reset', '-q', '--hard', sha)
             _git(worktree, 'clean', '-ffdxq')
         try:
             expected = start_sha
@@ -377,11 +398,11 @@ class Batch:
                     self.update(job, 'not_merged', status='branch_moved',
                                 reason='job branch moved after verification; nothing merged')
                     continue
-                merged = _git(worktree, *NO_HOOKS, '-c', f'user.name={identity["name"]}',
+                merged = _git(worktree, '-c', f'user.name={identity["name"]}',
                               '-c', f'user.email={identity["email"]}', 'merge', '--no-ff', '--no-edit', '-m',
                               f"router: batch {self.batch_id} merge {job['branch']} ({job['key']})", job['verified_sha'])
                 if merged.returncode != 0:
-                    _git(worktree, *NO_HOOKS, 'merge', '--abort')
+                    _git(worktree, 'merge', '--abort')
                     self.update(job, 'not_merged', status='merge_conflict',
                                 reason=security.redact(merged.stdout.strip() or merged.stderr.strip())[-300:])
                     continue
@@ -408,7 +429,7 @@ class Batch:
                 self.update(job, 'merged', status='merged', staging_commit=merge_sha)
             restore(expected)
         finally:
-            _git(self.repo, *NO_HOOKS, 'worktree', 'remove', '--force', str(worktree))
+            _git(self.repo, 'worktree', 'remove', '--force', str(worktree))
 
 
 def run_batch(repo, issues=(), task_files=(), max_parallel=None, base='main', staging_branch=None, test_cmd=None,
