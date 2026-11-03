@@ -264,6 +264,15 @@
     },
     "_why": "A human approves every push and merge: approvals bind job+action+exact head SHA, expire, are single use; a new commit needs a new review+approval. Never force/--admin/--auto/delete."
   },
+  "tool_gateway": {
+    "ladder": {
+      "read": "auto",
+      "worktree_write": "auto",
+      "git_commit": "auto",
+      "publish_or_cfg": "needs_human_approval",
+      "destructive": "always_human"
+    }
+  },
   "workers": {},
   "grok_bot": {
     "billing": {
