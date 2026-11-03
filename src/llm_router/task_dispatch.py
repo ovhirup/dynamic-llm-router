@@ -221,25 +221,10 @@ def handoff_restore(cwd, snapshot):
     return {'before': state, 'action': 'restored'}
 
 
-def build_argv(policy, worker, cwd, prompt_file=None, prompt=None, repo=None, env=None, size='full',
-               claude_version=None, warnings=None):
+def build_argv(policy, worker, cwd, prompt_file=None, prompt=None, repo=None, env=None, size='full'):
     """Expand a linted template; task text enters argv only for explicit arg delivery."""
-    template = list(policy['run_task']['commands'][worker])
+    template = policy['run_task']['commands'][worker]
     if worker == 'claude':
-        if policy['run_task'].get('claude_guard_mod'):
-            from . import claude_guard
-            ver_text = claude_version if claude_version is not None else \
-                claude_guard.probe_claude_version(config.binary(policy, 'claude'))
-            if claude_guard.version_supported(ver_text):
-                mod_path = str(policy['run_task'].get('claude_guard_plugin_dir') or claude_guard.plugin_dir())
-                if '--plugin-dir' not in template and not any(a.startswith('--plugin-dir=') for a in template):
-                    if '--' in template:
-                        idx = template.index('--')
-                        template = template[:idx] + ['--plugin-dir', mod_path] + template[idx:]
-                    else:
-                        template = template + ['--plugin-dir', mod_path]
-            elif warnings is not None:
-                warnings.append(f'claude guard mod skipped: claude version {ver_text or "unknown"!r} < 2.1.287')
         chosen_effort = claude_handoff.effort(size, template,
             policy['run_task'].get('claude_allow_raised_effort') is True)
         normalized = []
