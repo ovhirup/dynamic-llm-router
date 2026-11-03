@@ -1,0 +1,18 @@
+{
+  "name": "dlr-claude-guard",
+  "version": "0.1.0",
+  "description": "DLR safety guard hook for headless Claude Code runs (fail-closed).",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/guard.mjs\""
+          }
+        ]
+      }
+    ]
+  }
+}

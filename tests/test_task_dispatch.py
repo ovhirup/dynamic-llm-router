@@ -147,6 +147,23 @@ class TaskDispatchTests(unittest.TestCase):
         with self.assertRaises(td.Refused):
             td.build_argv(self.policy, 'grok-build', self.repo)
 
+    def test_claude_argv_carries_the_guard_mod(self):
+        # Regression for #101: a94efba (#188) silently dropped the --plugin-dir injection and the mod files
+        from importlib import resources
+        mod = resources.files('llm_router').joinpath('mods', 'claude-guard')
+        self.assertTrue(mod.joinpath('plugin.json').is_file())
+        self.assertTrue(mod.joinpath('guard.mjs').is_file())
+        policy = copy.deepcopy(self.policy)
+        policy['run_task']['claude_guard_mod'] = True
+        warnings = []
+        argv = td.build_argv(policy, 'claude', self.repo, claude_version='2.1.309', warnings=warnings)
+        self.assertEqual(warnings, [])
+        plugin = Path(argv[argv.index('--plugin-dir') + 1])
+        self.assertTrue((plugin / 'plugin.json').is_file())
+        if '--' in argv:
+            self.assertLess(argv.index('--plugin-dir'), argv.index('--'))
+        self.assertNotIn('--plugin-dir', td.build_argv(self.policy, 'claude', self.repo, claude_version='2.1.309'))
+
     def test_pacing_refuse_and_warn(self):
         with self.assertRaisesRegex(td.Refused, 'refusing new full-size'):
             self.run_task(worker='codex', select=self.selection([], {'codex': 85}))
