@@ -14,8 +14,10 @@ Ubuntu CI. This module wraps the judge instead:
   `unshare`). Every other path keeps read and write. Allow-list entries are real paths. A path
   is omitted when it is the private directory, inside it, or an ancestor of it, including `/`
   (`Path.is_relative_to` on the resolved paths, both ways). A symlink to `/` resolves to `/`
-  and is rejected. The verdict file is write-only. The caller points TMPDIR at a sibling
-  directory so the judge's own temp files are not created beside the nonce.
+  and is rejected. The verdict file is write-only. Rule file descriptors are opened with
+  `O_PATH`, so a named pipe among those entries cannot stall the judge before it writes the
+  verdict. The caller points TMPDIR at a sibling directory so the judge's own temp files are
+  not created beside the nonce.
 - If neither sandbox can be applied, the caller must not run the judge.
 """
 import ctypes
@@ -219,7 +221,13 @@ def _syscall(number, *args):
 def _allow(add_rule, ruleset, path, access):
     if ctypes.sizeof(_PathBeneath) != 12:
         return False
-    flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0)
+    # O_RDONLY on a FIFO blocks until some other process opens it for write.
+    # O_PATH names the inode for the Landlock rule and returns immediately.
+    flags = getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    if hasattr(os, 'O_PATH'):
+        flags |= os.O_PATH
+    else:
+        flags |= os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0)
     try:
         fd = os.open(path, flags)
     except OSError:

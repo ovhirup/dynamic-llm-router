@@ -116,6 +116,46 @@ class JudgeSandboxTests(unittest.TestCase):
             os.rmdir(secret)
             os.rmdir(sibling)
 
+    def test_child_writes_verdict_and_cannot_read_prompt(self):
+        root, parent, private, prompt, verdict = self._private_tree()
+        fifo = os.path.join(parent, 'stall.pipe')
+        os.mkfifo(fifo)
+        code = (
+            'import sys\n'
+            'from pathlib import Path\n'
+            'try:\n'
+            '    Path({verdict!r}).write_text("VERDICT-OK\\n")\n'
+            '    print("WRITE_OK")\n'
+            'except OSError as err:\n'
+            '    print("WRITE_FAIL", err.errno)\n'
+            '    raise SystemExit(1)\n'
+            'try:\n'
+            '    print(Path({prompt!r}).read_text())\n'
+            'except OSError:\n'
+            '    print("READ_FAIL")\n'
+        ).format(verdict=verdict, prompt=prompt)
+        try:
+            argv = js.wrap([sys.executable, '-c', code], private, verdict)
+            if sys.platform == 'darwin' and shutil.which('sandbox-exec') is None:
+                profile = js.macos_profile(private, verdict)
+                real_private = os.path.realpath(private)
+                self.assertIn('(deny file-read* (subpath "%s"))' % real_private, profile)
+                self.assertIn('(allow file-write-data (literal "%s"))' % os.path.realpath(verdict), profile)
+                return
+            self.assertIsNotNone(argv)
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+            self.assertIn('WRITE_OK', done.stdout, done.stderr)
+            self.assertIn('READ_FAIL', done.stdout, done.stderr)
+            self.assertNotIn(MARKER, done.stdout)
+            self.assertEqual(Path(verdict).read_text(), 'VERDICT-OK\n')
+            self.assertIn(MARKER, Path(prompt).read_text())
+        finally:
+            try:
+                os.unlink(fifo)
+            except OSError:
+                pass
+            shutil.rmtree(root, ignore_errors=True)
+
     def test_wrap_uses_the_platform_sandbox(self):
         private = tempfile.mkdtemp()
         verdict = Path(private) / 'verdict.json'
