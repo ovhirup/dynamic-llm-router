@@ -32,6 +32,11 @@ def git(cwd, *args):
     return subprocess.run(['git', '-C', str(cwd), *args], capture_output=True, text=True).stdout.strip()
 
 
+def commit_tree(cwd, *args):
+    """commit-tree refuses to run without an identity. Linux CI has none; macOS runners do."""
+    return git(cwd, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit-tree', *args)
+
+
 def commit_all(cwd, message):
     git(cwd, 'add', '-A')
     git(cwd, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', message)
@@ -371,7 +376,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(summary['merged'], 3, summary)
 
     def test_staging_moved_while_jobs_ran_is_put_back_before_merging(self):
-        side = git(self.repo, 'commit-tree', 'main^{tree}', '-p', 'main', '-m', 'planted by job code')
+        side = commit_tree(self.repo, 'main^{tree}', '-p', 'main', '-m', 'planted by job code')
 
         def tampering_run_job(*args, **kw):
             result = self.fake_run_job(*args, **kw)
@@ -386,7 +391,7 @@ class BatchTests(unittest.TestCase):
         self.assertNotEqual(ancestor.returncode, 0)
 
     def test_staging_moved_while_jobs_ran_is_put_back_even_when_nothing_merges(self):
-        side = git(self.repo, 'commit-tree', 'main^{tree}', '-p', 'main', '-m', 'planted by job code')
+        side = commit_tree(self.repo, 'main^{tree}', '-p', 'main', '-m', 'planted by job code')
         for key in ('alpha', 'beta', 'gamma'):
             self.verdicts[key] = [{'text': 'looks fine'}]  # no verdict: nothing is verified
 
