@@ -5,10 +5,16 @@ from pathlib import Path
 
 from llm_router import feedback, merge_queue as mq
 from test_job_dispatch import job_setup, job_teardown, job_select, job_worker, run_job_fixture
-import test_merge_queue as tmq
+from test_merge_queue import (
+    merge_queue_create,
+    merge_queue_mkfile,
+    merge_queue_set_test_cmd,
+    merge_queue_setup,
+    merge_queue_teardown,
+    run_merge_queue_fixture,
+)
 
 # Reuse the job / merge-queue fixtures without subclassing, so their own tests are not re-run here.
-MQ = tmq.MergeQueueTests
 
 
 class JobFeedbackTests(unittest.TestCase):
@@ -54,10 +60,14 @@ class JobFeedbackTests(unittest.TestCase):
 
 class ReviewFeedbackTests(unittest.TestCase):
     """merge_queue.record_review feeds approve/reject verdicts into the reviewed worker's scorecard."""
-    tearDown, set_test_cmd, create, queue, mkfile = MQ.tearDown, MQ.set_test_cmd, MQ.create, MQ.queue, MQ.mkfile
+    tearDown = merge_queue_teardown
+    set_test_cmd = merge_queue_set_test_cmd
+    create = merge_queue_create
+    queue = run_merge_queue_fixture
+    mkfile = merge_queue_mkfile
 
     def setUp(self):
-        MQ.setUp(self)
+        merge_queue_setup(self)
         self.policy['feedback'] = {'scorecards_dir': str(self.base / 'scorecards')}
 
     def test_review_rejection_and_approval_update_scorecard(self):
