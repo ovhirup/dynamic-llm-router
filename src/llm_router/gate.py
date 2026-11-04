@@ -6,6 +6,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
@@ -130,20 +132,107 @@ def _run_step(argv: list[str], cwd: Path, env: dict) -> dict:
     proc = subprocess.run(
         argv, cwd=str(cwd), env=env, capture_output=True, text=True, errors='replace',
     )
-    combined = (proc.stdout or '') + (proc.stderr or '')
-    return {'argv': argv, 'returncode': proc.returncode, 'output': combined}
+    return {
+        'argv': argv,
+        'returncode': proc.returncode,
+        'stdout': proc.stdout or '',
+        'stderr': proc.stderr or '',
+    }
 
 
-def pytest_command(repo_root: Path, target: Path | None = None) -> list[str]:
+def _extend_streams(lines: list[str], step: dict) -> None:
+    for stream in (step['stdout'], step['stderr']):
+        if stream.strip():
+            lines.extend(stream.rstrip().splitlines())
+
+
+def pytest_command(repo_root: Path, target: Path | None = None,
+                   junitxml: Path | None = None) -> list[str]:
     """Quiet pytest with config addopts cleared.
 
     ``-rA`` and ``-p no:cacheprovider`` are intentionally absent: report chars
     and the cache plugin are not required for the final summary line.
+    ``junitxml`` is the private report the gate counts; it is not part of the
+    default argv so callers can still inspect the base command.
     """
     tests = target or repo_root / 'tests'
-    return [
+    argv = [
         sys.executable, '-m', 'pytest', '-q', '--color=no', '-o', 'addopts=', str(tests),
     ]
+    if junitxml is not None:
+        argv.extend(['--junitxml', str(junitxml)])
+    return argv
+
+
+def parse_junit_counts(path: Path) -> dict | None:
+    """tests/skipped/failures/errors from a pytest junitxml file, or None.
+
+    The file must be a regular non-symlink. A missing, huge, or malformed
+    report is not a summary.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, 'rb') as handle:
+            raw = handle.read(8_000_001)
+    except OSError:
+        return None
+    if not raw or len(raw) > 8_000_000:
+        return None
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return None
+    suites = [root] if root.tag == 'testsuite' else list(root.findall('testsuite'))
+    if not suites:
+        return None
+
+    def total(name: str) -> int:
+        count = 0
+        for suite in suites:
+            value = suite.get(name)
+            if value is None or not value.isdigit():
+                raise ValueError(name)
+            count += int(value)
+        return count
+
+    try:
+        return {
+            'tests': total('tests'),
+            'skipped': total('skipped'),
+            'failures': total('failures'),
+            'errors': total('errors'),
+        }
+    except ValueError:
+        return None
+
+
+def _junit_matches(summary: dict, junit: dict) -> bool:
+    """Stdout footer counts agree with the junitxml report.
+
+    Pytest records an xfailed test as skipped in junitxml and as xfailed in
+    the footer. An xpassed test counts in the footer separately and inside
+    the junit tests total.
+    """
+    if not summary.get('authentic'):
+        return False
+    total = (summary['passed'] + summary['failed'] + summary['skipped']
+             + summary['errors'] + summary['xpassed'] + summary['xfailed'])
+    return (junit['tests'] == total
+            and junit['failures'] == summary['failed']
+            and junit['errors'] == summary['errors']
+            and junit['skipped'] == summary['skipped'] + summary['xfailed'])
+
+
+def _apply_junit(summary: dict, junit: dict) -> None:
+    """Prefer the junitxml counts once they agree with the stdout footer."""
+    summary['failed'] = junit['failures']
+    summary['errors'] = junit['errors']
+    summary['skipped'] = junit['skipped'] - summary['xfailed']
+    summary['passed'] = (junit['tests'] - junit['failures'] - junit['errors']
+                         - junit['skipped'] - summary['xpassed'])
 
 
 def run_gate(
@@ -171,19 +260,35 @@ def run_gate(
         for argv in configured_lint_commands(repo_root):
             lines.append(f'==> {" ".join(argv)}')
             step = _run_step(argv, repo_root, run_env)
-            if step['output'].strip():
-                lines.extend(step['output'].rstrip().splitlines())
+            _extend_streams(lines, step)
             if step['returncode'] != 0:
                 steps_ok = False
                 lines.append(f'lint failed: {" ".join(argv)} (exit {step["returncode"]})')
                 break
 
-    pytest_argv = pytest_command(repo_root, pytest_target)
-    lines.append(f'==> {" ".join(pytest_argv)}')
-    pytest_step = _run_step(pytest_argv, repo_root, run_env)
-    if pytest_step['output'].strip():
-        lines.extend(pytest_step['output'].rstrip().splitlines())
-    verdict = evaluate_pytest(pytest_step['returncode'], pytest_step['output'])
+    # Counts come from a junitxml report in a private 0700 directory. The
+    # stdout footer is the cross-check. Stderr is shown and never parsed, so
+    # a test cannot forge a passing footer with capsys.disabled().
+    directory = tempfile.mkdtemp()
+    try:
+        os.chmod(directory, 0o700)
+        junit_path = Path(directory) / 'results.xml'
+        pytest_argv = pytest_command(repo_root, pytest_target, junit_path)
+        lines.append(f'==> {" ".join(pytest_argv)}')
+        pytest_step = _run_step(pytest_argv, repo_root, run_env)
+        _extend_streams(lines, pytest_step)
+        verdict = evaluate_pytest(pytest_step['returncode'], pytest_step['stdout'])
+        junit = parse_junit_counts(junit_path)
+        if junit is None:
+            verdict['reasons'].append('missing junitxml summary')
+            verdict['ok'] = False
+        elif not _junit_matches(verdict, junit):
+            verdict['reasons'].append('junitxml does not match the stdout summary')
+            verdict['ok'] = False
+        else:
+            _apply_junit(verdict, junit)
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
     ok = steps_ok and verdict['ok']
     banner = 'GATE: PASS' if ok else 'GATE: FAIL'
     lines.append(banner)

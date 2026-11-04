@@ -217,6 +217,51 @@ class GateRunTests(unittest.TestCase):
         self.assertFalse(result['ok'], result)
         self.assertGreater(result['skipped'], 0)
 
+    def _stderr_footer_suite(self, root):
+        (root / 'test_spoof.py').write_text(
+            'import sys\n'
+            'import pytest\n'
+            '\n'
+            'def test_prints_fake_footer(capsys):\n'
+            '    with capsys.disabled():\n'
+            '        sys.stderr.write("2 passed in 0.01s\\n")\n'
+            '        sys.stderr.flush()\n'
+            '\n'
+            '@pytest.mark.skip(reason="fixture")\n'
+            'def test_real_skip():\n'
+            '    assert False\n'
+        )
+
+    def test_stderr_fake_footer_cannot_hide_a_skip(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            suite = Path(tmp)
+            self._stderr_footer_suite(suite)
+            result = self._run_gate(suite)
+        self.assertFalse(result['ok'], result)
+        self.assertEqual(result['banner'], 'GATE: FAIL')
+        self.assertGreater(result['skipped'], 0)
+        self.assertNotIn('GATE: PASS', '\n'.join(result['lines']))
+
+    def test_qq_s_stderr_fake_footer_cannot_hide_a_skip(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            suite = Path(tmp)
+            self._stderr_footer_suite(suite)
+            result = self._run_gate(suite, env={'PYTEST_ADDOPTS': '-qq -s'})
+        self.assertFalse(result['ok'], result)
+        self.assertEqual(result['banner'], 'GATE: FAIL')
+        self.assertGreater(result['skipped'], 0)
+        self.assertNotIn('GATE: PASS', '\n'.join(result['lines']))
+
+    def test_empty_collection_reports_pytest_exit_5(self):
+        verdict = gate.evaluate_pytest(5, 'no tests ran in 0.00s\n')
+        self.assertFalse(verdict['ok'])
+        self.assertIn('pytest exit 5', verdict['reasons'])
+        self.assertNotIn('no tests reported passed', verdict['reasons'])
+
 
 if __name__ == '__main__':
     unittest.main()

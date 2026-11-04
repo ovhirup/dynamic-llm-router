@@ -35,25 +35,28 @@ summary: 1364 passed, 331 subtests, 0 skipped
 - Collection or run **errors** in the summary
 - No positive **passed** count (`no tests reported passed`)
 - Stdout that suppresses or spoofs the summary (`no authentic pytest summary`)
+- A missing junitxml report, or one that disagrees with the stdout footer
+- A footer that appears only on stderr (never parsed)
 
 **Warnings** in the pytest summary do not fail the gate by themselves.
 
 ## Authentic summary and a positive passed count
 
-The gate trusts one line: pytest's final `=== ... in Ns ===` footer, or, under `-q`, the last line of the form `N passed in Ns`. That line must report a positive passed count. Zero passed tests fail the gate even when the exit code is 0.
+The gate counts tests, skipped, failures, and errors from a pytest `--junitxml` report written in a private temporary directory. It cross-checks that report against pytest's stdout footer only: the final `=== ... in Ns ===` line, or, under `-q`, the last line of the form `N passed in Ns`. Stderr is displayed and never parsed, so a `capsys.disabled()` write of `2 passed in 0.01s` cannot hide a skip. A missing report, or a report that disagrees with that stdout footer, fails the gate. The footer must still report a positive passed count. Zero passed tests fail the gate even when the exit code is 0.
 
-These all fail with `no tests reported passed`:
+An empty collection exits pytest with code 5 and prints a summary such as `no tests ran in 0.00s`. The gate reports `pytest exit 5`.
+
+These fail with `no tests reported passed` when pytest still exits 0:
 
 - a missing summary
 - warnings only, including a warning whose text is `1 skipped cache refresh` (that phrase is not a skip)
-- a countless summary such as `no tests ran in 0.01s`
 - empty output
 
 A line like `worker diagnostic: 2 passed` is not a summary. If `-q -s` or `PYTEST_ADDOPTS` suppresses the real footer, or only that spoof is left, the gate fails with `no authentic pytest summary`.
 
 ANSI escapes are stripped before parsing, including a reset code between a count and its label (`1`, reset, `skipped`).
 
-The gate runs pytest with `-q`, `--color=no`, and `-o addopts=`. It does not pass `-rA` or `-p no:cacheprovider`, and it removes `PYTEST_ADDOPTS` so those flags cannot hide the summary.
+The gate runs pytest with `-q`, `--color=no`, `-o addopts=`, and `--junitxml` pointed at the private report. It does not pass `-rA` or `-p no:cacheprovider`, and it removes `PYTEST_ADDOPTS` so those flags cannot hide the summary.
 
 Configured linters in `pyproject.toml` (`[tool.ruff]`, `[tool.mypy]`, `[tool.pyright]`) run first when the matching CLI is on `PATH`.
 
