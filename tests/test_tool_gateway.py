@@ -3,15 +3,21 @@ import unittest
 
 from helpers import load_policy
 from llm_router import tool_gateway
-from test_job_dispatch import JobTests
+from test_job_dispatch import (
+    job_setup,
+    job_teardown,
+    job_select,
+    job_worker,
+    run_job_fixture,
+)
 
 
 class PermissionedToolGatewayTests(unittest.TestCase):
-    setUp = JobTests.setUp
-    tearDown = JobTests.tearDown
-    select = JobTests.select
-    worker = JobTests.worker
-    job = JobTests.job
+    setUp = job_setup
+    tearDown = job_teardown
+    select = job_select
+    worker = job_worker
+    job = run_job_fixture
 
     def test_ladder_allows_read_write_commit_and_refuses_push_merge_and_secrets_without_approval(self):
         policy = load_policy()

@@ -3,15 +3,21 @@ from pathlib import Path
 import unittest
 
 from llm_router import handoff, triage
-from test_job_dispatch import JobTests
+from test_job_dispatch import (
+    job_setup,
+    job_teardown,
+    job_select,
+    job_worker,
+    run_job_fixture,
+)
 
 
 class WorkerTriageTests(unittest.TestCase):
-    setUp = JobTests.setUp
-    tearDown = JobTests.tearDown
-    select = JobTests.select
-    worker = JobTests.worker
-    job = JobTests.job
+    setUp = job_setup
+    tearDown = job_teardown
+    select = job_select
+    worker = job_worker
+    job = run_job_fixture
 
     def test_triage_block_in_worker_prompt_template_and_parsed_into_result_and_handoff(self):
         self.assertIn('Size: small | medium | large', handoff.WORKER_INSTRUCTIONS)

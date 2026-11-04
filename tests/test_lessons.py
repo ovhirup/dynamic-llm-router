@@ -3,16 +3,23 @@ from pathlib import Path
 import unittest
 
 from llm_router import lessons
-from test_job_dispatch import JobTests
+from test_job_dispatch import (
+    job_setup,
+    job_teardown,
+    job_select,
+    job_worker,
+    run_job_fixture,
+    assert_job_main_untouched,
+)
 
 
 class LessonsUnitTests(unittest.TestCase):
-    setUp = JobTests.setUp
-    tearDown = JobTests.tearDown
-    select = JobTests.select
-    worker = JobTests.worker
-    job = JobTests.job
-    assert_main_untouched = JobTests.assert_main_untouched
+    setUp = job_setup
+    tearDown = job_teardown
+    select = job_select
+    worker = job_worker
+    job = run_job_fixture
+    assert_main_untouched = assert_job_main_untouched
 
     def test_write_dedup_cap_and_layer_filing(self):
         self.policy['run_job']['lessons_dir'] = str(self.base / 'lessons')
@@ -42,7 +49,7 @@ class LessonsUnitTests(unittest.TestCase):
         capture = self.base / 'prompts.txt'
         self.worker("import sys; p=sys.stdin.read(); open(%r,'a').write(p+'\\n=====\\n'); "
                     "open('n.txt','a').write('x\\n')" % str(capture))
-        before = JobTests.setUp  # keep reference
+        before = job_setup  # keep reference
         state_before = self.policy['run_job']['lessons_dir']
         first = self.job(test_cmd='test $(wc -l < n.txt) -ge 2')
         self.assertTrue(first['ok'], first)
