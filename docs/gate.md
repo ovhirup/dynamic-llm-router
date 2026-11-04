@@ -42,7 +42,7 @@ summary: 1364 passed, 331 subtests, 0 skipped
 
 ## Authentic summary and a positive passed count
 
-The gate counts tests, skipped, failures, and errors from a pytest `--junitxml` report written in a private temporary directory. It cross-checks that report against pytest's stdout footer only: the final `=== ... in Ns ===` line, or, under `-q`, the last line of the form `N passed in Ns`. Stderr is displayed and never parsed, so a `capsys.disabled()` write of `2 passed in 0.01s` cannot hide a skip. A missing report, or a report that disagrees with that stdout footer, fails the gate. The footer must still report a positive passed count. Zero passed tests fail the gate even when the exit code is 0.
+The gate counts tests, skipped, failures, and errors from a pytest `--junitxml` report written in a private temporary directory. It cross-checks that report against pytest's stdout footer only: the final `=== ... in Ns ===` line, or, under `-q`, the last line of the form `N passed in Ns`. Passing subtests are part of the JUnit `tests` total and part of that cross-check. Stderr is displayed and never parsed, so a `capsys.disabled()` write of `2 passed in 0.01s` cannot hide a skip. A missing report fails the gate. A report that disagrees with the stdout footer fails the gate, reports the JUnit counts (skips included), and shows both sides. The footer must still report a positive passed count. Zero passed tests fail the gate even when the exit code is 0.
 
 An empty collection exits pytest with code 5 and prints a summary such as `no tests ran in 0.00s`. The gate reports `pytest exit 5`.
 

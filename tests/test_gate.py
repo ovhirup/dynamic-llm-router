@@ -262,6 +262,54 @@ class GateRunTests(unittest.TestCase):
         self.assertIn('pytest exit 5', verdict['reasons'])
         self.assertNotIn('no tests reported passed', verdict['reasons'])
 
+    def test_mismatch_reports_junit_counts_including_skips(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            suite = Path(tmp)
+            (suite / 'test_spoof.py').write_text(
+                'import atexit\n'
+                'import sys\n'
+                'import pytest\n'
+                '\n'
+                'def test_late_footer():\n'
+                '    atexit.register(lambda: sys.stdout.write("2 passed in 0.01s\\n"))\n'
+                '\n'
+                '@pytest.mark.skip(reason="fixture")\n'
+                'def test_real_skip():\n'
+                '    assert False\n'
+            )
+            result = self._run_gate(suite)
+        self.assertFalse(result['ok'], result)
+        self.assertEqual(result['banner'], 'GATE: FAIL')
+        self.assertEqual(result['skipped'], 1)
+        self.assertEqual(result['passed'], 1)
+        self.assertEqual(result['failed'], 0)
+        text = '\n'.join(result['lines'])
+        self.assertIn('junitxml does not match the stdout summary', text)
+        self.assertIn('junit tests=2 skipped=1 failures=0 errors=0', text)
+        self.assertIn('stdout passed=2 failed=0 skipped=0', text)
+
+    def test_passing_subtest_matches_junit_total(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            suite = Path(tmp)
+            (suite / 'test_sub.py').write_text(
+                'import unittest\n'
+                '\n'
+                'class T(unittest.TestCase):\n'
+                '    def test_one(self):\n'
+                '        with self.subTest(n=1):\n'
+                '            self.assertTrue(True)\n'
+            )
+            result = self._run_gate(suite)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['banner'], 'GATE: PASS')
+        self.assertEqual(result['passed'], 1)
+        self.assertEqual(result['subtests'], 1)
+        self.assertEqual(result['skipped'], 0)
+
 
 if __name__ == '__main__':
     unittest.main()

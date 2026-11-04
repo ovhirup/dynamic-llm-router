@@ -218,8 +218,11 @@ def _junit_matches(summary: dict, junit: dict) -> bool:
     """
     if not summary.get('authentic'):
         return False
+    # Pytest's footer lists passing subtests beside the test total. JUnit
+    # folds those same subtests into tests=.
     total = (summary['passed'] + summary['failed'] + summary['skipped']
-             + summary['errors'] + summary['xpassed'] + summary['xfailed'])
+             + summary['errors'] + summary['xpassed'] + summary['xfailed']
+             + summary['subtests'])
     return (junit['tests'] == total
             and junit['failures'] == summary['failed']
             and junit['errors'] == summary['errors']
@@ -232,7 +235,27 @@ def _apply_junit(summary: dict, junit: dict) -> None:
     summary['errors'] = junit['errors']
     summary['skipped'] = junit['skipped'] - summary['xfailed']
     summary['passed'] = (junit['tests'] - junit['failures'] - junit['errors']
-                         - junit['skipped'] - summary['xpassed'])
+                         - junit['skipped'] - summary['xpassed'] - summary['subtests'])
+
+
+def _report_junit_counts(summary: dict, junit: dict) -> None:
+    """On a mismatch, the returned counts are JUnit's, skips included."""
+    summary['failed'] = junit['failures']
+    summary['errors'] = junit['errors']
+    summary['skipped'] = junit['skipped']
+    summary['passed'] = (junit['tests'] - junit['failures'] - junit['errors']
+                         - junit['skipped'])
+
+
+def _mismatch_reason(summary: dict, junit: dict) -> str:
+    return (
+        'junitxml does not match the stdout summary: '
+        f'junit tests={junit["tests"]} skipped={junit["skipped"]} '
+        f'failures={junit["failures"]} errors={junit["errors"]}; '
+        f'stdout passed={summary["passed"]} failed={summary["failed"]} '
+        f'skipped={summary["skipped"]} errors={summary["errors"]} '
+        f'subtests={summary["subtests"]}'
+    )
 
 
 def run_gate(
@@ -283,8 +306,9 @@ def run_gate(
             verdict['reasons'].append('missing junitxml summary')
             verdict['ok'] = False
         elif not _junit_matches(verdict, junit):
-            verdict['reasons'].append('junitxml does not match the stdout summary')
+            verdict['reasons'].append(_mismatch_reason(verdict, junit))
             verdict['ok'] = False
+            _report_junit_counts(verdict, junit)
         else:
             _apply_junit(verdict, junit)
     finally:
