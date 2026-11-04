@@ -29,6 +29,8 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -61,8 +63,9 @@ Verifier rules (binding):
 2. Judge the produced diff against the task by running the tests and the code. Never trust the worker's claims.
 3. Count each distinct wrong behaviour (`wrong`) and each crash, traceback or failing/erroring run (`crash`).
    For each, give the command you ran, what you expected and what you saw, so it can become a failing test.
-4. Write a JSON object with exactly two nonnegative integer fields, wrong and crash, to the designated
-   verdict file after testing. Write it yourself and keep the path out of test commands and their output.
+4. Write a JSON object with exactly three fields to the designated verdict file after testing:
+   wrong and crash, each a nonnegative integer, and nonce, the exact value from the verdict nonce line.
+   Write it yourself. Keep the verdict path and the nonce out of test commands, their environment, and their output.
 """
 
 
@@ -109,7 +112,22 @@ def _valid_verdict(verdict):
             and all(type(count) is int and count >= 0 for count in verdict.values()))
 
 
-def _read_verdict(path):
+def _nonce_matches(got, expected):
+    if type(got) is not str or type(expected) is not str or len(got) != len(expected) or not expected:
+        return False
+    return secrets.compare_digest(got, expected)
+
+
+def _valid_file_verdict(verdict, nonce):
+    """The file the judge writes. nonce is the per-job secret; counts alone are not approval."""
+    if not isinstance(verdict, dict) or set(verdict) != {'wrong', 'crash', 'nonce'}:
+        return False
+    if not _nonce_matches(verdict.get('nonce'), nonce):
+        return False
+    return all(type(verdict[key]) is int and verdict[key] >= 0 for key in ('wrong', 'crash'))
+
+
+def _read_verdict(path, nonce):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, 'rb') as handle:
@@ -121,7 +139,43 @@ def _read_verdict(path):
         verdict = json.loads(raw, object_pairs_hook=_unique_object)
     except (OSError, ValueError, RecursionError):
         return None
-    return verdict if _valid_verdict(verdict) else None
+    return verdict if _valid_file_verdict(verdict, nonce) else None
+
+
+def _scrub_env(env, *hidden):
+    """Drop any value that carries the verdict directory, its path, or the nonce."""
+    needles = tuple(item for item in hidden if item)
+    scrubbed = {}
+    for key, value in env.items():
+        text = value if isinstance(value, str) else ''
+        if any(needle in text for needle in needles):
+            continue
+        scrubbed[key] = value
+    return scrubbed
+
+
+def _job_rows(jobs):
+    return [{'job': job['key'], 'source': job['source'], 'worker': job['worker'],
+             'branch': job['branch'], 'commit': job['commit'], 'tests': job['tests'],
+             'verdict': job['verdict'], 'fix_rounds': len(job['fix_rounds']),
+             'staging_tests': job['staging_tests'], 'merged': job['state'] == 'merged',
+             'status': job['status'], 'reason': job['reason'], 'job_id': job.get('job_id'),
+             'worktree': job.get('worktree')} for job in jobs]
+
+
+def _ref_sha(repo, ref):
+    """Final staging-ref lookup. A failure here must not skip the batch reports."""
+    try:
+        return jd.resolve_base(repo, ref)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _main_untouched(repo, before):
+    try:
+        return jd.main_state(repo) == before
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def gate_tests(tests):
@@ -177,19 +231,35 @@ def verdict_text(argv, done):
     stdout = done.get('stdout') or ''
     if not is_stream_json(argv):
         return stdout
-    return claude_handoff.inspect(stdout, done.get('stderr') or '', done.get('returncode') or 0)['text']
+    try:
+        return claude_handoff.inspect(stdout, done.get('stderr') or '', done.get('returncode') or 0)['text']
+    except (AttributeError, TypeError, ValueError, KeyError):
+        return ''
 
 
 def default_verifier(job, prompt, policy):
-    """Run a judge in the job worktree and accept its verdict only from a private file."""
+    """Run a judge in the job worktree and accept its verdict only from a private file.
+
+    The verdict directory is an unguessable 0700 mkdtemp (not a dlr-judge-* glob). Its path and the
+    per-job nonce stay out of the judge process environment, so a same-UID test child cannot forge
+    approval by scanning temp and writing counts. The nonce in the file is the only approval secret.
+    """
     attempts = []
-    with tempfile.TemporaryDirectory(prefix='dlr-judge-') as directory:
+    nonce = secrets.token_hex(16)
+    directory = tempfile.mkdtemp()
+    try:
+        os.chmod(directory, 0o700)
         verdict_path = Path(directory) / 'verdict.json'
-        task_file = _write_private(Path(directory) / 'prompt.md', f'{prompt}\nVerdict file `{verdict_path}`\n')
+        task_file = _write_private(Path(directory) / 'prompt.md',
+                                   f'{prompt}\nVerdict file `{verdict_path}`\nVerdict nonce `{nonce}`\n')
 
         def capture(argv, *args, **kwargs):
             # A failed worker or continuation cannot leave a verdict for a later attempt.
             verdict_path.unlink(missing_ok=True)
+            env = kwargs.get('env')
+            if env is None:
+                env = os.environ.copy()
+            kwargs['env'] = _scrub_env(env, str(directory), str(verdict_path), nonce)
             done = td.run_bounded(argv, *args, **kwargs)
             attempts.append((argv, done))
             return done
@@ -205,8 +275,12 @@ def default_verifier(job, prompt, policy):
         if not result.get('ok'):
             return {'status': 'unavailable', 'reason': result.get('reason') or 'verifier run failed',
                     'text': report, 'worker': worker}
-        verdict = _read_verdict(verdict_path) if attempts else None
+        verdict = _read_verdict(verdict_path, nonce) if attempts else None
+        if verdict is not None:
+            verdict = {'wrong': verdict['wrong'], 'crash': verdict['crash']}
         return {'status': 'done', 'text': report, 'verdict': verdict, 'worker': worker}
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def default_fixer(job, prompt, policy):
@@ -579,55 +653,75 @@ def run_batch(repo, issues=(), task_files=(), max_parallel=None, base='main', st
     if len(set(keys)) != len(keys):
         raise Refused('two task files share a name')
 
-    with jd.RepoLock(jd._path(policy, 'lock_dir', 'logs/locks'), repo):
-        before = jd.main_state(repo)
-        staging_sha = jd.resolve_base(repo, f'refs/heads/{staging}')
-        if not staging_sha:
-            _git(repo, 'branch', staging, base_sha, check=True)  # creates a ref only; no checkout changes
-            staging_sha = base_sha
-        root = jd._path(policy, 'worktree_root', 'worktrees')
-        root.mkdir(parents=True, exist_ok=True)
-        prefix = policy['run_job'].get('branch_prefix', 'router/')
-        batch = Batch(repo, jobs, policy, batch_id, staging, test_cmd, test_runner,
-                      verifier or default_verifier, fixer or default_fixer)
+    batch = None
+    summary = None
+    before = None
+    staging_sha = None
+    try:
+        with jd.RepoLock(jd._path(policy, 'lock_dir', 'logs/locks'), repo):
+            before = jd.main_state(repo)
+            staging_sha = jd.resolve_base(repo, f'refs/heads/{staging}')
+            if not staging_sha:
+                _git(repo, 'branch', staging, base_sha, check=True)  # creates a ref only; no checkout changes
+                staging_sha = base_sha
+            root = jd._path(policy, 'worktree_root', 'worktrees')
+            root.mkdir(parents=True, exist_ok=True)
+            prefix = policy['run_job'].get('branch_prefix', 'router/')
+            batch = Batch(repo, jobs, policy, batch_id, staging, test_cmd, test_runner,
+                          verifier or default_verifier, fixer or default_fixer)
+            for job in jobs:
+                job.update(base_sha=staging_sha, branch=f"{prefix}batch-{batch_id}-{job['key']}", verified_sha=None)
+            batch.write_status()
+            options = {'size': size, 'worker': worker, 'task_class': task_class}
+            if test_runner:
+                options['test_runner'] = test_runner
+            with ThreadPoolExecutor(max_workers=cap) as pool:
+                list(pool.map(lambda job: batch.run_one(job, run_job or jd.run_job, options), jobs))
+            batch.merge_all(root, staging_sha)
         for job in jobs:
-            job.update(base_sha=staging_sha, branch=f"{prefix}batch-{batch_id}-{job['key']}", verified_sha=None)
-        batch.write_status()
-        options = {'size': size, 'worker': worker, 'task_class': task_class}
-        if test_runner:
-            options['test_runner'] = test_runner
-        with ThreadPoolExecutor(max_workers=cap) as pool:
-            list(pool.map(lambda job: batch.run_one(job, run_job or jd.run_job, options), jobs))
-        batch.merge_all(root, staging_sha)
-    for job in jobs:
-        if job['state'] not in ('merged', 'not_merged', 'rollback_failed'):
-            batch.update(job, 'not_merged', status=job.get('status'), reason=job.get('reason'))
-    batch.write_status(final=True)
-
-    summary = {'batch_id': batch_id, 'repo': str(repo), 'base': base, 'base_sha': base_sha,
-               'staging_branch': staging, 'staging_start': staging_sha,
-               'staging_restored_from': batch.staging_restored_from,
-               'staging_head': jd.resolve_base(repo, f'refs/heads/{staging}'), 'test_command': test_cmd,
-               'max_parallel': cap, 'started_at': started.isoformat(timespec='seconds'),
-               'finished_at': _now(policy), 'pushed': False,
-               'main_checkout_untouched': jd.main_state(repo) == before,
-               'jobs': [{'job': job['key'], 'source': job['source'], 'worker': job['worker'],
-                         'branch': job['branch'], 'commit': job['commit'], 'tests': job['tests'],
-                         'verdict': job['verdict'], 'fix_rounds': len(job['fix_rounds']),
-                         'staging_tests': job['staging_tests'], 'merged': job['state'] == 'merged',
-                         'status': job['status'], 'reason': job['reason'], 'job_id': job.get('job_id'),
-                         'worktree': job.get('worktree')} for job in jobs]}
-    summary['merged'] = sum(job['merged'] for job in summary['jobs'])
-    if batch.rollback_failure is not None:
-        summary['rollback_failure'] = batch.rollback_failure
-    summary['ok'] = (summary['merged'] == len(jobs) and summary['main_checkout_untouched']
-                     and batch.rollback_failure is None)
-    summary = security.redact_obj(summary)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / 'summary.json').write_text(json.dumps(summary, indent=2))
-    (out / 'summary.md').write_text(render_markdown(summary))
-    return dict(summary, files={'summary_json': str(out / 'summary.json'), 'summary_md': str(out / 'summary.md'),
-                        'status': str(out / 'status.json'), 'events': str(out / 'events.jsonl')})
+            if job['state'] not in ('merged', 'not_merged', 'rollback_failed'):
+                batch.update(job, 'not_merged', status=job.get('status'), reason=job.get('reason'))
+        summary = {'batch_id': batch_id, 'repo': str(repo), 'base': base, 'base_sha': base_sha,
+                   'staging_branch': staging, 'staging_start': staging_sha,
+                   'staging_restored_from': batch.staging_restored_from,
+                   'staging_head': _ref_sha(repo, f'refs/heads/{staging}'), 'test_command': test_cmd,
+                   'max_parallel': cap, 'started_at': started.isoformat(timespec='seconds'),
+                   'finished_at': _now(policy), 'pushed': False,
+                   'main_checkout_untouched': _main_untouched(repo, before),
+                   'jobs': _job_rows(jobs)}
+        summary['merged'] = sum(job['merged'] for job in summary['jobs'])
+        if batch.rollback_failure is not None:
+            summary['rollback_failure'] = batch.rollback_failure
+        summary['ok'] = (summary['merged'] == len(jobs) and summary['main_checkout_untouched']
+                         and batch.rollback_failure is None)
+        summary = security.redact_obj(summary)
+    finally:
+        # A staging-ref lookup that raises after a rollback must still leave all three reports.
+        if batch is not None:
+            try:
+                batch.write_status(final=True)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            if summary is None:
+                rows = _job_rows(jobs)
+                summary = {'batch_id': batch_id, 'repo': str(repo), 'base': base, 'base_sha': base_sha,
+                           'staging_branch': staging, 'staging_start': staging_sha,
+                           'staging_restored_from': batch.staging_restored_from, 'staging_head': None,
+                           'test_command': test_cmd, 'max_parallel': cap,
+                           'started_at': started.isoformat(timespec='seconds'), 'finished_at': _now(policy),
+                           'pushed': False, 'main_checkout_untouched': False, 'jobs': rows,
+                           'merged': sum(row['merged'] for row in rows), 'ok': False}
+                if batch.rollback_failure is not None:
+                    summary['rollback_failure'] = batch.rollback_failure
+                summary = security.redact_obj(summary)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / 'summary.json').write_text(json.dumps(summary, indent=2))
+            (out / 'summary.md').write_text(render_markdown(summary))
+            summary = dict(summary, files={'summary_json': str(out / 'summary.json'),
+                                           'summary_md': str(out / 'summary.md'),
+                                           'status': str(out / 'status.json'),
+                                           'events': str(out / 'events.jsonl')})
+    return summary
 
 
 def render_markdown(summary):

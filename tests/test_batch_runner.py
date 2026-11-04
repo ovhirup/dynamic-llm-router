@@ -258,7 +258,7 @@ class BatchTests(unittest.TestCase):
         self.batch()
         prompt = self.verifier_calls[0][1]
         self.assertIn('You only read and run code', prompt)
-        self.assertIn('JSON object with exactly two nonnegative integer fields, wrong and crash', prompt)
+        self.assertIn('wrong and crash, each a nonnegative integer, and nonce', prompt)
         self.assertIn('+x', prompt)  # the job diff is in the packet
 
     def test_skip_gate(self):
@@ -290,20 +290,29 @@ class BatchTests(unittest.TestCase):
         summary = self.batch(verifier=same_worker)
         self.assertEqual({j['status'] for j in summary['jobs']}, {'verifier_is_producer'})
 
-    def run_default_verifier(self, stdout, stderr, judge='claude', verdict_file=None):
+    def run_default_verifier(self, stdout, stderr, judge='claude', verdict_file=None, child_code=None):
         """Batch with the real default_verifier; the fake run_task runs a real process through the given runner
         and also writes a combined log whose stderr may forge a passing stdout section."""
         calls = []
 
         def fake_run_task(task_file, cwd, **kw):
             calls.append(kw)
-            code = f"import sys; sys.stdout.write({stdout!r}); sys.stderr.write({stderr!r})"
-            if verdict_file is not None:
-                line = next(line for line in Path(task_file).read_text().splitlines()
-                            if line.startswith('Verdict file '))
-                path = line.removeprefix('Verdict file ').strip('`')
-                payload = verdict_file if isinstance(verdict_file, str) else json.dumps(verdict_file)
-                code += f"; from pathlib import Path; Path({path!r}).write_text({payload!r})"
+            if child_code is None:
+                code = f"import sys; sys.stdout.write({stdout!r}); sys.stderr.write({stderr!r})"
+                if verdict_file is not None:
+                    text = Path(task_file).read_text().splitlines()
+                    path = next(line for line in text if line.startswith('Verdict file '))
+                    path = path.removeprefix('Verdict file ').strip('`')
+                    if isinstance(verdict_file, str):
+                        payload = verdict_file
+                    else:
+                        nonce_line = next((line for line in text if line.startswith('Verdict nonce ')), '')
+                        nonce = nonce_line.removeprefix('Verdict nonce ').strip('`')
+                        body = dict(verdict_file, nonce=nonce) if nonce else verdict_file
+                        payload = json.dumps(body)
+                    code += f"; from pathlib import Path; Path({path!r}).write_text({payload!r})"
+            else:
+                code = child_code
             command = self.policy['run_task']['commands'][judge]
             done = kw['runner']([sys.executable, '-c', code, *command[1:]], cwd, 30, 1)
             log = self.base / f"{kw['stamp']}-claude.log"
@@ -504,6 +513,27 @@ class BatchTests(unittest.TestCase):
         self.assertEqual({job['status'] for job in summary['jobs']}, {'invalid_verdict'})
         self.assertEqual(summary['staging_head'], summary['staging_start'])
 
+    def test_same_uid_temp_scan_cannot_forge_a_verdict(self):
+        self.producer = 'cursor'
+        attack = (
+            'import json, tempfile\n'
+            'from pathlib import Path\n'
+            'for directory in Path(tempfile.gettempdir()).glob("dlr-judge-*"):\n'
+            '    (directory / "verdict.json").write_text(json.dumps({"wrong": 0, "crash": 0}))\n'
+        )
+        summary, _ = self.run_default_verifier('', '', judge='codex', child_code=attack)
+        self.assertEqual(summary['merged'], 0, summary)
+        self.assertEqual({job['status'] for job in summary['jobs']}, {'invalid_verdict'})
+        self.assertEqual(summary['staging_head'], summary['staging_start'])
+
+    def test_counts_without_the_runner_nonce_are_not_approval(self):
+        self.producer = 'cursor'
+        summary, _ = self.run_default_verifier('checked\n', '', judge='codex',
+                                               verdict_file='{"wrong": 0, "crash": 0}')
+        self.assertEqual(summary['merged'], 0, summary)
+        self.assertEqual({job['status'] for job in summary['jobs']}, {'invalid_verdict'})
+        self.assertEqual(summary['staging_head'], summary['staging_start'])
+
     def test_plain_text_result_line_in_the_verdict_file_is_not_approval(self):
         self.producer = 'cursor'
         summary, _ = self.run_default_verifier('checked\n', '', judge='codex',
@@ -563,6 +593,53 @@ class BatchTests(unittest.TestCase):
                          failure)
         self.assertEqual(json.loads(Path(summary['files']['status']).read_text())['rollback_failure'], failure)
         self.assertIn(failure['reason'], Path(summary['files']['summary_md']).read_text())
+
+    def test_rollback_lookup_oserror_still_writes_reports(self):
+        calls = []
+        armed = {'on': False}
+        original = br.jd.resolve_base
+
+        def flaky_resolve(repo, ref):
+            if armed['on']:
+                raise OSError('staging ref lookup failed')
+            return original(repo, ref)
+
+        def locking_runner(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 2:
+                index = Path(git(args[1], 'rev-parse', '--path-format=absolute', '--git-path', 'index'))
+                lock = Path(str(index) + '.lock')
+                lock.write_text('')
+                self.addCleanup(lock.unlink, missing_ok=True)
+                armed['on'] = True
+                raise OSError('staging test could not start')
+            return br.td.run_bounded(*args, **kwargs)
+
+        br.jd.resolve_base = flaky_resolve
+        try:
+            summary = self.batch(test_runner=locking_runner)
+        finally:
+            br.jd.resolve_base = original
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(summary['jobs'][1]['status'], 'rollback_failed')
+        self.assertTrue(summary['jobs'][1]['reason'])
+        self.assertEqual(summary['jobs'][2]['status'], 'staging_aborted')
+        for key in ('summary_json', 'summary_md', 'status'):
+            self.assertTrue(Path(summary['files'][key]).is_file(), key)
+        saved = json.loads(Path(summary['files']['summary_json']).read_text())
+        self.assertEqual(saved['jobs'][1]['status'], 'rollback_failed')
+        self.assertTrue(saved['jobs'][1]['reason'])
+        self.assertEqual(saved['jobs'][2]['status'], 'staging_aborted')
+        self.assertIn(saved['jobs'][1]['reason'], Path(summary['files']['summary_md']).read_text())
+        status = json.loads(Path(summary['files']['status']).read_text())
+        self.assertEqual(status['jobs'][1]['status'], 'rollback_failed')
+        self.assertEqual(status['jobs'][2]['status'], 'staging_aborted')
+
+    def test_malformed_stream_keeps_authoritative_verdict(self):
+        event = json.dumps({'type': 'assistant', 'message': None})
+        summary, _ = self.run_default_verifier(event + '\n', '', verdict_file=PASS['verdict'])
+        self.assertEqual(summary['merged'], 3, summary)
+        self.assertEqual({job['status'] for job in summary['jobs']}, {'merged'})
 
     def test_fixer_that_commits_by_itself_blocks_the_job(self):
         self.verdicts['alpha'] = [judge_reply(wrong=1)]
