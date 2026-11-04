@@ -2,8 +2,8 @@
 
 `llm-router batch` takes 3-5 issue numbers (or task files) and, with at most `max_parallel` jobs running at once:
 1. runs every job through job_dispatch.run_job (allocation, worktree, tests, commit) from the staging head;
-2. sends each committed job to a verifier unit that only reads and runs code and ends its report with
-   `RESULT wrong=<n> crash=<n>`. Findings go back to the producing worker as a fix round (new failing tests
+2. sends each committed job to a verifier unit that only reads and runs code and records
+   a private JSON verdict. Findings go back to the producing worker as a fix round (new failing tests
    first, then the fix); after MAX_FIX_ROUNDS failed rounds the job is blocked;
 3. merges each verified job (`wrong=0 crash=0`, tests passed, zero skipped) into `staging/YYYYMMDD` one at a
    time, keeping the merge only when the full test suite passes on the merged result. A failed job stays on its
@@ -18,7 +18,7 @@ Decisions (v1):
   it). Job starts are spaced into distinct seconds because run_job names worktrees and logs by the second.
 - Staging merges the exact commit the verifier passed, never a branch tip that moved after verification. Fix
   rounds keep the task's allowed-paths scope, and a fixer that commits by itself blocks the job.
-- Verifiers are read-and-run only: the prompt says so and the runner enforces it afterwards. A verifier that moved
+- Verifiers may write their private verdict file. The runner checks the worktree afterwards. A verifier that moved
   HEAD or left any change blocks the job (`verifier_wrote`); its edits are left in place for a human, never kept.
 - The verifier is the `judge` role with the producing worker excluded, so the finder is never the fixer.
 - Never pushes, never touches main or the user's checkout: staging is updated in its own temporary worktree, and
@@ -29,7 +29,9 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -49,20 +51,18 @@ MAX_DIFF_CHARS = 60_000
 # objects, so replace refs cannot change them.
 SAFE_GIT = ('--no-replace-objects', '-c', 'core.hooksPath=/dev/null')
 STREAM_JSON = ('stream-json', 'streaming-json')
-RESULT_LINE = re.compile(r'\s*RESULT\s+wrong=(\d+)\s+crash=(\d+)\s*')
-RESULT_ANY = re.compile(r'RESULT\s+wrong=(\d+)\s+crash=(\d+)')
 SKIPPED = re.compile(r'(?<!\d)[1-9]\d*\s+skipped\b|\bskip(?:ped)?=[1-9]|^(?:--- SKIP\b|SKIPPED \[)', re.I | re.M)
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 
 VERIFIER_RULES = """\
 Verifier rules (binding):
-1. You only read and run code. Never edit, create or delete files, never commit, push, merge or open a PR.
-   Any change you leave behind voids this verification and blocks the job.
+1. You only read and run code. The designated verdict file is your only authorized write.
+   Any worktree change voids verification. Never commit, push, merge or open a PR.
 2. Judge the produced diff against the task by running the tests and the code. Never trust the worker's claims.
 3. Count each distinct wrong behaviour (`wrong`) and each crash, traceback or failing/erroring run (`crash`).
    For each, give the command you ran, what you expected and what you saw, so it can become a failing test.
-4. End your answer with exactly one line:
-RESULT wrong=<n> crash=<n>
+4. Write a JSON object with exactly two nonnegative integer fields, wrong and crash, to the designated
+   verdict file after testing. Write it yourself and keep the path out of test commands and their output.
 """
 
 
@@ -81,30 +81,47 @@ def batch_dir(policy, batch_id):
     return config.policy_path(policy, 'batch', 'dir', 'logs/batches') / batch_id
 
 
-def result_conflict(text, raw=''):
-    """True when the verdict is ambiguous: more than one RESULT line in the answer, or RESULT values anywhere in the
-    judge's answer or raw output (stream-JSON events included) that disagree. An ambiguous verdict never passes."""
-    lines = [line for line in (text or '').splitlines() if RESULT_LINE.fullmatch(line)]
-    values = {m.groups() for source in (text or '', raw or '') for m in RESULT_ANY.finditer(source)}
-    return len(lines) > 1 or len(values) > 1
-
-
 def is_stream_json(command):
-    """True only when the command's --output-format option value is a stream-JSON format, never for a stray token."""
-    for k, arg in enumerate(command):
-        if arg == '--output-format' and k + 1 < len(command) and command[k + 1] in STREAM_JSON:
-            return True
-        if arg.startswith('--output-format=') and arg.split('=', 1)[1] in STREAM_JSON:
-            return True
-    return False
+    """Read the last output-format option before the option terminator."""
+    output_format = None
+    args = iter(command[1:])
+    for arg in args:
+        if arg == '--':
+            break
+        if arg == '--output-format':
+            output_format = next(args, None)
+            if output_format == '--':
+                break
+        elif arg.startswith('--output-format='):
+            output_format = arg.split('=', 1)[1]
+    return output_format in STREAM_JSON
 
 
-def parse_result(text):
-    """(wrong, crash) when the last non-blank line is `RESULT wrong=<n> crash=<n>`, else None (never guessed):
-    a RESULT line echoed from the prompt or the task text earlier in the output never counts."""
-    lines = [line for line in (text or '').splitlines() if line.strip()]
-    found = RESULT_LINE.fullmatch(lines[-1]) if lines else None
-    return (int(found.group(1)), int(found.group(2))) if found else None
+def _unique_object(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError('duplicate verdict field')
+    return result
+
+
+def _valid_verdict(verdict):
+    return (isinstance(verdict, dict) and set(verdict) == {'wrong', 'crash'}
+            and all(type(count) is int and count >= 0 for count in verdict.values()))
+
+
+def _read_verdict(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None
+            raw = handle.read(1025)
+        if len(raw) > 1024:
+            return None
+        verdict = json.loads(raw, object_pairs_hook=_unique_object)
+    except (OSError, ValueError, RecursionError):
+        return None
+    return verdict if _valid_verdict(verdict) else None
 
 
 def gate_tests(tests):
@@ -155,42 +172,41 @@ def _snapshot(worktree):
             _git(worktree, 'status', '--porcelain', '--untracked-files=normal').stdout)
 
 
-def verdict_text(policy, worker, done):
-    """The judge's answer text: stream-JSON workers are reduced to their final answer by claude_handoff.inspect;
-    any other worker's stdout is used as is, so a JSON-looking line it echoes from test output is never trusted."""
+def verdict_text(argv, done):
+    """Extract the report for review. Report output cannot authorize staging."""
     stdout = done.get('stdout') or ''
-    command = (policy.get('run_task') or {}).get('commands', {}).get(worker) or []
-    if not is_stream_json(command):
+    if not is_stream_json(argv):
         return stdout
     return claude_handoff.inspect(stdout, done.get('stderr') or '', done.get('returncode') or 0)['text']
 
 
 def default_verifier(job, prompt, policy):
-    """Run the `judge` role headless in the job worktree, never on the producing worker. The verdict is read from
-    the final worker process's own stdout, captured as data: the combined log stores stdout and stderr unescaped,
-    so anything the code under test prints could forge a stdout section there. Only a stream-JSON judge's stdout
-    goes through claude_handoff.inspect (verified for claude; other formats fall back to an empty verdict, which
-    blocks the job). Output files are named per job and round."""
-    task_file = _prompt_file(Path(job['worktree']), prompt)
-    stdouts = []
+    """Run a judge in the job worktree and accept its verdict only from a private file."""
+    attempts = []
+    with tempfile.TemporaryDirectory(prefix='dlr-judge-') as directory:
+        verdict_path = Path(directory) / 'verdict.json'
+        task_file = _write_private(Path(directory) / 'prompt.md', f'{prompt}\nVerdict file `{verdict_path}`\n')
 
-    def capture(*args, **kwargs):
-        done = td.run_bounded(*args, **kwargs)
-        stdouts.append(done)
-        return done
-    try:
-        result = td.run_task(task_file, job['worktree'], allow_dirty=True, policy=policy, role='judge',
-                             exclude=tuple(w for w in [job.get('worker')] if w), runner=capture,
-                             stamp=f"{job['job_id']}-verify{len(job['verifications']) + 1}")
-    except td.Refused as refusal:
-        return {'status': 'unavailable', 'reason': str(refusal)}
-    # run_task stops at the first worker that succeeds, so the last runner call is the reporting worker's
-    text = verdict_text(policy, result.get('worker'), stdouts[-1]) if stdouts else ''
-    raw = (stdouts[-1].get('stdout') or '') if stdouts else ''
-    if not result.get('ok'):
-        return {'status': 'unavailable', 'reason': result.get('reason') or 'verifier run failed', 'text': text,
-                'worker': result.get('worker')}
-    return {'status': 'done', 'text': text, 'raw': raw, 'worker': result.get('worker')}
+        def capture(argv, *args, **kwargs):
+            # A failed worker or continuation cannot leave a verdict for a later attempt.
+            verdict_path.unlink(missing_ok=True)
+            done = td.run_bounded(argv, *args, **kwargs)
+            attempts.append((argv, done))
+            return done
+
+        try:
+            result = td.run_task(task_file, job['worktree'], allow_dirty=True, policy=policy, role='judge',
+                                 exclude=tuple(w for w in [job.get('worker')] if w), runner=capture,
+                                 stamp=f"{job['job_id']}-verify{len(job['verifications']) + 1}")
+        except td.Refused as refusal:
+            return {'status': 'unavailable', 'reason': str(refusal)}
+        worker = result.get('worker')
+        report = verdict_text(*attempts[-1]) if attempts else ''
+        if not result.get('ok'):
+            return {'status': 'unavailable', 'reason': result.get('reason') or 'verifier run failed',
+                    'text': report, 'worker': worker}
+        verdict = _read_verdict(verdict_path) if attempts else None
+        return {'status': 'done', 'text': report, 'verdict': verdict, 'worker': worker}
 
 
 def default_fixer(job, prompt, policy):
@@ -216,6 +232,7 @@ class Batch:
         self.lock = threading.Lock()
         self.start_lock, self.last_stamp = threading.Lock(), None
         self.staging_restored_from = None
+        self.rollback_failure = None
 
     # ---- progress log (read by the Notch) ----
     def update(self, job, state, **fields):
@@ -233,6 +250,8 @@ class Batch:
                   'updated_at': _now(self.policy), 'finished': final,
                   'jobs': [{k: job.get(k) for k in ('key', 'source', 'state', 'status', 'worker', 'branch',
                                                      'commit', 'reason', 'updated_at')} for job in self.jobs]}
+        if self.rollback_failure is not None:
+            status['rollback_failure'] = self.rollback_failure
         self.dir.mkdir(parents=True, exist_ok=True)
         path = self.dir / 'status.json'
         tmp = path.with_suffix('.tmp')
@@ -326,12 +345,10 @@ class Batch:
             return dict(record, status='verifier_unavailable', reason=result.get('reason'))
         if result.get('worker') and result.get('worker') == job.get('worker'):
             return dict(record, status='verifier_is_producer', reason='the producing worker cannot verify its own job')
-        if result_conflict(result.get('text'), result.get('raw')):
-            return dict(record, status='conflicting_verdicts', reason='judge output has conflicting RESULT values')
-        parsed = parse_result(result.get('text'))
-        if parsed is None:
-            return dict(record, status='no_result_line', reason='verifier report has no RESULT line')
-        return dict(record, status='done', wrong=parsed[0], crash=parsed[1],
+        verdict = result.get('verdict')
+        if not _valid_verdict(verdict):
+            return dict(record, status='invalid_verdict', reason='judge verdict file was missing or invalid')
+        return dict(record, status='done', wrong=verdict['wrong'], crash=verdict['crash'],
                     report=security.redact((result.get('text') or '').strip()[-4000:]))
 
     def fix(self, job, findings, round_no):
@@ -375,6 +392,20 @@ class Batch:
         return record
 
     # ---- staging: merge one verified job at a time, keep it only when the full suite passes ----
+    def stop_after_rollback_failure(self, ref, expected, error, job=None):
+        try:
+            observed = jd.resolve_base(self.repo, ref) or None
+        except (OSError, subprocess.SubprocessError):
+            observed = None
+        reason = security.redact(f'{type(error).__name__}: {error}')[:300]
+        self.rollback_failure = {'ref': ref, 'expected_sha': expected, 'observed_sha': observed, 'reason': reason}
+        if job is not None:
+            self.update(job, 'rollback_failed', status='rollback_failed', reason=reason)
+        for pending in self.jobs:
+            if pending['state'] == 'verified':
+                self.update(pending, 'not_merged', status='staging_aborted',
+                            reason='staging stopped after a rollback failure')
+
     def merge_all(self, root, start_sha):
         """start_sha: the staging tip recorded under the repo lock before any job ran. Job code ran against the
         shared .git meanwhile, so the branch is put back on it rather than trusted. Every git call here runs with
@@ -383,7 +414,13 @@ class Batch:
         current = jd.resolve_base(self.repo, staging_ref)
         if current != start_sha:  # put staging back even when nothing is verified or no worktree opens
             self.staging_restored_from = current or None
-            _git(self.repo, 'update-ref', staging_ref, start_sha)
+            try:
+                _git(self.repo, 'update-ref', staging_ref, start_sha, check=True)
+                if jd.resolve_base(self.repo, staging_ref) != start_sha:
+                    raise Refused('staging ref did not return to its recorded start')
+            except (Refused, OSError, subprocess.SubprocessError) as error:
+                self.stop_after_rollback_failure(staging_ref, start_sha, error)
+                return
         verified = [job for job in self.jobs if job['state'] == 'verified']
         if not verified:
             return
@@ -402,18 +439,23 @@ class Batch:
         def at(sha):  # both the staging worktree and the staging branch ref are exactly at sha
             return rev('HEAD') == sha and jd.resolve_base(self.repo, staging_ref) == sha
 
-        def restore(sha):  # put staging back on sha with no leftovers, whatever code under test did to it
-            _git(self.repo, 'update-ref', staging_ref, sha)
-            _git(worktree, 'checkout', '-q', '-f', self.staging)
-            _git(worktree, 'reset', '-q', '--hard', sha)
-            _git(worktree, 'clean', '-ffdxq')
+        class RollbackFailed(Exception):
+            pass
+
+        def restore(sha):  # a failed Git operation must never be reported as a successful rollback
+            try:
+                _git(self.repo, 'update-ref', staging_ref, sha, check=True)
+                _git(worktree, 'checkout', '-q', '-f', self.staging, check=True)
+                _git(worktree, 'reset', '-q', '--hard', sha, check=True)
+                _git(worktree, 'clean', '-ffdxq', check=True)
+                if not at(sha):
+                    raise Refused('staging ref or worktree HEAD did not return to the expected commit')
+            except (Refused, OSError, subprocess.SubprocessError) as error:
+                raise RollbackFailed(str(error)) from error
+
         def merge_one(job, expected):
             """Merge one verified job onto `expected`; returns the new staging tip (unchanged when not merged)."""
             restore(expected)  # also clears files the previous job's staging tests left behind
-            if not at(expected):
-                self.update(job, 'not_merged', status='staging_moved',
-                            reason='staging could not be put back on its expected commit')
-                return expected
             if jd.resolve_base(self.repo, f"refs/heads/{job['branch']}") != job['verified_sha']:
                 self.update(job, 'not_merged', status='branch_moved',
                             reason='job branch moved after verification; nothing merged')
@@ -422,7 +464,7 @@ class Batch:
                           '-c', f'user.email={identity["email"]}', 'merge', '--no-ff', '--no-edit', '-m',
                           f"router: batch {self.batch_id} merge {job['branch']} ({job['key']})", job['verified_sha'])
             if merged.returncode != 0:
-                _git(worktree, 'merge', '--abort')
+                restore(expected)
                 self.update(job, 'not_merged', status='merge_conflict',
                             reason=security.redact(merged.stdout.strip() or merged.stderr.strip())[-300:])
                 return expected
@@ -436,8 +478,8 @@ class Batch:
             try:
                 tests = self.run_tests(worktree, f"{job['key']}-staging")
             except Exception as error:  # a test run that cannot even start is a failed run, never a pass
-                restore(expected)
                 job['staging_tests'] = 'error'
+                restore(expected)
                 self.update(job, 'not_merged', status='staging_tests_error',
                             reason=security.redact(f'staging test run raised {type(error).__name__}: {error}')[:300])
                 return expected
@@ -454,19 +496,29 @@ class Batch:
                 return expected
             self.update(job, 'merged', status='merged', staging_commit=merge_sha)
             return merge_sha
+        expected = start_sha
+        job = None
         try:
-            expected = start_sha
             for job in verified:
                 self.update(job, 'merging')
                 try:
                     expected = merge_one(job, expected)
-                except Exception as error:  # anything else going wrong mid-merge also leaves staging unchanged
+                except RollbackFailed:
+                    raise
+                except Exception as error:  # recover other failures before proceeding to another merge
                     restore(expected)
                     self.update(job, 'not_merged', status='staging_error',
                                 reason=security.redact(f'{type(error).__name__}: {error}')[:300])
+            job = None
             restore(expected)
+        except RollbackFailed as error:
+            self.stop_after_rollback_failure(staging_ref, expected, error, job)
         finally:
-            _git(self.repo, 'worktree', 'remove', '--force', str(worktree))
+            try:
+                _git(self.repo, 'worktree', 'remove', '--force', str(worktree))
+            except (OSError, subprocess.SubprocessError):
+                if self.rollback_failure is None:
+                    raise
 
 
 def run_batch(repo, issues=(), task_files=(), max_parallel=None, base='main', staging_branch=None, test_cmd=None,
@@ -475,7 +527,7 @@ def run_batch(repo, issues=(), task_files=(), max_parallel=None, base='main', st
     """Run 3-5 jobs into a nightly staging branch; returns the morning summary (also written to disk).
 
     fetch_issue(number) -> {'title', 'body'}; run_job(repo, task_file, **kw) -> run-job summary;
-    verifier(job, prompt, policy) -> {'status': 'done'|..., 'text', 'worker'};
+    verifier(job, prompt, policy) -> {'status', 'text', 'worker', 'verdict'};
     fixer(job, prompt, policy) -> {'ok', 'reason'?, 'worker'?, 'blocked_by_leak_check'?}. Defaults run the
     real gh/run-job/workers; test_runner is passed to every test run.
     """
@@ -548,7 +600,7 @@ def run_batch(repo, issues=(), task_files=(), max_parallel=None, base='main', st
             list(pool.map(lambda job: batch.run_one(job, run_job or jd.run_job, options), jobs))
         batch.merge_all(root, staging_sha)
     for job in jobs:
-        if job['state'] not in ('merged', 'not_merged'):
+        if job['state'] not in ('merged', 'not_merged', 'rollback_failed'):
             batch.update(job, 'not_merged', status=job.get('status'), reason=job.get('reason'))
     batch.write_status(final=True)
 
@@ -566,7 +618,10 @@ def run_batch(repo, issues=(), task_files=(), max_parallel=None, base='main', st
                          'status': job['status'], 'reason': job['reason'], 'job_id': job.get('job_id'),
                          'worktree': job.get('worktree')} for job in jobs]}
     summary['merged'] = sum(job['merged'] for job in summary['jobs'])
-    summary['ok'] = summary['merged'] == len(jobs) and summary['main_checkout_untouched']
+    if batch.rollback_failure is not None:
+        summary['rollback_failure'] = batch.rollback_failure
+    summary['ok'] = (summary['merged'] == len(jobs) and summary['main_checkout_untouched']
+                     and batch.rollback_failure is None)
     summary = security.redact_obj(summary)
     out.mkdir(parents=True, exist_ok=True)
     (out / 'summary.json').write_text(json.dumps(summary, indent=2))
@@ -583,6 +638,10 @@ def render_markdown(summary):
         f"{cell(j['tests'])} | {cell(j['verdict'])} | {'merged' if j['merged'] else cell(j['status'])} |"
         for j in summary['jobs'])
     notes = '\n'.join(f"- **{j['job']}**: {j['reason']}" for j in summary['jobs'] if not j['merged'] and j['reason'])
+    failure = summary.get('rollback_failure')
+    if failure:
+        notes += (f"\n- **Rollback failed** for `{failure['ref']}`. Expected `{failure['expected_sha']}`, "
+                  f"observed `{failure['observed_sha'] or 'unknown'}`. {failure['reason']}")
     return (f"# Batch {summary['batch_id']}: {summary['merged']}/{len(summary['jobs'])} merged into "
             f"`{summary['staging_branch']}`\n\n"
             f"Staging `{(summary['staging_start'] or '')[:10]}` -> `{(summary['staging_head'] or '')[:10]}` "
