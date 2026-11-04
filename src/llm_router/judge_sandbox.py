@@ -5,12 +5,17 @@ open the directory and read prompt.md. A container is not available on the macOS
 Ubuntu CI. This module wraps the judge instead:
 
 - macOS: `sandbox-exec` allows the process's normal filesystem access and denies `file-read*`
-  on the private directory. The judge can still write the verdict file. The runner reads it
-  after the process exits.
+  and `file-write*` (rename and unlink included) on the private directory and the files in it.
+  The same `file-write*` deny is applied to each ancestor directory itself, so the child cannot
+  rename the prompt, its directory, or a parent out from under the read rule. The verdict file
+  stays writable in place (`file-write-data` only) and cannot be renamed out. The runner reads
+  it after the process exits.
 - Linux: Landlock (no user namespace, so it still works where AppArmor blocks unprivileged
-  `unshare`). Every other path keeps read and write. The private directory is not in that
-  allow list. The verdict file is write-only. The caller points TMPDIR at a sibling directory
-  so the judge's own temp files are not created beside the nonce.
+  `unshare`). Every other path keeps read and write. Allow-list entries are real paths. A path
+  is omitted when it is the private directory, inside it, or an ancestor of it, including `/`
+  (`Path.is_relative_to` on the resolved paths, both ways). A symlink to `/` resolves to `/`
+  and is rejected. The verdict file is write-only. The caller points TMPDIR at a sibling
+  directory so the judge's own temp files are not created beside the nonce.
 - If neither sandbox can be applied, the caller must not run the judge.
 """
 import ctypes
@@ -53,7 +58,7 @@ def wrap(argv, private_dir, verdict_path):
         exe = shutil.which('sandbox-exec')
         if not exe:
             return None
-        return [exe, '-p', macos_profile(private), *argv]
+        return [exe, '-p', macos_profile(private, verdict), *argv]
     if sys.platform == 'linux' and landlock_abi() is not None:
         script = (
             'import os, sys\n'
@@ -66,10 +71,43 @@ def wrap(argv, private_dir, verdict_path):
     return None
 
 
-def macos_profile(private_dir):
-    """Seatbelt profile: normal access, no reads under the private directory."""
-    path = '"' + os.path.realpath(private_dir).replace('\\', '\\\\').replace('"', '\\"') + '"'
-    return '(version 1)\n(allow default)\n(deny file-read* (subpath %s))\n' % path
+def _quoted(path):
+    text = os.path.realpath(path).replace('\\', '\\\\').replace('"', '\\"')
+    return '"' + text + '"'
+
+
+def macos_profile(private_dir, verdict_path=None):
+    """Seatbelt profile: normal access, no reads or renames of the private directory.
+
+    ``file-write*`` on the directory covers the files inside it, including rename and unlink.
+    Each ancestor gets that deny on the directory inode only, so the child cannot rename the
+    directory out from under the rule. The verdict file may still be written in place.
+    """
+    private = os.path.realpath(private_dir)
+    rules = [
+        '(version 1)',
+        '(allow default)',
+        '(deny file-read* (subpath %s))' % _quoted(private),
+        '(deny file-write* (subpath %s))' % _quoted(private),
+    ]
+    try:
+        names = os.listdir(private)
+    except OSError:
+        names = []
+    for name in names:
+        rules.append('(deny file-write* (literal %s))' % _quoted(os.path.join(private, name)))
+    parent = os.path.dirname(private)
+    seen = set()
+    while parent and parent not in seen:
+        seen.add(parent)
+        rules.append('(deny file-write* (literal %s))' % _quoted(parent))
+        if parent == os.sep:
+            break
+        parent = os.path.dirname(parent)
+    if verdict_path:
+        # In-place contents only. file-write* would also allow renaming the verdict aside.
+        rules.append('(allow file-write-data (literal %s))' % _quoted(verdict_path))
+    return '\n'.join(rules) + '\n'
 
 
 def paths_outside(secret):
@@ -103,7 +141,13 @@ def paths_outside(secret):
 
 
 def _covers(path, secret):
-    return path == secret or secret.startswith(path + os.sep) or path.startswith(secret + os.sep)
+    """True when either resolved path is the other or contained in it.
+
+    ``secret.startswith(path + os.sep)`` treats ``/`` as the prefix ``//`` and would allow it.
+    """
+    left = Path(os.path.realpath(path))
+    right = Path(os.path.realpath(secret))
+    return left.is_relative_to(right) or right.is_relative_to(left)
 
 
 def landlock_abi():
