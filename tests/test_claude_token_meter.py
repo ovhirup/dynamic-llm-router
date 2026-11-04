@@ -5,15 +5,21 @@ import sys
 import unittest
 
 from llm_router import claude_token_meter, handoff
-from test_job_dispatch import JobTests
+from test_job_dispatch import (
+    job_setup,
+    job_teardown,
+    job_select,
+    job_worker,
+    run_job_fixture,
+)
 
 
 class ClaudeTokenMeterTests(unittest.TestCase):
-    setUp = JobTests.setUp
-    tearDown = JobTests.tearDown
-    select = JobTests.select
-    worker = JobTests.worker
-    job = JobTests.job
+    setUp = job_setup
+    tearDown = job_teardown
+    select = job_select
+    worker = job_worker
+    job = run_job_fixture
 
     def test_falls_back_to_unmetered_when_file_missing(self):
         missing = self.base / 'nonexistent_meter.json'

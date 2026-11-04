@@ -685,6 +685,15 @@ class JobTests(unittest.TestCase):
         self.assertNotIn('stronger-model review', str(caught.exception))
 
 
+# Export fixture methods without exposing the TestCase to unittest discovery.
+job_setup = JobTests.setUp
+job_teardown = JobTests.tearDown
+job_select = JobTests.select
+job_worker = JobTests.worker
+run_job_fixture = JobTests.job
+assert_job_main_untouched = JobTests.assert_main_untouched
+
+
 def stat_mode(path):
     return os.stat(path).st_mode & 0o777
 

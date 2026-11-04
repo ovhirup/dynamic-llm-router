@@ -4,19 +4,19 @@ import unittest
 from pathlib import Path
 
 from llm_router import feedback, merge_queue as mq
-import test_job_dispatch as tjd
+from test_job_dispatch import job_setup, job_teardown, job_select, job_worker, run_job_fixture
 import test_merge_queue as tmq
 
 # Reuse the job / merge-queue fixtures without subclassing, so their own tests are not re-run here.
-JT, MQ = tjd.JobTests, tmq.MergeQueueTests
+MQ = tmq.MergeQueueTests
 
 
 class JobFeedbackTests(unittest.TestCase):
     """run_job feeds every finished job into <scorecards_dir>/<worker>.json."""
-    tearDown, select, worker, job = JT.tearDown, JT.select, JT.worker, JT.job
+    tearDown, select, worker, job = job_teardown, job_select, job_worker, run_job_fixture
 
     def setUp(self):
-        JT.setUp(self)
+        job_setup(self)
         self.policy['feedback'] = {'scorecards_dir': str(self.base / 'scorecards')}
 
     def card(self, worker):

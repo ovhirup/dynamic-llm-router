@@ -4,19 +4,27 @@ import unittest
 from unittest import mock
 
 from llm_router import fail_first, job_dispatch as jd
-from test_job_dispatch import JobTests, git
+from test_job_dispatch import (
+    git,
+    job_setup,
+    job_teardown,
+    job_select,
+    job_worker,
+    run_job_fixture,
+    assert_job_main_untouched,
+)
 
 
 class FailFirstBugCheckTests(unittest.TestCase):
-    setUp = JobTests.setUp
-    tearDown = JobTests.tearDown
-    select = JobTests.select
-    worker = JobTests.worker
-    job = JobTests.job
-    assert_main_untouched = JobTests.assert_main_untouched
+    setUp = job_setup
+    tearDown = job_teardown
+    select = job_select
+    worker = job_worker
+    job = run_job_fixture
+    assert_main_untouched = assert_job_main_untouched
 
     def setUp(self):
-        JobTests.setUp(self)
+        job_setup(self)
         (self.repo / 'calc.py').write_text('def add(a, b):\n    return a - b\n')
         (self.repo / 'tests').mkdir(exist_ok=True)
         (self.repo / 'tests' / 'test_calc.py').write_text(

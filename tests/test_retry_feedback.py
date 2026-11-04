@@ -4,7 +4,12 @@ from pathlib import Path
 import unittest
 
 from llm_router import retry_feedback
-from test_job_dispatch import JobTests
+from test_job_dispatch import (
+    job_setup,
+    job_teardown,
+    job_worker,
+    run_job_fixture,
+)
 
 
 class RetryFeedbackTests(unittest.TestCase):
@@ -37,10 +42,10 @@ class RetryFeedbackTests(unittest.TestCase):
 
 
 class SameFailureTwiceJobTests(unittest.TestCase):
-    setUp = JobTests.setUp
-    tearDown = JobTests.tearDown
-    worker = JobTests.worker
-    job = JobTests.job
+    setUp = job_setup
+    tearDown = job_teardown
+    worker = job_worker
+    job = run_job_fixture
 
     def select(self, chars, **kw):
         return {'eligible': ['codex', 'grok-build', 'cursor'],

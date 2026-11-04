@@ -4,15 +4,21 @@ from pathlib import Path
 import unittest
 
 from llm_router import pr_gate
-from test_job_dispatch import JobTests
+from test_job_dispatch import (
+    job_setup,
+    job_teardown,
+    job_select,
+    job_worker,
+    run_job_fixture,
+)
 
 
 class ApprovalAuditLogTests(unittest.TestCase):
-    setUp = JobTests.setUp
-    tearDown = JobTests.tearDown
-    select = JobTests.select
-    worker = JobTests.worker
-    job = JobTests.job
+    setUp = job_setup
+    tearDown = job_teardown
+    select = job_select
+    worker = job_worker
+    job = run_job_fixture
 
     def test_approve_and_deny_write_who_when_what_to_job_log_and_vault(self):
         self.policy['run_job']['vault_dir'] = str(self.base / 'vault')

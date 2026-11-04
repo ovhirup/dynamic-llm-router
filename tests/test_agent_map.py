@@ -7,17 +7,24 @@ import tempfile
 import unittest
 
 from llm_router import agent_map, cli
-from test_job_dispatch import JobTests, git
+from test_job_dispatch import (
+    git,
+    job_setup,
+    job_teardown,
+    job_select,
+    job_worker,
+    run_job_fixture,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class AgentMapTests(unittest.TestCase):
-    setUp = JobTests.setUp
-    tearDown = JobTests.tearDown
-    select = JobTests.select
-    worker = JobTests.worker
-    job = JobTests.job
+    setUp = job_setup
+    tearDown = job_teardown
+    select = job_select
+    worker = job_worker
+    job = run_job_fixture
 
     def test_repo_map_decisions_and_learnings_files_exist_and_are_concise(self):
         for rel in ('AGENTS.md', 'CLAUDE.md', 'docs/decisions.md', 'docs/learnings.md'):

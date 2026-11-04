@@ -2,15 +2,21 @@
 import unittest
 
 from llm_router import forget_restart
-from test_job_dispatch import JobTests
+from test_job_dispatch import (
+    job_setup,
+    job_teardown,
+    job_select,
+    job_worker,
+    run_job_fixture,
+)
 
 
 class ForgetAndRestartTests(unittest.TestCase):
-    setUp = JobTests.setUp
-    tearDown = JobTests.tearDown
-    select = JobTests.select
-    worker = JobTests.worker
-    job = JobTests.job
+    setUp = job_setup
+    tearDown = job_teardown
+    select = job_select
+    worker = job_worker
+    job = run_job_fixture
 
     def test_tracker_picks_highest_scoring_candidate_and_discards_history(self):
         tracker = forget_restart.CandidateTracker(forget_after=2)
