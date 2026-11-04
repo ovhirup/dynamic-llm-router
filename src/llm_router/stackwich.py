@@ -3,12 +3,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import stat
+
+from .adapters import structured_outputs as outputs
 
 REPORT_PATH = '.router-stackwich/report.json'
-MAX_REPORT_BYTES = 1_000_000
-SCHEMA = {'plan': {'files': ['out.txt'], 'steps': ['Create out.txt'],
-                  'verification': [{'command': 'test -f out.txt', 'expected': 'exit 0'}]},
+MAX_REPORT_BYTES = outputs.MAX_REPORT_BYTES
+SCHEMA = {'schema_version': outputs.VERSION,
+          'plan': {'files': ['out.txt'], 'steps': ['Create out.txt'],
+                   'verification': [{'command': 'test -f out.txt', 'expected': 'exit 0'}]},
           'execute': {'changed_files': ['out.txt']},
           'verify': {'commands_run': [{'command': 'test -f out.txt', 'exit_code': 0}],
                      'scope_check': 'PASS', 'gate': 'PASS'},
@@ -50,15 +52,8 @@ def prepare(cwd, tracked=False):
 
 def load(cwd):
     """No-follow, bounded read; callers must first complete their leak scan."""
-    path = _safe_path(cwd)
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, 'rb') as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-            raise ValueError('report must be a regular file')
-        raw = handle.read(MAX_REPORT_BYTES + 1)
-    if len(raw) > MAX_REPORT_BYTES:
-        raise ValueError('report is too large')
-    return json.loads(raw), hashlib.sha256(raw).hexdigest()
+    report, raw = outputs.load_json(_safe_path(cwd), outputs.WORKER_REPORT_V1, MAX_REPORT_BYTES)
+    return report, hashlib.sha256(raw).hexdigest()
 
 
 def canonical(path):
@@ -122,6 +117,9 @@ def evidence(cwd, actual, cycle):
                 result.update(gate=verify.get('gate'), scope_check=verify.get('scope_check'))
             if isinstance(review, dict):
                 result['review'] = review.get('verdict')
+    except outputs.InvalidStructuredOutput as error:
+        result['output_error'] = str(error)
+        result['errors'] = [f'invalid worker report: {error}']
     except (OSError, ValueError, RecursionError):
         result['errors'] = ['report missing, unsafe, oversized, or malformed']
     if not result['errors']:

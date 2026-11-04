@@ -1,0 +1,8 @@
+[
+  {"id": "valid", "output": {"schema_version": 1, "wrong": 0, "crash": 0, "nonce": "aa"}},
+  {"id": "partial", "output": {"schema_version": 1, "wrong": 0, "nonce": "aa"}, "repair": {"schema_version": 1, "wrong": 0, "crash": 0, "nonce": "aa"}},
+  {"id": "malformed", "output": "{", "repair": "{"},
+  {"id": "oversized", "output": "x", "repeat": 1025, "repair": "x", "repair_repeat": 1025},
+  {"id": "empty", "output": "", "repair": {"schema_version": 1, "wrong": 1, "crash": 0, "nonce": "aa"}},
+  {"id": "duplicate", "output": "{\"schema_version\": 1, \"schema_version\": 1, \"wrong\": 0, \"crash\": 0, \"nonce\": \"aa\"}", "repair": {"schema_version": 1, "wrong": 0, "crash": 0, "nonce": "aa"}}
+]
