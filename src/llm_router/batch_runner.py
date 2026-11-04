@@ -18,7 +18,8 @@ Decisions (v1):
   it). Job starts are spaced into distinct seconds because run_job names worktrees and logs by the second.
 - Staging merges the exact commit the verifier passed, never a branch tip that moved after verification. Fix
   rounds keep the task's allowed-paths scope, and a fixer that commits by itself blocks the job.
-- Verifiers may write their private verdict file. The runner checks the worktree afterwards. A verifier that moved
+- Verifiers may write their private verdict file. They cannot read the private directory that holds the prompt
+  and the nonce (`judge_sandbox`). The runner reads the verdict after the judge exits. A verifier that moved
   HEAD or left any change blocks the job (`verifier_wrote`); its edits are left in place for a human, never kept.
 - The verifier is the `judge` role with the producing worker excluded, so the finder is never the fixer.
 - Never pushes, never touches main or the user's checkout: staging is updated in its own temporary worktree, and
@@ -33,11 +34,12 @@ import secrets
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 
-from . import claude_handoff, config, security
+from . import claude_handoff, config, judge_sandbox, security
 from . import job_dispatch as jd
 from . import task_dispatch as td
 from .job_dispatch import Refused
@@ -240,27 +242,39 @@ def verdict_text(argv, done):
 def default_verifier(job, prompt, policy):
     """Run a judge in the job worktree and accept its verdict only from a private file.
 
-    The verdict directory is an unguessable 0700 mkdtemp (not a dlr-judge-* glob). Its path and the
-    per-job nonce stay out of the judge process environment, so a same-UID test child cannot forge
-    approval by scanning temp and writing counts. The nonce in the file is the only approval secret.
+    The verdict directory is mode 0700 and is not named `dlr-judge-*`. That is not enough against
+    the same UID: a test child can list temp, read prompt.md, and write a verdict carrying the
+    nonce. The judge process is therefore sandboxed so it cannot read that directory (see
+    judge_sandbox). The runner alone reads the verdict file, after the judge exits. Counts without
+    the nonce are not approval. When the sandbox cannot be applied, the judge is not started.
     """
     attempts = []
     nonce = secrets.token_hex(16)
+    if not judge_sandbox.supported():
+        return {'status': 'unavailable', 'reason': 'judge sandbox unavailable'}
     directory = tempfile.mkdtemp()
+    child_temp = tempfile.mkdtemp(prefix='dlr-judge-tmp-') if sys.platform == 'linux' else None
     try:
         os.chmod(directory, 0o700)
         verdict_path = Path(directory) / 'verdict.json'
+        _write_private(verdict_path, '')
         task_file = _write_private(Path(directory) / 'prompt.md',
                                    f'{prompt}\nVerdict file `{verdict_path}`\nVerdict nonce `{nonce}`\n')
 
         def capture(argv, *args, **kwargs):
             # A failed worker or continuation cannot leave a verdict for a later attempt.
             verdict_path.unlink(missing_ok=True)
-            env = kwargs.get('env')
-            if env is None:
-                env = os.environ.copy()
+            _write_private(verdict_path, '')
+            env = dict(os.environ if kwargs.get('env') is None else kwargs.get('env'))
+            if child_temp is not None:
+                env['TMPDIR'] = env['TEMP'] = env['TMP'] = child_temp
             kwargs['env'] = _scrub_env(env, str(directory), str(verdict_path), nonce)
-            done = td.run_bounded(argv, *args, **kwargs)
+            wrapped = judge_sandbox.wrap(argv, directory, verdict_path)
+            if wrapped is None:
+                done = {'returncode': 126, 'stdout': '', 'stderr': 'judge sandbox unavailable',
+                        'timed_out': False, 'stalled': False, 'elapsed_seconds': 0}
+            else:
+                done = td.run_bounded(wrapped, *args, **kwargs)
             attempts.append((argv, done))
             return done
 
@@ -281,6 +295,8 @@ def default_verifier(job, prompt, policy):
         return {'status': 'done', 'text': report, 'verdict': verdict, 'worker': worker}
     finally:
         shutil.rmtree(directory, ignore_errors=True)
+        if child_temp is not None:
+            shutil.rmtree(child_temp, ignore_errors=True)
 
 
 def default_fixer(job, prompt, policy):

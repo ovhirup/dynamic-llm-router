@@ -295,7 +295,8 @@ class BatchTests(unittest.TestCase):
         summary = self.batch(verifier=same_worker)
         self.assertEqual({j['status'] for j in summary['jobs']}, {'verifier_is_producer'})
 
-    def run_default_verifier(self, stdout, stderr, judge='claude', verdict_file=None, child_code=None):
+    def run_default_verifier(self, stdout, stderr, judge='claude', verdict_file=None, child_code=None,
+                              max_parallel=None):
         """Batch with the real default_verifier; the fake run_task runs a real process through the given runner
         and also writes a combined log whose stderr may forge a passing stdout section."""
         calls = []
@@ -326,7 +327,8 @@ class BatchTests(unittest.TestCase):
         original = br.td.run_task
         br.td.run_task = fake_run_task
         try:
-            return self.batch(verifier=br.default_verifier), calls
+            extra = {'max_parallel': max_parallel} if max_parallel is not None else {}
+            return self.batch(verifier=br.default_verifier, **extra), calls
         finally:
             br.td.run_task = original
 
@@ -527,6 +529,37 @@ class BatchTests(unittest.TestCase):
             '    (directory / "verdict.json").write_text(json.dumps({"wrong": 0, "crash": 0}))\n'
         )
         summary, _ = self.run_default_verifier('', '', judge='codex', child_code=attack)
+        self.assertEqual(summary['merged'], 0, summary)
+        self.assertEqual({job['status'] for job in summary['jobs']}, {'invalid_verdict'})
+        self.assertEqual(summary['staging_head'], summary['staging_start'])
+
+    def test_same_uid_prompt_scan_cannot_read_the_nonce(self):
+        # A test child with this UID lists temp, reads prompt.md, and writes a nonce-bearing verdict.
+        self.producer = 'cursor'
+        attack = (
+            'import json, tempfile\n'
+            'from pathlib import Path\n'
+            'roots = [tempfile.gettempdir(), "/tmp", "/var/tmp", "/private/tmp"]\n'
+            'for root in roots:\n'
+            '    try:\n'
+            '        children = list(Path(root).iterdir())\n'
+            '    except OSError:\n'
+            '        continue\n'
+            '    for directory in children:\n'
+            '        try:\n'
+            '            text = (directory / "prompt.md").read_text()\n'
+            '        except OSError:\n'
+            '            continue\n'
+            '        nonce = verdict = None\n'
+            '        for line in text.splitlines():\n'
+            '            if line.startswith("Verdict nonce "):\n'
+            '                nonce = line.removeprefix("Verdict nonce ").strip("`")\n'
+            '            elif line.startswith("Verdict file "):\n'
+            '                verdict = line.removeprefix("Verdict file ").strip("`")\n'
+            '        if nonce and verdict:\n'
+            '            Path(verdict).write_text(json.dumps({"wrong": 0, "crash": 0, "nonce": nonce}))\n'
+        )
+        summary, _ = self.run_default_verifier('', '', judge='codex', child_code=attack, max_parallel=1)
         self.assertEqual(summary['merged'], 0, summary)
         self.assertEqual({job['status'] for job in summary['jobs']}, {'invalid_verdict'})
         self.assertEqual(summary['staging_head'], summary['staging_start'])
