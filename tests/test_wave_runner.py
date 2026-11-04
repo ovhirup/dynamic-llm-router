@@ -83,6 +83,20 @@ class WaveRunnerTests(unittest.TestCase):
         self.assertEqual(result['deferred'], [])
         json.dumps(result)
 
+    def test_shared_memory_reaches_claude_codex_and_cursor(self):
+        shared_memory = (Path(__file__).resolve().parents[1] / 'AGENTS.md').read_text().strip()
+        commit(self.repo, 'AGENTS.md', shared_memory + '\n')
+        runner = FakeRunner()
+        assignment = {'api': 'claude', 'ui': 'codex', 'docs': 'cursor'}
+
+        result = self.run_batch(assignment=assignment, unit_runner=runner)
+
+        self.assertTrue(result['ok'], result)
+        self.assertEqual({unit: worker for unit, worker, _ in runner.calls}, assignment)
+        for _, worker, prompt in runner.calls:
+            with self.subTest(worker=worker):
+                self.assertEqual(prompt.count(shared_memory), 1)
+
     def test_slot_full_defers_unit_and_wave_continues(self):
         def acquire(policy, worker):
             return ('full', None) if worker == 'codex' else ('uncapped', None)

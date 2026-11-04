@@ -47,6 +47,8 @@ class AgentMapTests(unittest.TestCase):
 
     def test_workers_receive_agent_map_in_run_job_prompt(self):
         agent_map.init_map(self.repo)
+        shared_memory = (ROOT / 'AGENTS.md').read_text().strip()
+        (self.repo / 'AGENTS.md').write_text(shared_memory + '\n')
         git(self.repo, 'add', '.')
         git(self.repo, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@localhost',
             'commit', '-qm', 'add agent map')
@@ -58,6 +60,9 @@ class AgentMapTests(unittest.TestCase):
         prompt = capture.read_text()
         self.assertIn('## Repository Agent Map', prompt)
         self.assertIn('### `AGENTS.md`', prompt)
+        self.assertIn('## Decisions', shared_memory)
+        self.assertIn('## Open', shared_memory)
+        self.assertEqual(prompt.count(shared_memory), 1)
         self.assertIn('### `docs/decisions.md`', prompt)
         self.assertIn('### `docs/learnings.md`', prompt)
 

@@ -2,6 +2,20 @@
 
 Whichever coding tool or agent receives the prompt (`cursor`, `claude`, `codex`, `grok-build`, or `grok-bot`) starts from this map so project context stays consistent without manual strategy rewrites.
 
+## Decisions
+
+- 2026-11-04 — Workers never approve their own fixes.
+- 2026-11-04 — A green test run has zero skipped tests.
+- 2026-11-04 — Stop after the third REVISE on the same change and hand it back to the user.
+- 2026-11-04 — Never stage `*.orig` or `*.rej` files.
+- 2026-11-04 — Keep secrets out of shared memory.
+
+Each month, remove lines no worker used and move settled items from Open to Decisions.
+
+## Open
+
+- #219 shared memory awaits review by the repository maintainer.
+
 ## Where things live
 
 - **Architecture & routing strategy:** [`docs/ROUTING_STRATEGY.md`](docs/ROUTING_STRATEGY.md), [`docs/STRATEGY_WORKERS_FALLBACK.md`](docs/STRATEGY_WORKERS_FALLBACK.md), [`docs/ROUTER_BRAIN.md`](docs/ROUTER_BRAIN.md)
