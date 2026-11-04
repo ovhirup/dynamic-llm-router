@@ -21,8 +21,9 @@ def build_parser():
     parser.add_argument('--version', action='version', version=f'llm-router {__version__}')
     parser.add_argument('--config', help='config JSON file (default: $LLM_ROUTER_CONFIG or <config dir>/config.json)')
     commands = parser.add_subparsers(dest='command', required=True)
-    from . import allocation_cli
+    from . import allocation_cli, batch_runner
     allocation_cli.register(commands)
+    batch_runner.register(commands)
 
     commands.add_parser('paths', help='Show config/state locations and which binaries resolve')
     init = commands.add_parser('init', help='Write example config files into the config dir (never overwrites)')
@@ -487,6 +488,9 @@ def main(argv=None):
     except config.ConfigError as error:
         print(json.dumps({'ok': False, 'config_error': str(error)}))
         return 2
+    if args.command == 'batch':
+        from . import batch_runner
+        return batch_runner.run(args, policy)
     if args.command == 'init-map':
         from . import agent_map
         _print(agent_map.init_map(args.path, force=args.force))

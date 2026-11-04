@@ -85,6 +85,25 @@ def build_prompt(task, effort, timeout, elapsed=0, prefix='', extra='', tail='',
     return '\n\n'.join(parts)
 
 
+def _assistant_text(message):
+    """Text of one assistant message. A null or non-object message is skipped, not an error."""
+    if not isinstance(message, dict):
+        return ''
+    content = message.get('content')
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ''
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        text = block.get('text', '')
+        if isinstance(text, str):
+            parts.append(text)
+    return '\n'.join(parts)
+
+
 def inspect(stdout, stderr='', returncode=0):
     """Prefer the last stream result, then assistant text; plain stdout is its own final."""
     events = []
@@ -98,13 +117,12 @@ def inspect(stdout, stderr='', returncode=0):
     results = [event for event in events if event.get('type') == 'result']
     assistants = [event for event in events if event.get('type') == 'assistant']
     final = results[-1] if results else assistants[-1] if assistants else {}
-    if isinstance(final.get('result'), str):
+    if isinstance(final, dict) and isinstance(final.get('result'), str):
         text = final['result']
+    elif assistants:
+        text = _assistant_text(assistants[-1].get('message'))
     elif events:
-        message = assistants[-1].get('message', {}) if assistants else {}
-        content = message.get('content', [])
-        text = content if isinstance(content, str) else '\n'.join(
-            block.get('text', '') for block in content if isinstance(block, dict))
+        text = ''
     else:
         text = stdout
 

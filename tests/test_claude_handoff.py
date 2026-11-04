@@ -72,6 +72,9 @@ class BriefTests(unittest.TestCase):
                       {'type': 'assistant', 'message': {'stop_reason': 'refusal'}}):
             self.assertEqual(ch.inspect(json.dumps(event))['failure'], 'refusal')
         self.assertEqual(ch.inspect(json.dumps({'type': 'result', 'is_error': True, 'result': 'failed'}))['failure'], 'stream_error')
+        malformed = json.dumps({'type': 'assistant', 'message': None})
+        self.assertEqual(ch.inspect(malformed)['text'], '')
+        self.assertIsNone(ch.inspect(malformed)['failure'])
         for text in ['usage limit', 'rate limit', 'quota', 'out of credits', 'limit reached', 'exhausted',
                      'out of extra usage'] + [f"You've hit your {kind} limit" for kind in ['session', 'weekly', 'opus', 'sonnet', 'fable']]:
             self.assertEqual(ch.inspect(text, returncode=1)['failure'], 'quota')
