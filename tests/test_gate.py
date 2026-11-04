@@ -49,11 +49,92 @@ class ParsePytestSummaryTests(unittest.TestCase):
         verdict = gate.evaluate_pytest(1, '2 errors in 0.01s\n')
         self.assertFalse(verdict['ok'])
 
-    def test_evaluate_fails_when_skipped_only_on_earlier_summary_line(self):
-        """Later 'N passed' decoy line must not hide an earlier skipped count."""
+    def test_final_quiet_summary_is_the_only_trusted_line(self):
+        """Only the last authentic -q summary counts; earlier stats lines do not."""
         out = '1 skipped in 0.01s\n2 passed in 0.01s\n'
         verdict = gate.evaluate_pytest(0, out)
+        self.assertTrue(verdict['ok'], verdict)
+        self.assertEqual(verdict['passed'], 2)
+        self.assertEqual(verdict['skipped'], 0)
+
+    def test_later_diagnostic_cannot_hide_authentic_skip(self):
+        out = '1 skipped in 0.01s\nworker diagnostic: 2 passed\n'
+        verdict = gate.evaluate_pytest(0, out)
         self.assertFalse(verdict['ok'])
+        self.assertEqual(verdict['skipped'], 1)
+        self.assertTrue(any('skipped' in r for r in verdict['reasons']))
+
+    def test_spoofed_pass_line_is_not_an_authentic_summary(self):
+        out = 's\nworker diagnostic: 2 passed\n'
+        verdict = gate.evaluate_pytest(0, out)
+        self.assertFalse(verdict['ok'])
+        self.assertEqual(verdict['passed'], 0)
+        self.assertEqual(verdict['skipped'], 0)
+        self.assertIn('no authentic pytest summary', verdict['reasons'])
+
+    def test_warning_phrase_is_not_a_skip(self):
+        out = (
+            'tests/test_cache.py::test_refresh\n'
+            '  tests/test_cache.py:4: UserWarning: 1 skipped cache refresh\n'
+            '2 passed, 1 warning in 0.02s\n'
+        )
+        verdict = gate.evaluate_pytest(0, out)
+        self.assertTrue(verdict['ok'], verdict)
+        self.assertEqual(verdict['skipped'], 0)
+        self.assertEqual(verdict['passed'], 2)
+
+    def test_ansi_reset_splits_count_and_skipped(self):
+        out = '1\x1b[0mskipped in 0.00s\n'
+        summary = gate.parse_pytest_summary(out)
+        self.assertEqual(summary['skipped'], 1)
+        verdict = gate.evaluate_pytest(0, out)
+        self.assertFalse(verdict['ok'])
+        self.assertTrue(any(r == '1 skipped' for r in verdict['reasons']))
+
+    def test_pytest_color_footer_parses_after_ansi_strip(self):
+        out = (
+            '\x1b[33m============================== '
+            '\x1b[33m\x1b[1m1 skipped\x1b[0m\x1b[33m in 0.00s\x1b[0m'
+            '\x1b[33m ==============================\x1b[0m\n'
+        )
+        summary = gate.parse_pytest_summary(out)
+        self.assertEqual(summary['skipped'], 1)
+        self.assertEqual(summary['passed'], 0)
+
+    def test_missing_summary_fails_no_tests_reported_passed(self):
+        out = (
+            '============================= test session starts ==============================\n'
+            'collected 1 item\n'
+        )
+        verdict = gate.evaluate_pytest(0, out)
+        self.assertFalse(verdict['ok'])
+        self.assertIn('no tests reported passed', verdict['reasons'])
+        self.assertNotIn('no authentic pytest summary', verdict['reasons'])
+
+    def test_warnings_only_fails_no_tests_reported_passed(self):
+        out = (
+            '=========================== warnings summary ============================\n'
+            '  tests/test_cache.py:4: UserWarning: 1 skipped cache refresh\n'
+            '=========================== 1 warning in 0.02s ===========================\n'
+        )
+        verdict = gate.evaluate_pytest(0, out)
+        self.assertFalse(verdict['ok'])
+        self.assertEqual(verdict['skipped'], 0)
+        self.assertIn('no tests reported passed', verdict['reasons'])
+        self.assertNotIn('no authentic pytest summary', verdict['reasons'])
+
+    def test_countless_summary_fails_no_tests_reported_passed(self):
+        verdict = gate.evaluate_pytest(0, '======================== no tests ran in 0.01s ========================\n')
+        self.assertFalse(verdict['ok'])
+        self.assertEqual(verdict['passed'], 0)
+        self.assertIn('no tests reported passed', verdict['reasons'])
+        self.assertNotIn('no authentic pytest summary', verdict['reasons'])
+
+    def test_empty_output_fails_no_tests_reported_passed(self):
+        verdict = gate.evaluate_pytest(0, '')
+        self.assertFalse(verdict['ok'])
+        self.assertIn('no tests reported passed', verdict['reasons'])
+        self.assertNotIn('no authentic pytest summary', verdict['reasons'])
 
 
 class GateRunTests(unittest.TestCase):
@@ -106,6 +187,35 @@ class GateRunTests(unittest.TestCase):
                                   '--pytest-target', str(FIXTURES / 'failing'), '--skip-lint'])
         code = gate.cli_main(args)
         self.assertEqual(code, 1)
+
+    def test_pytest_command_omits_report_and_cacheprovider_flags(self):
+        argv = gate.pytest_command(FIXTURES.parent.parent.parent)
+        self.assertIn('-q', argv)
+        self.assertIn('-o', argv)
+        self.assertIn('addopts=', argv)
+        self.assertNotIn('-rA', argv)
+        self.assertNotIn('no:cacheprovider', argv)
+
+    def test_pytest_addopts_cannot_hide_a_skip(self):
+        result = self._run_gate(FIXTURES / 'skipped', env={'PYTEST_ADDOPTS': '-qq -s'})
+        self.assertFalse(result['ok'], result)
+        self.assertGreater(result['skipped'], 0)
+        self.assertNotIn('no authentic pytest summary', '\n'.join(result['lines']))
+
+    def test_printed_pass_count_cannot_hide_a_skip(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            suite = Path(tmp)
+            (suite / 'test_spoof.py').write_text(
+                'import pytest\n\n'
+                'def test_hidden_skip():\n'
+                '    print("worker diagnostic: 2 passed")\n'
+                '    pytest.skip("fixture")\n'
+            )
+            result = self._run_gate(suite, env={'PYTEST_ADDOPTS': '-q -s'})
+        self.assertFalse(result['ok'], result)
+        self.assertGreater(result['skipped'], 0)
 
 
 if __name__ == '__main__':

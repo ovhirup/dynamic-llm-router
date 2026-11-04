@@ -8,32 +8,77 @@ import subprocess
 import sys
 from pathlib import Path
 
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+_COUNT_LABEL = (
+    'subtests passed|subtests failed|subtests skipped|'
+    'xpassed|xfailed|passed|failed|skipped|deselected|'
+    'warnings|warning|errors|error'
+)
+_DURATION = r'in \d+(?:\.\d+)?s(?: \([^)]+\))?'
+_STATS_BODY = (
+    rf'(?:\d+ (?:{_COUNT_LABEL}))(?:, (?:\d+ (?:{_COUNT_LABEL})))* {_DURATION}'
+)
+_SUMMARY_BODY = rf'(?:{_STATS_BODY}|no tests ran {_DURATION})'
+_EQUALS_SUMMARY = re.compile(rf'^=+ ({_SUMMARY_BODY}) =+$')
+_QUIET_SUMMARY = re.compile(rf'^({_SUMMARY_BODY})$')
+_PASS_SPOOF = re.compile(r'\d+ passed\b')
+_PROGRESS_ONLY = re.compile(r'^[.sFxXpPeE]+$')
+_PERCENT = re.compile(r'\[\d+%\]')
+
+
 def _count(label: str, line: str) -> int:
     match = re.search(rf'(\d+) {re.escape(label)}', line)
     return int(match.group(1)) if match else 0
 
 
-def _is_summary_line(line: str) -> bool:
-    return bool(re.search(r'\d+ (passed|failed|skipped|error|xpassed|xfailed)', line))
+def _normalize_line(raw: str) -> str:
+    """Drop ANSI so a reset code between a count and its label still parses."""
+    cleaned = _ANSI_RE.sub(' ', raw)
+    return re.sub(r'[ \t]+', ' ', cleaned).strip()
+
+
+def _summary_body(line: str) -> str | None:
+    """Return the stats text of an authentic pytest final summary line."""
+    match = _EQUALS_SUMMARY.match(line) or _QUIET_SUMMARY.match(line)
+    return match.group(1) if match else None
+
+
+def _untrustworthy_stdout(output: str) -> bool:
+    """True when output spoofs a pass count or shows progress with no summary."""
+    for raw in output.splitlines():
+        line = _normalize_line(raw)
+        if not line or _summary_body(line):
+            continue
+        if _PASS_SPOOF.search(line) or _PROGRESS_ONLY.match(line) or _PERCENT.search(line):
+            return True
+    return False
 
 
 def parse_pytest_summary(output: str) -> dict:
-    """Extract pytest result counts from summary lines in the combined output."""
+    """Extract counts from pytest's final summary line only.
+
+    Authentic lines are the ``=== ... in Ns ===`` footer or the last quiet
+    ``N passed in Ns`` line. Warning text and other diagnostics are ignored.
+    """
     counts = {'passed': 0, 'failed': 0, 'skipped': 0, 'subtests': 0, 'errors': 0,
-              'xpassed': 0, 'xfailed': 0}
-    summary_lines = [ln.strip() for ln in output.splitlines() if _is_summary_line(ln.strip())]
-    if not summary_lines:
+              'xpassed': 0, 'xfailed': 0, 'authentic': False}
+    bodies = []
+    for raw in output.splitlines():
+        body = _summary_body(_normalize_line(raw))
+        if body is not None:
+            bodies.append(body)
+    if not bodies:
         return counts
-    last = summary_lines[-1]
-    counts['subtests'] = _count('subtests passed', last)
-    without_subtests = re.sub(r'\d+ subtests passed,?\s*', '', last)
+    counts['authentic'] = True
+    stats = re.sub(rf'\s+{_DURATION}$', '', bodies[-1])
+    counts['subtests'] = _count('subtests passed', stats)
+    without_subtests = re.sub(r'\d+ subtests (?:passed|failed|skipped),?\s*', '', stats)
     counts['passed'] = _count('passed', without_subtests)
-    for line in summary_lines:
-        counts['failed'] = max(counts['failed'], _count('failed', line))
-        counts['skipped'] = max(counts['skipped'], _count('skipped', line))
-        counts['errors'] = max(counts['errors'], _count('error', line))
-        counts['xpassed'] = max(counts['xpassed'], _count('xpassed', line))
-        counts['xfailed'] = max(counts['xfailed'], _count('xfailed', line))
+    counts['failed'] = _count('failed', without_subtests)
+    counts['skipped'] = _count('skipped', without_subtests)
+    counts['errors'] = _count('error', without_subtests)
+    counts['xpassed'] = _count('xpassed', without_subtests)
+    counts['xfailed'] = _count('xfailed', without_subtests)
     return counts
 
 
@@ -42,16 +87,22 @@ def evaluate_pytest(exit_code: int, output: str) -> dict:
     reasons = []
     if exit_code != 0:
         reasons.append(f'pytest exit {exit_code}')
-    if summary['failed'] or summary['errors']:
-        reasons.append(f"{summary['failed']} failed, {summary['errors']} errors")
-    if summary['skipped']:
-        reasons.append(f"{summary['skipped']} skipped")
-    if summary['xpassed']:
-        reasons.append(f"{summary['xpassed']} xpassed")
-    if summary['xfailed']:
-        reasons.append(f"{summary['xfailed']} xfailed")
-    if summary['passed'] == 0 and summary['skipped'] == 0 and exit_code == 0:
-        reasons.append('no tests reported passed')
+    if not summary['authentic']:
+        if _untrustworthy_stdout(output):
+            reasons.append('no authentic pytest summary')
+        elif exit_code == 0:
+            reasons.append('no tests reported passed')
+    else:
+        if summary['failed'] or summary['errors']:
+            reasons.append(f"{summary['failed']} failed, {summary['errors']} errors")
+        if summary['skipped']:
+            reasons.append(f"{summary['skipped']} skipped")
+        if summary['xpassed']:
+            reasons.append(f"{summary['xpassed']} xpassed")
+        if summary['xfailed']:
+            reasons.append(f"{summary['xfailed']} xfailed")
+        if summary['passed'] == 0 and summary['skipped'] == 0 and exit_code == 0:
+            reasons.append('no tests reported passed')
     ok = not reasons
     return {'ok': ok, 'reasons': reasons, **summary}
 
@@ -84,8 +135,15 @@ def _run_step(argv: list[str], cwd: Path, env: dict) -> dict:
 
 
 def pytest_command(repo_root: Path, target: Path | None = None) -> list[str]:
+    """Quiet pytest with config addopts cleared.
+
+    ``-rA`` and ``-p no:cacheprovider`` are intentionally absent: report chars
+    and the cache plugin are not required for the final summary line.
+    """
     tests = target or repo_root / 'tests'
-    return [sys.executable, '-m', 'pytest', '-q', str(tests)]
+    return [
+        sys.executable, '-m', 'pytest', '-q', '--color=no', '-o', 'addopts=', str(tests),
+    ]
 
 
 def run_gate(
@@ -99,6 +157,9 @@ def run_gate(
     run_env = os.environ.copy()
     if env:
         run_env.update(env)
+    # -qq / -s from the environment can drop the summary or let a test print a
+    # fake "N passed" line. The gate's own argv is the whole pytest command.
+    run_env.pop('PYTEST_ADDOPTS', None)
     existing = run_env.get('PYTHONPATH', '')
     extra = os.pathsep.join(filter(None, [str(repo_root / 'src'), str(repo_root / 'tests'), existing]))
     run_env['PYTHONPATH'] = extra
