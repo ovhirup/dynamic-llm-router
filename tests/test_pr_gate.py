@@ -229,6 +229,32 @@ class GateTests(unittest.TestCase):
         self.assertTrue(pg.approval_status(self.policy, JOB, 'push', self.head, NOW)['ok'])
         self.assertFalse(pg.approval_status(self.policy, JOB, 'merge', self.head, NOW)['ok'])
 
+    def test_approve_and_deny_record_approval_wait_spans(self):
+        from llm_router import traces
+        secret = 'sk-' + 'z' * 30
+        self.policy['run_job']['traces_dir'] = str(self.base / 'traces')
+        self.job['finished_at'] = (NOW - timedelta(seconds=10)).isoformat()
+        self.job['task_class'] = 'feature'
+        self.job['tokens'] = 1000
+        self.write_job()
+        self.review()
+        self.approve(note=secret)
+        pg.deny(JOB, 'push', policy=self.policy, now=NOW + timedelta(seconds=30))
+        spans = [span for span in traces.load_trace(self.policy, JOB) if span['name'] == 'approval_wait']
+        self.assertEqual([span['exit_status'] for span in spans], ['approved', 'denied'])
+        approved = spans[0]
+        self.assertEqual(approved['worker'], 'codex')
+        self.assertEqual(approved['model'], 'codex')
+        self.assertEqual(approved['tokens'], 1000)
+        self.assertEqual(approved['cost_estimate'], 0.0015)
+        self.assertEqual(approved['task_class'], 'feature')
+        started = datetime.fromisoformat(approved['started_at'])
+        finished = datetime.fromisoformat(approved['finished_at'])
+        self.assertEqual((finished - started).total_seconds(), 10)
+        raw = traces.trace_path(self.policy, JOB).read_text()
+        self.assertNotIn(secret, raw)
+        self.assertEqual(traces.scan_trace_files(self.policy)['status'], 'clean')
+
     def test_approval_expires(self):
         self.review()
         self.approve(hours=2)

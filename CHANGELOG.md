@@ -5,6 +5,11 @@ versions follow [SemVer](https://semver.org/) (0.x: minor versions may break con
 
 ## [Unreleased]
 
+- Add job phase traces (#236): spans for plan, dispatch, test, judge, fix, and approval wait record worker,
+  model, tokens, a cost estimate, and exit status. Local JSONL is the default export. OTLP is the optional
+  `otlp` extra, with no new core dependency. `dlr report traces --since` prints p50 and p95 latency and cost
+  per worker per task class. The leak gate scans trace files.
+
 - Add `llm-router setup` (#210): detects Claude, Codex, Grok Build, Cursor, Grok Bot and Ollama + Aider,
   enables each separately as worker and/or orchestrator with the rationale and recommended default shown,
   smoke-tests every enabled tool, and writes a backed-up `setup.json` layered over `config.json` (never

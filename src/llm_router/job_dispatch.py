@@ -21,6 +21,7 @@ import tempfile
 from . import agent_map, alerts, brain, config, context_navigator, fail_first, feedback, forget_restart, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, tool_gateway, traces, triage
 from . import task_dispatch as td
 from .adapters import NativeOrchestrator, Orchestrator, structured_outputs
+from .adapters.tracing import TracingOrchestrator, record_approval_wait
 
 Refused = td.Refused
 
@@ -444,9 +445,12 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             summary['test_command'] = security.redact(test_cmd) if test_cmd else None
             summary['test_command_source'] = test_source
             if test_cmd or allow_no_tests:
+                inner = NativeOrchestrator() if adapter is None else adapter
+                phase_runner = inner if isinstance(inner, TracingOrchestrator) else TracingOrchestrator(
+                    policy, summary, inner=inner, task_class=task_class)
                 _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd,
                           test_timeout, stamp, out_dir, run_task, select, test_runner,
-                          NativeOrchestrator() if adapter is None else adapter, allow_no_tests,
+                          phase_runner, allow_no_tests,
                           meter or (lambda w: handoff.meter_percent(w, policy=policy)),
                           reviewer=reviewer, scope=scope, task_class=task_class)
             else:  # fail before spending a worker run on a change nothing would verify
@@ -491,6 +495,15 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
     except Exception as error:
         summary['warnings'].append(f'trace not recorded: {type(error).__name__}: '
                                    f'{security.redact(str(error))[:200]}')
+    if summary.get('commit'):
+        try:
+            record_approval_wait(
+                policy, summary,
+                exit_status='pending' if summary.get('approval_required') else 'not_required',
+                finished_at=summary.get('finished_at'))
+        except Exception as error:
+            summary['warnings'].append(f'trace not recorded: {type(error).__name__}: '
+                                       f'{security.redact(str(error))[:200]}')
     summary = security.redact_obj(summary)
     try:  # outcome feedback: a scorecard write never fails the job
         feedback.record_job_feedback(policy, summary, task_class)

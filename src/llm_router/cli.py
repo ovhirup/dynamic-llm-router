@@ -230,6 +230,12 @@ def build_parser():
     tr_replay.add_argument('job_id')
     tr_replay.add_argument('--until', required=True, help='target span id or name to re-run live')
 
+    report = commands.add_parser('report', help='Summaries over local job traces')
+    report_cmds = report.add_subparsers(dest='report_command', required=True)
+    traces_cmd = report_cmds.add_parser(
+        'traces', help='p50 and p95 latency and cost per worker per task class')
+    traces_cmd.add_argument('--since', required=True, help='window start, such as 7d, 12h, 30m, or an ISO date')
+
     scan = commands.add_parser('scan', help='Leak-scan a git tree (tracked + untracked, not ignored) before publishing')
     scan.add_argument('path', nargs='?', default='.')
     scan.add_argument('--terms', help='private terms file (default: the configured private_terms_file)')
@@ -533,11 +539,25 @@ def main(argv=None):
         except ValueError as error:
             print(json.dumps({'ok': False, 'refused': str(error)}))
             return 3
+    if args.command == 'report':
+        from . import traces
+        try:
+            report = traces.report_traces(policy, args.since)
+        except ValueError as error:
+            print(json.dumps({'ok': False, 'refused': str(error)}))
+            return 2
+        print(report['text'], end='')
+        return 0
     if args.command == 'scan':
-        from . import security, task_dispatch
+        from . import security, task_dispatch, traces
         terms = security.load_terms(args.terms) if args.terms else task_dispatch.private_terms(policy)
-        result = security.scan_tree(Path(args.path), terms, task_dispatch.leak_options(policy)['allow'],
-                                    history=args.history)
+        allow = task_dispatch.leak_options(policy)['allow']
+        result = security.scan_tree(Path(args.path), terms, allow, history=args.history)
+        trace_gate = traces.scan_trace_files(policy, terms, allow)
+        result['trace_files'] = trace_gate['files_scanned']
+        if trace_gate['findings']:
+            result['findings'] = list(result.get('findings') or []) + trace_gate['findings']
+            result['status'] = 'blocked'
         _print(result)
         return 0 if result['status'] == 'clean' else 1
     if args.command in gate_help:
