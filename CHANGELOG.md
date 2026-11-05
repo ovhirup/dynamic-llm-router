@@ -9,6 +9,12 @@ versions follow [SemVer](https://semver.org/) (0.x: minor versions may break con
   model, tokens, a cost estimate, and exit status. Local JSONL is the default export. OTLP is the optional
   `otlp` extra, with no new core dependency. `dlr report traces --since` prints p50 and p95 latency and cost
   per worker per task class. The leak gate scans trace files.
+- Add an optional LangGraph durable job graph (#238). Nodes call the orchestrator adapter for
+  plan, dispatch, test, judge, and fix. A worker run that fails or changes nothing is retried or
+  failed without running tests, and the same-failure-twice stop records `failed` with that reason.
+  A SQLite checkpoint keyed by job id resumes finished nodes without replaying them. With the
+  `langgraph` extra this is a LangGraph StateGraph and SqliteSaver; without it the same nodes use
+  a stdlib SQLite checkpoint. Each node writes a trace span when the trace writer accepts it.
 
 - Add `llm-router setup` (#210): detects Claude, Codex, Grok Build, Cursor, Grok Bot and Ollama + Aider,
   enables each separately as worker and/or orchestrator with the rationale and recommended default shown,
