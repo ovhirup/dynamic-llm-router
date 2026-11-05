@@ -20,7 +20,7 @@ import tempfile
 
 from . import agent_map, alerts, brain, config, context_navigator, fail_first, feedback, forget_restart, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, tool_gateway, traces, triage
 from . import task_dispatch as td
-from .adapters import NativeOrchestrator, Orchestrator
+from .adapters import NativeOrchestrator, Orchestrator, structured_outputs
 
 Refused = td.Refused
 
@@ -598,6 +598,39 @@ class _NoSleep:
                 self.process.kill()
 
 
+def _repair_worker_report(policy, summary, worktree, task_path, cycle, worker, run_task, options):
+    """One report-only invocation inside the current cycle. Not a product retry."""
+    paths = changed_paths(worktree) - {stackwich.REPORT_PATH}
+    before = stackwich.fingerprints(worktree, paths)
+    if resolve_base(worktree, 'HEAD') != summary['base_sha']:
+        return None, 'repair_worktree_changed'
+    repair = {key: value for key, value in options.items()
+              if key not in ('exclude', 'tried', '_claude_pinned', 'handoff')}
+    repair.update(
+        worker=worker, allow_dirty=True, stamp=f"{options['stamp']}-report-repair",
+        extra_prompt=(options['extra_prompt'] + '\n\n## Worker report format repair\n'
+                      'Rewrite only the Stackwich report using schema version 1. '
+                      'Keep the same cycle, worktree, and evidence. Do not edit product files or Git metadata.'),
+    )
+    try:
+        result = run_task(task_path, worktree, **repair)
+    except Refused:
+        return None, 'repair_run_failed'
+    if (resolve_base(worktree, 'HEAD') != summary['base_sha']
+            or changed_paths(worktree) - {stackwich.REPORT_PATH} != paths
+            or stackwich.fingerprints(worktree, paths) != before):
+        return None, 'repair_worktree_changed'
+    if result.get('blocked_by_leak_check') or (result.get('leak_check') or {}).get('status') != 'clean':
+        return None, 'repair_leak_check'
+    if (not result.get('ok') or result.get('worker') != worker
+            or (result.get('stackwich') or {}).get('status') != 'required'):
+        return None, 'repair_run_failed'
+    if _report_leak_check(policy, worktree, summary['base_sha'])['status'] != 'clean':
+        return None, 'repair_leak_check'
+    evidence = stackwich.evidence(worktree, paths, cycle)
+    return evidence, evidence.get('output_error')
+
+
 def _plan_job(policy, summary, worktree, task_text):
     repo_map = agent_map.load_repo_map(worktree)
     repo_lessons = lessons.render_for_prompt(policy, summary.get('repo') or worktree)
@@ -776,6 +809,22 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
                                             'ok': False, 'leak_check': scan['status']})
                 return
         evidence = stackwich.evidence(worktree, worker_paths, cycle) if required else None
+        if (required and evidence.get('output_error') in structured_outputs.FORMAT_ERRORS
+                and result.get('ok') and pinned == selected):
+            validation = summary.setdefault('output_validation', [])
+            validation.append({'status': 'invalid_report', 'cycle': cycle, 'attempt': 1,
+                               'reason': evidence['output_error']})
+            repaired, error = _repair_worker_report(
+                policy, summary, worktree, task_path, cycle, selected, run_task, kwargs)
+            validation.append({'status': 'invalid_report' if error else 'report_repaired',
+                               'cycle': cycle, 'attempt': 2, 'reason': error})
+            if error:
+                evidence = repaired if repaired is not None else evidence
+                summary.update(status='blocked_by_stackwich', reason='invalid_report', stackwich=evidence)
+                summary['attempts'].append({'attempt': cycle, 'worker': selected, 'ok': False,
+                                            'runs': runs, 'stackwich': evidence})
+                return
+            evidence = repaired
         before = stackwich.fingerprints(worktree, worker_paths) if required else None
         tests = {'status': 'not_run'}
         ff_check = None

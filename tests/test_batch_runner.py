@@ -244,11 +244,14 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(self.job(summary, 'alpha')['status'], 'blocked_after_fix_rounds')
 
     def test_missing_verdict_blocks_without_guessing(self):
-        self.verdicts['alpha'] = [{'text': 'looks fine to me'}]
+        self.verdicts['alpha'] = [{'text': 'looks fine to me'}, {'text': 'still no verdict'}]
         summary = self.batch()
         alpha = self.job(summary, 'alpha')
         self.assertEqual(alpha['status'], 'invalid_verdict')
         self.assertIsNone(alpha['verdict'])
+        alpha_prompts = [prompt for key, prompt in self.verifier_calls if key == 'alpha']
+        self.assertEqual(len(alpha_prompts), 2)
+        self.assertIn('Verdict format repair', alpha_prompts[1])
         self.assertEqual(self.fixer_calls, [])
 
     def test_verifier_that_writes_blocks_the_job(self):
@@ -314,7 +317,10 @@ class BatchTests(unittest.TestCase):
                     else:
                         nonce_line = next((line for line in text if line.startswith('Verdict nonce ')), '')
                         nonce = nonce_line.removeprefix('Verdict nonce ').strip('`')
-                        body = dict(verdict_file, nonce=nonce) if nonce else verdict_file
+                        body = dict(verdict_file)
+                        if nonce:
+                            body['nonce'] = nonce
+                        body.setdefault('schema_version', 1)
                         payload = json.dumps(body)
                     code += f"; from pathlib import Path; Path({path!r}).write_text({payload!r})"
             else:
@@ -395,7 +401,7 @@ class BatchTests(unittest.TestCase):
     def test_staging_moved_while_jobs_ran_is_put_back_even_when_nothing_merges(self):
         side = commit_tree(self.repo, 'main^{tree}', '-p', 'main', '-m', 'planted by job code')
         for key in ('alpha', 'beta', 'gamma'):
-            self.verdicts[key] = [{'text': 'looks fine'}]  # no verdict: nothing is verified
+            self.verdicts[key] = [{'text': 'looks fine'}, {'text': 'still no verdict'}]
 
         def tampering_run_job(*args, **kw):
             result = self.fake_run_job(*args, **kw)

@@ -10,15 +10,14 @@ Never pushes, never merges, never opens a PR: the best outcome is `ready_for_hum
 stays outside this module.
 """
 from pathlib import Path
-import re
 
 from . import config, merge_queue, security
 from . import unit_worktrees as uw
+from .adapters import structured_outputs as outputs
 from .job_dispatch import Refused, _git
 
 REVIEWERS = ('claude', 'grok-bot')
 PROMPT_NAME = '.llm-router-review-prompt.md'
-VERDICT_LINE = re.compile(r'^\s*VERDICT:\s*(approve|reject)\s*$', re.I | re.M)
 MAX_DIFF_CHARS = 60_000
 
 REVIEW_RULES = """\
@@ -33,9 +32,8 @@ Reviewer rules (binding):
    missing evidence. "Command exited 0" alone is not done; the tests must actually exercise the change.
 5. Approve only when the diff stays in scope, the tests cover the change, and you found no blocking defect.
 
-End your answer with exactly one line, either:
-VERDICT: approve
-VERDICT: reject
+Return exactly one JSON object and no surrounding prose. Set schema_version to the integer 1,
+verdict to "approve" or "reject", and notes to the findings as a string.
 """
 
 
@@ -91,9 +89,8 @@ def review_prompt(packet):
 
 
 def parse_verdict(text):
-    """The last `VERDICT: approve|reject` line, or None when absent (never guessed)."""
-    found = VERDICT_LINE.findall(text or '')
-    return found[-1].lower() if found else None
+    """Return a validated v1 unit verdict or raise a typed format error."""
+    return outputs.parse_json(text, outputs.UNIT_VERDICT_V1, outputs.MAX_UNIT_VERDICT_BYTES)
 
 
 def _write_prompt(worktree, prompt):
@@ -149,14 +146,28 @@ def review_unit(batch_id, unit_id, policy=None, reviewers=REVIEWERS, reviewer=No
                             '--verdict approve|reject --reviewer grok-bot'}
         if result.get('status') != 'done':
             continue
-        verdict = parse_verdict(result.get('text'))
-        if verdict is None:
-            return {'ok': False, 'unit': unit_id, 'status': 'no_verdict', 'reviewer': name, 'tried': tried,
-                    'reason': 'reviewer output has no VERDICT line; nothing recorded'}
+        try:
+            parsed = parse_verdict(result.get('text'))
+        except outputs.InvalidStructuredOutput as error:
+            tried[-1].update(status='invalid_verdict', reason=str(error))
+            repair = reviewer(name, packet, prompt + (
+                '\n## Verdict format repair\nThe previous verdict was invalid. '
+                'Return one schema version 1 object and do not change the worktree.\n'), policy)
+            tried.append({'reviewer': name, 'status': repair.get('status'), 'reason': repair.get('reason')})
+            try:
+                if repair.get('status') != 'done':
+                    raise outputs.InvalidStructuredOutput('repair_run_failed')
+                parsed = parse_verdict(repair.get('text'))
+            except outputs.InvalidStructuredOutput as repair_error:
+                tried[-1].update(status='invalid_verdict', reason=str(repair_error))
+                return {'ok': False, 'unit': unit_id, 'status': 'invalid_verdict', 'reviewer': name,
+                        'tried': tried, 'reason': str(repair_error)}
+            tried[-1]['status'] = 'verdict_repaired'
+        verdict = parsed['verdict']
         if _git(worktree, 'rev-parse', 'HEAD').stdout.strip() != packet['head']:
             return {'ok': False, 'unit': unit_id, 'status': 'stale', 'reviewer': name, 'tried': tried,
                     'reason': 'unit head moved during review; re-queue the unit; nothing recorded'}
-        notes = security.redact((result.get('text') or '').strip()[-4000:])
+        notes = security.redact(parsed['notes'].strip()[-4000:])
         if verdict == 'approve' and worktree.is_dir() and _dirty(worktree):
             verdict, notes = 'reject', ('reviewer left uncommitted patches; commit them and re-queue.\n' + notes)
         entry = merge_queue.record_review(batch_id, unit_id, verdict, notes=notes, policy=policy,

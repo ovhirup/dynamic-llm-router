@@ -32,7 +32,6 @@ from pathlib import Path
 import re
 import secrets
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -42,6 +41,7 @@ import time
 from . import claude_handoff, config, judge_sandbox, security
 from . import job_dispatch as jd
 from . import task_dispatch as td
+from .adapters import structured_outputs as outputs
 from .job_dispatch import Refused
 
 MIN_JOBS, MAX_JOBS = 3, 5
@@ -65,8 +65,9 @@ Verifier rules (binding):
 2. Judge the produced diff against the task by running the tests and the code. Never trust the worker's claims.
 3. Count each distinct wrong behaviour (`wrong`) and each crash, traceback or failing/erroring run (`crash`).
    For each, give the command you ran, what you expected and what you saw, so it can become a failing test.
-4. Write a JSON object with exactly three fields to the designated verdict file after testing:
-   wrong and crash, each a nonnegative integer, and nonce, the exact value from the verdict nonce line.
+4. Write a JSON object with exactly four fields to the designated verdict file after testing:
+   schema_version set to the integer 1, wrong and crash, each a nonnegative integer, and nonce,
+   the exact value from the verdict nonce line.
    Write it yourself. Keep the verdict path and the nonce out of test commands, their environment, and their output.
 """
 
@@ -102,13 +103,6 @@ def is_stream_json(command):
     return output_format in STREAM_JSON
 
 
-def _unique_object(pairs):
-    result = dict(pairs)
-    if len(result) != len(pairs):
-        raise ValueError('duplicate verdict field')
-    return result
-
-
 def _valid_verdict(verdict):
     return (isinstance(verdict, dict) and set(verdict) == {'wrong', 'crash'}
             and all(type(count) is int and count >= 0 for count in verdict.values()))
@@ -120,28 +114,12 @@ def _nonce_matches(got, expected):
     return secrets.compare_digest(got, expected)
 
 
-def _valid_file_verdict(verdict, nonce):
-    """The file the judge writes. nonce is the per-job secret; counts alone are not approval."""
-    if not isinstance(verdict, dict) or set(verdict) != {'wrong', 'crash', 'nonce'}:
-        return False
-    if not _nonce_matches(verdict.get('nonce'), nonce):
-        return False
-    return all(type(verdict[key]) is int and verdict[key] >= 0 for key in ('wrong', 'crash'))
-
-
 def _read_verdict(path, nonce):
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, 'rb') as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                return None
-            raw = handle.read(1025)
-        if len(raw) > 1024:
-            return None
-        verdict = json.loads(raw, object_pairs_hook=_unique_object)
-    except (OSError, ValueError, RecursionError):
-        return None
-    return verdict if _valid_file_verdict(verdict, nonce) else None
+    """The file the judge writes. nonce is the per-job secret; counts alone are not approval."""
+    verdict, _raw = outputs.load_json(path, outputs.BATCH_VERDICT_V1, outputs.MAX_BATCH_VERDICT_BYTES)
+    if not _nonce_matches(verdict.get('nonce'), nonce):
+        raise outputs.InvalidStructuredOutput('nonce_mismatch')
+    return {'wrong': verdict['wrong'], 'crash': verdict['crash']}
 
 
 def _scrub_env(env, *hidden):
@@ -289,9 +267,12 @@ def default_verifier(job, prompt, policy):
         if not result.get('ok'):
             return {'status': 'unavailable', 'reason': result.get('reason') or 'verifier run failed',
                     'text': report, 'worker': worker}
-        verdict = _read_verdict(verdict_path, nonce) if attempts else None
-        if verdict is not None:
-            verdict = {'wrong': verdict['wrong'], 'crash': verdict['crash']}
+        try:
+            if not attempts:
+                raise outputs.InvalidStructuredOutput('missing_output')
+            verdict = _read_verdict(verdict_path, nonce)
+        except outputs.InvalidStructuredOutput as error:
+            return {'status': 'invalid_verdict', 'reason': str(error), 'text': report, 'worker': worker}
         return {'status': 'done', 'text': report, 'verdict': verdict, 'worker': worker}
     finally:
         shutil.rmtree(directory, ignore_errors=True)
@@ -406,6 +387,11 @@ class Batch:
                     continue
             verdict = self.verify(job)
             job['verifications'].append(verdict)
+            if verdict['status'] == 'invalid_verdict':
+                # Format repair is not a product fix round and does not consume MAX_FIX_ROUNDS.
+                self.update(job, 'repairing_verdict', status='invalid_verdict', reason=verdict.get('reason'))
+                verdict = self.verify(job, repair=True)
+                job['verifications'].append(verdict)
             if verdict['status'] != 'done':
                 return self.update(job, 'blocked', status=verdict['status'], reason=verdict.get('reason'))
             job['verdict'] = f"RESULT wrong={verdict['wrong']} crash={verdict['crash']}"
@@ -415,7 +401,7 @@ class Batch:
         self.update(job, 'blocked', status='blocked_after_fix_rounds',
                     reason=f'{MAX_FIX_ROUNDS} fix rounds did not reach RESULT wrong=0 crash=0')
 
-    def verify(self, job):
+    def verify(self, job, *, repair=False):
         self.update(job, 'verifying', round=len(job['fix_rounds']))
         worktree = Path(job['worktree'])
         diff = _git(worktree, 'diff', '--no-renames', '--no-color', f"{job['base_sha']}..HEAD").stdout
@@ -423,6 +409,10 @@ class Batch:
                   f"{VERIFIER_RULES}\n## Task\n{job['task_text']}\n\n## Test command\n{self.test_cmd}\n\n"
                   f"## Diff{' (truncated)' if len(diff) > MAX_DIFF_CHARS else ''}\n"
                   f"```diff\n{security.redact(diff[:MAX_DIFF_CHARS])}\n```\n")
+        if repair:
+            prompt += ('\n## Verdict format repair\nThe previous verdict was invalid. '
+                       'Write one valid schema version 1 verdict to the newly designated file. '
+                       'Keep the same review criteria and do not change the worktree.\n')
         before = _snapshot(worktree)
         try:
             result = self.verifier(job, prompt, self.policy) or {}
@@ -431,6 +421,8 @@ class Batch:
         record = {'worker': result.get('worker'), 'sha': before[0], 'at': _now(self.policy)}
         if _snapshot(worktree) != before:  # read and run only: a verifier never makes a problem disappear
             return dict(record, status='verifier_wrote', reason='verifier changed the worktree; job blocked')
+        if result.get('status') == 'invalid_verdict':
+            return dict(record, status='invalid_verdict', reason=result.get('reason') or 'invalid_verdict')
         if result.get('status') != 'done':
             return dict(record, status='verifier_unavailable', reason=result.get('reason'))
         if result.get('worker') and result.get('worker') == job.get('worker'):

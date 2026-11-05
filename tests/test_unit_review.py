@@ -5,6 +5,7 @@ from unittest import mock
 
 from llm_router import job_dispatch as jd, merge_queue as mq, pr_gate
 from llm_router import unit_review as ur
+from llm_router.adapters import structured_outputs as outputs
 import test_merge_queue  # module import (no TestCase name at module level) so its tests are not re-collected
 
 
@@ -22,7 +23,8 @@ class FakeReviewer:
 
 
 def done(verdict, body='defect list'):
-    return {'status': 'done', 'text': f'{body}\nVERDICT: {verdict}\n'}
+    return {'status': 'done', 'text': json.dumps(
+        {'schema_version': 1, 'verdict': verdict, 'notes': body})}
 
 
 class UnitReviewTests(unittest.TestCase):
@@ -63,7 +65,7 @@ class UnitReviewTests(unittest.TestCase):
         for needle in ('src/api/a.py', '+    return 1', 'command: true', 'status: passed', 'src/api/',
                        "never judge", 'at most the 3 highest-impact defects', 'file:line',
                        're-run the affected tests', 'missing required input', '"Command exited 0" alone is not done',
-                       'VERDICT: approve'):
+                       'schema_version'):
             self.assertIn(needle.lower(), prompt.lower())
         entry = self.status('api')
         self.assertEqual(entry['status'], 'ready_for_human')
@@ -91,7 +93,9 @@ class UnitReviewTests(unittest.TestCase):
     def test_missing_verdict_records_nothing(self):
         fake = FakeReviewer({'claude': {'status': 'done', 'text': 'looks fine, exited 0'}})
         report = ur.review_unit('b1', 'api', policy=self.policy, reviewer=fake)
-        self.assertEqual(report['status'], 'no_verdict')
+        self.assertEqual(report['status'], 'invalid_verdict')
+        self.assertEqual(len(fake.calls), 2)
+        self.assertIn('Verdict format repair', fake.calls[1]['prompt'])
         self.assertEqual(self.status('api')['status'], 'needs_review')
 
     def test_no_reviewer_available_keeps_pending(self):
@@ -132,10 +136,42 @@ class UnitReviewTests(unittest.TestCase):
         with self.assertRaisesRegex(jd.Refused, 'missing passing test evidence'):
             ur.build_packet('b1', 'api', policy=self.policy)
 
+    def test_invalid_verdict_repairs_once_then_stays_unrecorded(self):
+        answers = ['approve please', '{"verdict": "approve"}']
+
+        def reviewer(name, packet, prompt, policy):
+            reviewer.calls.append(prompt)
+            return {'status': 'done', 'text': answers.pop(0)}
+
+        reviewer.calls = []
+        report = ur.review_unit('b1', 'api', policy=self.policy, reviewer=reviewer)
+        self.assertEqual(report['status'], 'invalid_verdict')
+        self.assertEqual(len(reviewer.calls), 2)
+        self.assertIn('Verdict format repair', reviewer.calls[1])
+        self.assertEqual(self.status('api')['status'], 'needs_review')
+
+    def test_format_repair_can_record_a_valid_verdict(self):
+        answers = ['nope', json.dumps({'schema_version': 1, 'verdict': 'reject', 'notes': 'file:line defect'})]
+
+        def reviewer(name, packet, prompt, policy):
+            reviewer.calls.append(prompt)
+            return {'status': 'done', 'text': answers.pop(0)}
+
+        reviewer.calls = []
+        report = ur.review_unit('b1', 'api', policy=self.policy, reviewer=reviewer)
+        self.assertEqual(report['verdict'], 'reject')
+        self.assertEqual(len(reviewer.calls), 2)
+        self.assertEqual(self.status('api')['status'], 'blocked')
+
     def test_parse_verdict(self):
-        self.assertEqual(ur.parse_verdict('x\nVERDICT: reject\nVERDICT: Approve\n'), 'approve')
-        self.assertIsNone(ur.parse_verdict('I approve this'))
-        self.assertIsNone(ur.parse_verdict(None))
+        parsed = ur.parse_verdict(json.dumps(
+            {'schema_version': 1, 'verdict': 'approve', 'notes': 'ok'}))
+        self.assertEqual(parsed['verdict'], 'approve')
+        for text in ('I approve this', None, '{"verdict": "approve"}',
+                     json.dumps({'schema_version': 1, 'verdict': 'approve', 'notes': 'ok'}) + ' trailing'):
+            with self.subTest(text=text):
+                with self.assertRaises(outputs.InvalidStructuredOutput):
+                    ur.parse_verdict(text)
 
     def test_cli_review_live_and_manual_verdict(self):
         fake = FakeReviewer({'claude': done('reject')})
