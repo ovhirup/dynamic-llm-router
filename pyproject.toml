@@ -23,6 +23,11 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+langgraph = ["langgraph"]
+crewai = ["crewai"]
+agent-framework = ["agent-framework"]
+
 [project.urls]
 Homepage = "https://github.com/ovhirup/dynamic-llm-router"
 Repository = "https://github.com/ovhirup/dynamic-llm-router"

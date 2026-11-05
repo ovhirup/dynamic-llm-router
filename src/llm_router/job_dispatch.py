@@ -20,6 +20,7 @@ import tempfile
 
 from . import agent_map, alerts, brain, config, context_navigator, fail_first, feedback, forget_restart, handoff, lessons, orchestrator as orch_module, retry_feedback, risk_tiers, security, stackwich, task_dag, tool_gateway, traces, triage
 from . import task_dispatch as td
+from .adapters import NativeOrchestrator, Orchestrator
 
 Refused = td.Refused
 
@@ -340,10 +341,11 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             keep=None, policy=None, run_task=td.run_task, select=None, now=None, test_runner=td.run_bounded,
             popen=subprocess.Popen, notifier=None, meter=None, task_class=None,
             orchestrator=None, reviewer=None, allowed_paths=None, role=None, orchestrator_decision=None,
-            record_decision=None):
+            record_decision=None, adapter: Orchestrator | None = None):
     """keep: True (--keep), False (--prune) or None (keep on success, prune on failure).
     meter(worker) -> percent used or None (default: the cached meter, never a live read).
     task_class ranks workers by class_order.<task_class> (see selection.select).
+    adapter runs the job phase hooks; the default is NativeOrchestrator.
     record_decision(orchestrator_decision) logs a deferred orchestrator switch once the repo, task and
     branch checks have passed, so a refused job records none (#212)."""
     policy = policy or config.load_policy()
@@ -443,7 +445,8 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             summary['test_command_source'] = test_source
             if test_cmd or allow_no_tests:
                 _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd,
-                          test_timeout, stamp, out_dir, run_task, select, test_runner, allow_no_tests,
+                          test_timeout, stamp, out_dir, run_task, select, test_runner,
+                          NativeOrchestrator() if adapter is None else adapter, allow_no_tests,
                           meter or (lambda w: handoff.meter_percent(w, policy=policy)),
                           reviewer=reviewer, scope=scope, task_class=task_class)
             else:  # fail before spending a worker run on a change nothing would verify
@@ -595,11 +598,7 @@ class _NoSleep:
                 self.process.kill()
 
 
-def _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd, test_timeout,
-              stamp, out_dir, run_task, select, test_runner, allow_no_tests=False,
-              meter=handoff.meter_percent, reviewer=None, scope=None, task_class=None):
-    # 'no_tests' passes only on the repo's explicit opt-in; anything else ('skipped', 'not_run') never does.
-    passing = ('passed', 'no_tests') if allow_no_tests else ('passed',)
+def _plan_job(policy, summary, worktree, task_text):
     repo_map = agent_map.load_repo_map(worktree)
     repo_lessons = lessons.render_for_prompt(policy, summary.get('repo') or worktree)
     nav_result = None
@@ -623,6 +622,15 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         }
     nav_block = context_navigator.format_for_prompt(nav_result) if nav_result else ''
     base_instructions = '\n\n'.join(filter(None, [handoff.WORKER_INSTRUCTIONS, repo_map, repo_lessons, nav_block]))
+    return base_instructions, nav_result
+
+
+def _job_body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd, test_timeout,
+              stamp, out_dir, run_task, select, test_runner, adapter, allow_no_tests=False,
+              meter=handoff.meter_percent, reviewer=None, scope=None, task_class=None):
+    # 'no_tests' passes only on the repo's explicit opt-in; anything else ('skipped', 'not_run') never does.
+    passing = ('passed', 'no_tests') if allow_no_tests else ('passed',)
+    base_instructions, nav_result = adapter.plan(_plan_job, policy, summary, worktree, task_text)
     require_fail_first = fail_first.is_bug_task(task_text, task_class=task_class, policy=policy)
     if require_fail_first:
         summary['fail_first'] = {'required': True, 'status': 'pending'}
@@ -671,7 +679,8 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         if select is not None:
             kwargs['select'] = select
         try:
-            result = run_task(task_path, worktree, **kwargs)
+            dispatch = adapter.fix if attempt_number else adapter.dispatch
+            result = dispatch(run_task, task_path, worktree, **kwargs)
         except Refused as refusal:
             summary['attempts'].append({'attempt': cycle, 'refused': str(refusal)})
             if required:
@@ -775,11 +784,12 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
                 ff_check = fail_first.verify_fail_first(
                     policy, worktree, summary['base_sha'], worker_paths, test_cmd, test_timeout,
                     out_dir / f'{stamp}-a{cycle}-base-tests.log',
-                    lambda pol, cwd, cmd, tout, lpath: run_tests(pol, cwd, cmd, tout, lpath, test_runner),
+                    lambda pol, cwd, cmd, tout, lpath: adapter.test(
+                        run_tests, pol, cwd, cmd, tout, lpath, test_runner),
                     _git,
                 )
-            tests = run_tests(policy, worktree, test_cmd, test_timeout,
-                              out_dir / f'{stamp}-a{cycle}-tests.log', test_runner)
+            tests = adapter.test(run_tests, policy, worktree, test_cmd, test_timeout,
+                                 out_dir / f'{stamp}-a{cycle}-tests.log', test_runner)
             tests['source'] = summary.get('test_command_source')
             test_artifacts |= changed_paths(worktree) - worker_paths - {stackwich.REPORT_PATH}
             if ff_check is not None:
@@ -946,7 +956,7 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
     producer = last.get('worker')
     summary['review_required'] = any(review_required(w) for w in [producer, *summary['workers']] if w)
     if summary['review_required']:
-        summary['review'] = _stronger_review(summary, worktree, worker_paths, reviewer)
+        summary['review'] = adapter.judge(_stronger_review, summary, worktree, worker_paths, reviewer)
         if summary['review'].get('verdict') == 'reject':
             summary['ok'] = False
             summary['status'] = 'review_rejected'

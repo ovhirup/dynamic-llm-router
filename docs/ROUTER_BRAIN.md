@@ -86,6 +86,8 @@ Once public, DLR lets users plug in productivity tools over MCP via a simple plu
 (input source / context / notifier / output sink), and how to call it. Reference plugins: Hark (voice dictation and
 meeting transcripts become task files, searchable via hark-mcp; #19), the Obsidian vault (#50), notifiers
 (Slack/email summaries). Per-plugin opt-in consent and permissions; no secrets in logs.
+The [orchestrator adapter ADR](adr-235-orchestrator-adapters.md) records the separate job orchestration seam
+for the [external integrations epic](https://github.com/ovhirup/dynamic-llm-router/issues/73).
 
 ## (i) Notch actionable approvals
 Code lives outside this repo: `~/dev/notch-dashboard` (ovhirup/notch-dashboard; `RouterNotchCore/OrchestrationLogic.swift`
