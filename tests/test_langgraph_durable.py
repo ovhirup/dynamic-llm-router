@@ -105,9 +105,18 @@ def _scenarios():
          {'dispatch': [{'ok': False, 'changed': True}], 'fix': [{'ok': False, 'changed': True}],
           'test': [_passed(), _passed()]}),
         ('worker-failed-different-then-capped', False, 1, ('passed',),
-         {'dispatch': [{'ok': False, 'changed': False, 'runs': [{'failure_reason': 'boom-a'}]}],
-          'fix': [{'ok': False, 'changed': False, 'runs': [{'failure_reason': 'boom-b'}]}],
+         {'dispatch': [{'ok': False, 'changed': False, 'attempts': [{'failure_reason': 'boom-a'}]}],
+          'fix': [{'ok': False, 'changed': False, 'attempts': [{'failure_reason': 'boom-b'}]}],
           'test': [_passed(), _passed()]}),
+        ('different-attempt-reasons-then-pass', False, 2, ('passed',),
+         {'dispatch': [{'ok': False, 'changed': True, 'attempts': [{'failure_reason': 'reason-a'}]}],
+          'fix': [{'ok': False, 'changed': True, 'attempts': [{'failure_reason': 'reason-b'}]},
+                  _changed()],
+          'test': [_passed()]}),
+        ('same-attempt-reasons-stop', False, 5, ('passed',),
+         {'dispatch': [{'ok': False, 'changed': True, 'attempts': [{'failure_reason': 'reason-a'}]}],
+          'fix': [{'ok': False, 'changed': True, 'attempts': [{'failure_reason': 'reason-a'}]}],
+          'test': [_passed()]}),
     ]
     scenarios = []
     for name, review, retries, passing, phases in rows:
@@ -160,7 +169,7 @@ def native_attempt_loop(scenario):
             return {'status': 'passed', 'ok': True, 'reason': None,
                     'same_failure_twice': False, 'completed': completed}
         fingerprints.append(retry_feedback.failure_fingerprint(
-            tests, {'ok': worker_ok, 'runs': result.get('runs') or []}))
+            tests, {'ok': worker_ok, 'runs': result.get('attempts', [])}))
         if retry_feedback.same_failure_twice(fingerprints):
             return {'status': 'failed', 'ok': False, 'reason': 'same_failure_twice',
                     'same_failure_twice': True, 'completed': completed}
@@ -234,6 +243,43 @@ class DurableJobTests(unittest.TestCase):
                 self.assertEqual(state['status'], 'failed')
                 self.assertNotIn('test', state['completed'])
                 self.assertEqual(state['completed'], expected['completed'])
+
+    def test_attempt_failure_reasons_match_the_native_loop(self):
+        wanted = {
+            'different-attempt-reasons-then-pass': ('passed', None),
+            'same-attempt-reasons-stop': ('failed', 'same_failure_twice'),
+        }
+        for scenario in _scenarios():
+            expected_status = wanted.get(scenario['name'])
+            if expected_status is None:
+                continue
+            with self.subTest(scenario=scenario['name']):
+                expected = native_attempt_loop(scenario)
+                self.assertEqual((expected['status'], expected['reason']), expected_status)
+                with tempfile.TemporaryDirectory() as tmp:
+                    state = run_durable_job(
+                        NativeOrchestrator(), _scripted(scenario['steps']),
+                        thread_id=scenario['name'], db_path=str(Path(tmp) / 'job.sqlite'),
+                        review=scenario['review'], max_retries=scenario['max_retries'],
+                        passing=scenario['passing'], backend='sqlite')
+                self.assertEqual(state['status'], expected['status'])
+                self.assertEqual(state.get('reason'), expected['reason'])
+                self.assertEqual(state['ok'], expected['ok'])
+                self.assertEqual(state['completed'], expected['completed'])
+
+    def test_runs_is_the_fallback_when_attempts_is_absent(self):
+        # Not a native fixture: job_dispatch reads only attempts. If runs were ignored, both misses
+        # would fingerprint as not_run and stop as same_failure_twice instead of reaching the cap.
+        steps = {'plan': [{}], 'dispatch': [{'ok': False, 'runs': [{'failure_reason': 'reason-a'}]}],
+                 'fix': [{'ok': False, 'runs': [{'failure_reason': 'reason-b'}]}],
+                 'test': [], 'judge': []}
+        with tempfile.TemporaryDirectory() as tmp:
+            state = run_durable_job(
+                NativeOrchestrator(), _scripted(steps), thread_id='runs-fallback',
+                db_path=str(Path(tmp) / 'job.sqlite'), review=False, max_retries=1, backend='sqlite')
+        self.assertEqual((state['status'], state.get('reason')), ('failed', None))
+        self.assertEqual(state['completed'], ['plan', 'dispatch', 'fix'])
+        self.assertEqual([fp['error_line'] for fp in state['fingerprints']], ['reason-a', 'reason-b'])
 
     def test_nodes_call_the_adapter_hooks(self):
         adapter = mock.Mock(wraps=NativeOrchestrator())

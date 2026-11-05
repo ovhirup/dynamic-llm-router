@@ -155,8 +155,11 @@ def _apply(name, state, result):
 
 def _failure_update(state, tests, worker):
     """Fingerprint this cycle and stop on same-failure-twice or the native retry cap."""
+    # job_dispatch fingerprints the worker's attempts list (runs is only the older shape).
+    attempts = worker.get('attempts')
+    runs = attempts if attempts else (worker.get('runs') or [])
     fingerprint = retry_feedback.failure_fingerprint(
-        tests, {'ok': bool(worker.get('ok')), 'runs': worker.get('runs') or []})
+        tests, {'ok': bool(worker.get('ok')), 'runs': runs})
     fingerprints = [*list(state.get('fingerprints') or []), fingerprint]
     update = {
         'fingerprints': fingerprints,
