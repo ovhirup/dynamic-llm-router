@@ -387,6 +387,7 @@ def approve(job_id, action, sha=None, hours=None, note=None, policy=None, now=No
     record['id'] = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()[:12]
     saved = _append_approval(policy, record)
     approval_audit.record_approval_audit(policy, saved, actor='owner', now=stamp)
+    _record_approval_wait(policy, job, 'approved', stamp)
     return saved
 
 
@@ -422,7 +423,17 @@ def deny(job_id, action, note=None, policy=None, now=None):
               'at': stamp.isoformat(timespec='seconds'), 'note': security.redact(note or '')}
     saved = _append_approval(policy, record)
     approval_audit.record_approval_audit(policy, saved, actor='owner', now=stamp)
+    _record_approval_wait(policy, job, 'denied', stamp)
     return saved
+
+
+def _record_approval_wait(policy, job, exit_status, finished_at):
+    """Best-effort. A trace write must not block an approval or a denial."""
+    try:
+        from .adapters.tracing import record_approval_wait
+        record_approval_wait(policy, job, exit_status=exit_status, finished_at=finished_at)
+    except Exception:
+        return None
 
 
 def _mark_used(policy, approval, now=None):

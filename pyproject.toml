@@ -27,6 +27,11 @@ dependencies = []
 langgraph = ["langgraph"]
 crewai = ["crewai"]
 agent-framework = ["agent-framework"]
+otlp = [
+  "opentelemetry-api",
+  "opentelemetry-sdk",
+  "opentelemetry-exporter-otlp-proto-http",
+]
 
 [project.urls]
 Homepage = "https://github.com/ovhirup/dynamic-llm-router"
@@ -36,6 +41,7 @@ Changelog = "https://github.com/ovhirup/dynamic-llm-router/blob/main/CHANGELOG.m
 
 [project.scripts]
 llm-router = "llm_router.cli:main"
+dlr = "llm_router.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
