@@ -199,5 +199,14 @@ class MergeQueueTests(unittest.TestCase):
             self.assertNotIn(needle, source)
 
 
+# Export fixture methods without exposing the TestCase to unittest discovery.
+merge_queue_setup = MergeQueueTests.setUp
+merge_queue_teardown = MergeQueueTests.tearDown
+merge_queue_set_test_cmd = MergeQueueTests.set_test_cmd
+merge_queue_create = MergeQueueTests.create
+run_merge_queue_fixture = MergeQueueTests.queue
+merge_queue_mkfile = MergeQueueTests.mkfile
+
+
 if __name__ == '__main__':
     unittest.main()
