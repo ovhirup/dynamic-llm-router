@@ -13,7 +13,7 @@ from unittest import mock
 
 from llm_router.adapters import NativeOrchestrator
 from llm_router.adapters.langgraph_job import END, NODES, install_graph, run_durable_job
-from llm_router import traces
+from llm_router import retry_feedback, traces
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -52,75 +52,122 @@ def _passed():
     return {'status': 'passed'}
 
 
+def _changed(**extra):
+    body = {'ok': True, 'changed': True}
+    body.update(extra)
+    return body
+
+
 def _scenarios():
-    """Twenty phase-outcome fixtures. A live 20-job worktree corpus is not what this runs."""
+    """Phase scripts. Expected outcomes come from ``native_attempt_loop``."""
     approve = {'verdict': 'approve'}
     reject = {'verdict': 'reject'}
     rows = [
-        ('pass-approve', True, 1, ('passed',), {'test': [_passed()], 'judge': [approve]},
-         'passed', True, ['plan', 'dispatch', 'test', 'judge']),
-        ('pass-reject', True, 1, ('passed',), {'test': [_passed()], 'judge': [reject]},
-         'review_rejected', False, ['plan', 'dispatch', 'test', 'judge']),
-        ('pass-no-review', False, 1, ('passed',), {'test': [_passed()]},
-         'passed', True, ['plan', 'dispatch', 'test']),
+        ('pass-approve', True, 1, ('passed',), {'test': [_passed()], 'judge': [approve]}),
+        ('pass-reject', True, 1, ('passed',), {'test': [_passed()], 'judge': [reject]}),
+        ('pass-no-review', False, 1, ('passed',), {'test': [_passed()]}),
         ('fix-then-pass-approve', True, 1, ('passed',),
-         {'test': [_boom('a'), _passed()], 'fix': [{}], 'judge': [approve]},
-         'passed', True, ['plan', 'dispatch', 'test', 'fix', 'test', 'judge']),
+         {'test': [_boom('a'), _passed()], 'fix': [_changed()], 'judge': [approve]}),
         ('fix-then-pass-reject', True, 1, ('passed',),
-         {'test': [_boom('a'), _passed()], 'fix': [{}], 'judge': [reject]},
-         'review_rejected', False, ['plan', 'dispatch', 'test', 'fix', 'test', 'judge']),
+         {'test': [_boom('a'), _passed()], 'fix': [_changed()], 'judge': [reject]}),
         ('fix-then-pass-no-review', False, 1, ('passed',),
-         {'test': [_boom('a'), _passed()], 'fix': [{}]},
-         'passed', True, ['plan', 'dispatch', 'test', 'fix', 'test']),
+         {'test': [_boom('a'), _passed()], 'fix': [_changed()]}),
         ('same-failure-high-cap', True, 5, ('passed',),
-         {'test': [_boom('same'), _boom('same')], 'fix': [{}]},
-         'same_failure_twice', False, ['plan', 'dispatch', 'test', 'fix', 'test']),
+         {'test': [_boom('same'), _boom('same')], 'fix': [_changed()]}),
         ('two-different-retries-1', True, 1, ('passed',),
-         {'test': [_boom('a'), _boom('b')], 'fix': [{}]},
-         'failed', False, ['plan', 'dispatch', 'test', 'fix', 'test']),
+         {'test': [_boom('a'), _boom('b')], 'fix': [_changed()]}),
         ('three-different-retries-2', True, 2, ('passed',),
-         {'test': [_boom('a'), _boom('b'), _boom('c')], 'fix': [{}, {}]},
-         'failed', False, ['plan', 'dispatch', 'test', 'fix', 'test', 'fix', 'test']),
+         {'test': [_boom('a'), _boom('b'), _boom('c')], 'fix': [_changed(), _changed()]}),
         ('same-failure-retries-1', True, 1, ('passed',),
-         {'test': [_boom('same'), _boom('same')], 'fix': [{}]},
-         'same_failure_twice', False, ['plan', 'dispatch', 'test', 'fix', 'test']),
-        ('no-retry-on-first-failure', True, 0, ('passed',), {'test': [_boom('a')]},
-         'failed', False, ['plan', 'dispatch', 'test']),
+         {'test': [_boom('same'), _boom('same')], 'fix': [_changed()]}),
+        ('no-retry-on-first-failure', True, 0, ('passed',), {'test': [_boom('a')]}),
         ('dispatch-tokens-do-not-change-outcome', True, 1, ('passed',),
-         {'dispatch': [{'ok': True, 'worker': 'codex', 'tokens': 10}], 'test': [_passed()], 'judge': [approve]},
-         'passed', True, ['plan', 'dispatch', 'test', 'judge']),
+         {'dispatch': [_changed(worker='codex', tokens=10)], 'test': [_passed()], 'judge': [approve]}),
         ('dispatch-failed-no-retry', True, 0, ('passed',),
-         {'dispatch': [{'ok': False, 'worker': 'codex'}], 'test': [_boom('worker')]},
-         'failed', False, ['plan', 'dispatch', 'test']),
+         {'dispatch': [{'ok': False, 'changed': True, 'worker': 'codex'}], 'test': [_boom('worker')]}),
         ('same-failure-retries-4', False, 4, ('passed',),
-         {'test': [_boom('loop'), _boom('loop')], 'fix': [{}]},
-         'same_failure_twice', False, ['plan', 'dispatch', 'test', 'fix', 'test']),
+         {'test': [_boom('loop'), _boom('loop')], 'fix': [_changed()]}),
         ('two-failures-then-pass', False, 3, ('passed',),
-         {'test': [_boom('a'), _boom('b'), _passed()], 'fix': [{}, {}]},
-         'passed', True, ['plan', 'dispatch', 'test', 'fix', 'test', 'fix', 'test']),
+         {'test': [_boom('a'), _boom('b'), _passed()], 'fix': [_changed(), _changed()]}),
         ('fix-worker-then-approve', True, 1, ('passed',),
-         {'test': [_boom('a'), _passed()], 'fix': [{'ok': True, 'worker': 'grok-build'}], 'judge': [approve]},
-         'passed', True, ['plan', 'dispatch', 'test', 'fix', 'test', 'judge']),
-        ('no-tests-is-not-passing', False, 0, ('passed',), {'test': [{'status': 'no_tests'}]},
-         'failed', False, ['plan', 'dispatch', 'test']),
-        ('no-tests-opt-in', False, 1, ('passed', 'no_tests'), {'test': [{'status': 'no_tests'}]},
-         'passed', True, ['plan', 'dispatch', 'test']),
+         {'test': [_boom('a'), _passed()], 'fix': [_changed(worker='grok-build')], 'judge': [approve]}),
+        ('no-tests-is-not-passing', False, 0, ('passed',), {'test': [{'status': 'no_tests'}]}),
+        ('no-tests-opt-in', False, 1, ('passed', 'no_tests'), {'test': [{'status': 'no_tests'}]}),
         ('third-failure-matches-second', True, 5, ('passed',),
-         {'test': [_boom('A'), _boom('B'), _boom('B')], 'fix': [{}, {}]},
-         'same_failure_twice', False, ['plan', 'dispatch', 'test', 'fix', 'test', 'fix', 'test']),
+         {'test': [_boom('A'), _boom('B'), _boom('B')], 'fix': [_changed(), _changed()]}),
         ('two-fixes-then-approve', True, 2, ('passed',),
-         {'test': [_boom('A'), _boom('B'), _passed()], 'fix': [{}, {}], 'judge': [approve]},
-         'passed', True, ['plan', 'dispatch', 'test', 'fix', 'test', 'fix', 'test', 'judge']),
+         {'test': [_boom('A'), _boom('B'), _passed()], 'fix': [_changed(), _changed()], 'judge': [approve]}),
+        ('worker-failed-tests-would-pass', True, 0, ('passed',),
+         {'dispatch': [{'ok': False, 'changed': True, 'worker': 'codex'}], 'test': [_passed()]}),
+        ('no-change-tests-would-pass', False, 0, ('passed',),
+         {'dispatch': [{'ok': True, 'changed': False, 'worker': 'codex'}], 'test': [_passed()]}),
+        ('worker-failed-same-fingerprint', False, 5, ('passed',),
+         {'dispatch': [{'ok': False, 'changed': True}], 'fix': [{'ok': False, 'changed': True}],
+          'test': [_passed(), _passed()]}),
+        ('worker-failed-different-then-capped', False, 1, ('passed',),
+         {'dispatch': [{'ok': False, 'changed': False, 'runs': [{'failure_reason': 'boom-a'}]}],
+          'fix': [{'ok': False, 'changed': False, 'runs': [{'failure_reason': 'boom-b'}]}],
+          'test': [_passed(), _passed()]}),
     ]
     scenarios = []
-    for name, review, retries, passing, phases, status, ok, completed in rows:
-        steps = {'plan': [{}], 'dispatch': [{'ok': True, 'worker': 'codex'}], 'test': [], 'fix': [], 'judge': []}
+    for name, review, retries, passing, phases in rows:
+        steps = {'plan': [{}], 'dispatch': [_changed(worker='codex')], 'test': [], 'fix': [], 'judge': []}
         steps.update(phases)
         scenarios.append({
-            'name': name, 'review': review, 'max_retries': retries, 'passing': passing,
-            'steps': steps, 'status': status, 'ok': ok, 'completed': completed,
+            'name': name, 'review': review, 'max_retries': retries, 'passing': passing, 'steps': steps,
         })
     return scenarios
+
+
+def native_attempt_loop(scenario):
+    """job_dispatch attempt loop: test only when the worker succeeded and changed files.
+
+    Same-failure-twice sets status failed and reason same_failure_twice. The cap is
+    attempt_number <= max_retries. A passing phase outcome stays ``passed``; judge may still reject.
+    """
+    queues = {name: list(scenario['steps'][name]) for name in NODES}
+
+    def pop(name):
+        if not queues[name]:
+            raise AssertionError(f'{scenario["name"]}: native loop called {name} with no scripted result')
+        return queues[name].pop(0)
+
+    passing = tuple(scenario['passing'])
+    review = scenario['review']
+    max_retries = scenario['max_retries']
+    fingerprints = []
+    completed = ['plan']
+    pop('plan')
+    phase = 'dispatch'
+    attempt_number = 0
+    while attempt_number <= max_retries:
+        result = pop(phase)
+        completed.append(phase)
+        worker_ok = bool(result.get('ok'))
+        changed = bool(result.get('changed'))
+        tests = {'status': 'not_run'}
+        if worker_ok and changed:
+            tests = pop('test')
+            completed.append('test')
+        tests_status = tests.get('status') or 'not_run'
+        if worker_ok and changed and tests_status in passing:
+            if review:
+                verdict = pop('judge')
+                completed.append('judge')
+                if verdict.get('verdict') == 'reject':
+                    return {'status': 'review_rejected', 'ok': False, 'reason': None,
+                            'same_failure_twice': False, 'completed': completed}
+            return {'status': 'passed', 'ok': True, 'reason': None,
+                    'same_failure_twice': False, 'completed': completed}
+        fingerprints.append(retry_feedback.failure_fingerprint(
+            tests, {'ok': worker_ok, 'runs': result.get('runs') or []}))
+        if retry_feedback.same_failure_twice(fingerprints):
+            return {'status': 'failed', 'ok': False, 'reason': 'same_failure_twice',
+                    'same_failure_twice': True, 'completed': completed}
+        attempt_number += 1
+        phase = 'fix'
+    return {'status': 'failed', 'ok': False, 'reason': None,
+            'same_failure_twice': False, 'completed': completed}
 
 
 def _scripted(spec):
@@ -153,19 +200,40 @@ class _Builder:
 
 
 class DurableJobTests(unittest.TestCase):
-    def test_fixture_outcomes_match_the_native_phase_rules(self):
-        self.assertEqual(len(_scenarios()), 20)
+    def test_fixture_outcomes_match_the_native_attempt_loop(self):
         for scenario in _scenarios():
             with self.subTest(scenario=scenario['name']):
+                expected = native_attempt_loop(scenario)
                 with tempfile.TemporaryDirectory() as tmp:
                     state = run_durable_job(
                         NativeOrchestrator(), _scripted(scenario['steps']),
                         thread_id=scenario['name'], db_path=str(Path(tmp) / 'job.sqlite'),
                         review=scenario['review'], max_retries=scenario['max_retries'],
                         passing=scenario['passing'], backend='sqlite')
-                self.assertEqual(state['status'], scenario['status'])
-                self.assertEqual(state['ok'], scenario['ok'])
-                self.assertEqual(state['completed'], scenario['completed'])
+                self.assertEqual(state['status'], expected['status'])
+                self.assertEqual(state['ok'], expected['ok'])
+                self.assertEqual(state.get('reason'), expected['reason'])
+                self.assertEqual(bool(state.get('same_failure_twice')), expected['same_failure_twice'])
+                self.assertEqual(state['completed'], expected['completed'])
+
+    def test_worker_failure_and_no_change_fail_without_tests(self):
+        names = ('worker-failed-tests-would-pass', 'no-change-tests-would-pass')
+        for scenario in _scenarios():
+            if scenario['name'] not in names:
+                continue
+            with self.subTest(scenario=scenario['name']):
+                expected = native_attempt_loop(scenario)
+                self.assertEqual(expected['status'], 'failed')
+                self.assertNotIn('test', expected['completed'])
+                with tempfile.TemporaryDirectory() as tmp:
+                    state = run_durable_job(
+                        NativeOrchestrator(), _scripted(scenario['steps']),
+                        thread_id=scenario['name'], db_path=str(Path(tmp) / 'job.sqlite'),
+                        review=scenario['review'], max_retries=scenario['max_retries'],
+                        passing=scenario['passing'], backend='sqlite')
+                self.assertEqual(state['status'], 'failed')
+                self.assertNotIn('test', state['completed'])
+                self.assertEqual(state['completed'], expected['completed'])
 
     def test_nodes_call_the_adapter_hooks(self):
         adapter = mock.Mock(wraps=NativeOrchestrator())
@@ -181,8 +249,12 @@ class DurableJobTests(unittest.TestCase):
         install_graph(builder, {name: lambda state: state for name in NODES}, 'start', END)
         self.assertEqual(builder.nodes, list(NODES))
         self.assertEqual(builder.edges, [
-            ('start', 'plan'), ('plan', 'dispatch'), ('dispatch', 'test'), ('fix', 'test'), ('judge', END)])
-        self.assertEqual(builder.conditional, [('test', {'judge': 'judge', 'fix': 'fix', 'end': END})])
+            ('start', 'plan'), ('plan', 'dispatch'), ('judge', END)])
+        self.assertEqual(builder.conditional, [
+            ('dispatch', {'test': 'test', 'fix': 'fix', 'end': END}),
+            ('test', {'judge': 'judge', 'fix': 'fix', 'end': END}),
+            ('fix', {'test': 'test', 'fix': 'fix', 'end': END}),
+        ])
 
     def test_same_failure_stops_before_another_fix(self):
         scenario = next(item for item in _scenarios() if item['name'] == 'same-failure-high-cap')
@@ -200,7 +272,9 @@ class DurableJobTests(unittest.TestCase):
             state = run_durable_job(
                 NativeOrchestrator(), wrapped, thread_id='cap', db_path=str(Path(tmp) / 'job.sqlite'),
                 review=True, max_retries=5, backend='sqlite')
-        self.assertEqual(state['status'], 'same_failure_twice')
+        self.assertEqual(state['status'], 'failed')
+        self.assertEqual(state['reason'], 'same_failure_twice')
+        self.assertTrue(state['same_failure_twice'])
         self.assertEqual(calls.count('fix'), 1)
         self.assertNotIn('judge', calls)
 
@@ -212,7 +286,7 @@ class DurableJobTests(unittest.TestCase):
             flag = base / 'kill.flag'
             script = json.dumps({
                 'plan': [{}],
-                'dispatch': [{'ok': True, 'worker': 'codex'}],
+                'dispatch': [{'ok': True, 'changed': True, 'worker': 'codex'}],
                 'test': [{'status': 'passed'}],
                 'fix': [],
                 'judge': [{'verdict': 'approve'}],

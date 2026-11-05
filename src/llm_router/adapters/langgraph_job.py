@@ -48,25 +48,34 @@ def run_durable_job(adapter, steps, *, thread_id, db_path, review=True, max_retr
 
 def install_graph(builder, nodes, start, end):
     """Add the DLR phase nodes and edges to a graph builder. Used by LangGraph and tests."""
+    worker_routes = {'test': 'test', 'fix': 'fix', 'end': end}
     for name in NODES:
         builder.add_node(name, nodes[name])
     builder.add_edge(start, 'plan')
     builder.add_edge('plan', 'dispatch')
-    builder.add_edge('dispatch', 'test')
+    builder.add_conditional_edges('dispatch', route_after_worker, worker_routes)
     builder.add_conditional_edges('test', route_after_test, {'judge': 'judge', 'fix': 'fix', 'end': end})
-    builder.add_edge('fix', 'test')
+    builder.add_conditional_edges('fix', route_after_worker, worker_routes)
     builder.add_edge('judge', end)
     return builder
 
 
-def route_after_test(state):
-    """judge, fix, or end. Same-failure-twice stops the loop before another fix."""
-    passing = tuple(state.get('passing') or ('passed',))
-    if state.get('tests_status') in passing:
-        return 'judge' if state.get('review') else END
-    if retry_feedback.same_failure_twice(state.get('fingerprints') or []):
+def route_after_worker(state):
+    """Test only after a worker run that succeeded and changed files. Otherwise retry or stop."""
+    if state.get('status') == 'failed':
         return END
-    if int(state.get('attempt') or 0) > int(state.get('max_retries') if state.get('max_retries') is not None else 0):
+    worker = state.get('worker_result') or {}
+    if worker.get('ok') and worker.get('changed'):
+        return 'test'
+    return 'fix'
+
+
+def route_after_test(state):
+    """judge, fix, or end. A failed status already applied the retry cap or same-failure stop."""
+    passing = tuple(state.get('passing') or ('passed',))
+    if state.get('ok') and state.get('tests_status') in passing:
+        return 'judge' if state.get('review') else END
+    if state.get('status') == 'failed':
         return END
     return 'fix'
 
@@ -81,8 +90,11 @@ def _initial(review, max_retries, passing):
         'passing': list(passing),
         'status': 'running',
         'ok': False,
+        'reason': None,
+        'same_failure_twice': False,
         'tests_status': None,
         'result': {},
+        'worker_result': {},
         'next': 'plan',
     }
 
@@ -110,32 +122,27 @@ def _apply(name, state, result):
         'result': result,
         'completed': [*list(state.get('completed') or []), name],
     }
-    if name == 'dispatch':
+    if name in ('dispatch', 'fix'):
         update['attempt'] = int(state.get('attempt') or 0) + 1
-    elif name == 'fix':
-        update['attempt'] = int(state.get('attempt') or 0) + 1
-    if name == 'test':
+        update['worker_result'] = result
         merged = {**state, **update}
+        if result.get('ok') and result.get('changed'):
+            update['status'] = 'running'
+        else:
+            # Native job_dispatch leaves tests at not_run unless the worker succeeded and changed files.
+            update.update(_failure_update(merged, {'status': 'not_run'}, result))
+    elif name == 'test':
         status = result.get('status') or result.get('tests_status') or 'failed'
-        passing = tuple(merged.get('passing') or ('passed',))
+        passing = tuple(state.get('passing') or ('passed',))
         update['tests_status'] = status
         if status in passing:
             update['status'] = 'passed'
             update['ok'] = True
+            update['reason'] = None
         else:
-            fingerprint = retry_feedback.failure_fingerprint(
-                result, {'ok': bool(result.get('ok', True)), 'runs': result.get('runs') or []})
-            fingerprints = [*list(state.get('fingerprints') or []), fingerprint]
-            update['fingerprints'] = fingerprints
-            if retry_feedback.same_failure_twice(fingerprints):
-                update['status'] = 'same_failure_twice'
-                update['ok'] = False
-            elif int(merged.get('attempt') or 0) > int(merged.get('max_retries') or 0):
-                update['status'] = 'failed'
-                update['ok'] = False
-            else:
-                update['status'] = 'retry'
-                update['ok'] = False
+            worker = state.get('worker_result') or {}
+            noted = dict(result, status=status)
+            update.update(_failure_update(state, noted, worker))
     elif name == 'judge':
         if result.get('verdict') == 'reject':
             update['status'] = 'review_rejected'
@@ -146,11 +153,37 @@ def _apply(name, state, result):
     return update
 
 
+def _failure_update(state, tests, worker):
+    """Fingerprint this cycle and stop on same-failure-twice or the native retry cap."""
+    fingerprint = retry_feedback.failure_fingerprint(
+        tests, {'ok': bool(worker.get('ok')), 'runs': worker.get('runs') or []})
+    fingerprints = [*list(state.get('fingerprints') or []), fingerprint]
+    update = {
+        'fingerprints': fingerprints,
+        'tests_status': tests.get('status') or 'not_run',
+        'ok': False,
+        'same_failure_twice': False,
+        'reason': None,
+    }
+    attempt = int(state.get('attempt') or 0)
+    limit = state.get('max_retries')
+    limit = int(limit) if limit is not None else 0
+    if retry_feedback.same_failure_twice(fingerprints):
+        update['status'] = 'failed'
+        update['reason'] = 'same_failure_twice'
+        update['same_failure_twice'] = True
+    elif attempt > limit:
+        update['status'] = 'failed'
+    else:
+        update['status'] = 'retry'
+    return update
+
+
 def _next_node(node, state):
     if node == 'plan':
         return 'dispatch'
     if node in ('dispatch', 'fix'):
-        return 'test'
+        return route_after_worker(state)
     if node == 'test':
         return route_after_test(state)
     return END
@@ -249,6 +282,9 @@ def _schema():
         ok: bool
         tests_status: str
         result: dict
+        worker_result: dict
+        reason: str
+        same_failure_twice: bool
 
     return JobState
 
