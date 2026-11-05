@@ -245,8 +245,8 @@ class GateTests(unittest.TestCase):
         approved = spans[0]
         self.assertEqual(approved['worker'], 'codex')
         self.assertEqual(approved['model'], 'codex')
-        self.assertEqual(approved['tokens'], 1000)
-        self.assertEqual(approved['cost_estimate'], 0.0015)
+        self.assertIsNone(approved['tokens'])
+        self.assertIsNone(approved['cost_estimate'])
         self.assertEqual(approved['task_class'], 'feature')
         started = datetime.fromisoformat(approved['started_at'])
         finished = datetime.fromisoformat(approved['finished_at'])

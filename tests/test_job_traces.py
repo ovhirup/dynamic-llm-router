@@ -33,7 +33,8 @@ class PhaseSpanTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
         self.policy = _policy(self.base)
-        self.summary = {'job_id': 'job-1', 'task_class': 'feature', 'workers': ['codex'], 'warnings': []}
+        self.summary = {'job_id': 'job-1', 'task_class': 'feature', 'workers': ['codex'],
+                        'tokens': 9999, 'warnings': []}
 
     def spans(self):
         return traces.load_trace(self.policy, 'job-1')
@@ -73,10 +74,22 @@ class PhaseSpanTests(unittest.TestCase):
         self.assertEqual(by_name['judge']['exit_status'], 'approve')
         self.assertEqual(by_name['fix']['exit_status'], 'error')
         self.assertEqual(by_name['fix']['status'], 'failed')
+        self.assertIsNone(by_name['fix']['tokens'])
+        self.assertIsNone(by_name['fix']['cost_estimate'])
+        for name in ('plan', 'test', 'judge', 'approval_wait'):
+            self.assertIsNone(by_name[name]['tokens'], name)
+            self.assertIsNone(by_name[name]['cost_estimate'], name)
         self.assertEqual(by_name['approval_wait']['exit_status'], 'approved')
         self.assertEqual(by_name['approval_wait']['worker'], 'codex')
-        self.assertEqual(by_name['approval_wait']['tokens'], 1000)
-        self.assertEqual(by_name['approval_wait']['cost_estimate'], 0.0015)
+
+    def test_fix_tokens_come_from_the_run_task_result(self):
+        from llm_router.adapters.tracing import estimate_cost
+        adapter = TracingOrchestrator(self.policy, self.summary)
+        adapter.fix(lambda: {'worker': 'codex', 'status': 'ok', 'attempts': [{'tokens': 20}]})
+        span = self.spans()[-1]
+        self.assertEqual(span['name'], 'fix')
+        self.assertEqual(span['tokens'], 20)
+        self.assertEqual(span['cost_estimate'], estimate_cost('codex', 20))
 
     def test_span_text_is_redacted_and_the_leak_gate_is_clean(self):
         secret = 'sk-' + 't' * 30
@@ -127,6 +140,7 @@ class TraceReportTests(unittest.TestCase):
         self.span('job-bug', 'test', 'grok-build', 'bugfix', 10, 1.0)
         self.span('job-old', 'dispatch', 'stale', 'feature', 9, 9.0, started=self.now - timedelta(days=30))
         self.span('job-wait', 'approval_wait', 'paused', 'feature', 0, 0.0, exit_status='pending')
+        self.span('job-owner', 'approval_wait', 'codex', 'feature', 500, 9.0, exit_status='approved')
 
         report = traces.report_traces(self.policy, '7d', now=self.now)
         text = report['text']
@@ -138,6 +152,10 @@ class TraceReportTests(unittest.TestCase):
         self.assertIn(
             'worker=grok-build task_class=bugfix p50_latency_s=10.000 p95_latency_s=10.000 '
             'p50_cost=1.000000 p95_cost=1.000000',
+            text)
+        self.assertIn(
+            'worker=codex task_class=feature phase=approval_wait p50_latency_s=500.000 '
+            'p95_latency_s=500.000 p50_cost=9.000000 p95_cost=9.000000',
             text)
         self.assertNotIn('worker=stale', text)
         self.assertNotIn('worker=paused', text)
@@ -266,6 +284,21 @@ class JobPhaseTraceTests(unittest.TestCase):
         self.assertEqual(waiting['exit_status'], 'pending')
         raw = traces.trace_path(self.policy, result['job_id']).read_text()
         self.assertEqual(traces.scan_trace_files(self.policy)['status'], 'clean', raw)
+
+    def test_worker_reported_tokens_land_on_the_dispatch_span_only(self):
+        from llm_router.adapters.tracing import estimate_cost
+        self.policy['run_job']['traces_dir'] = str(self.base / 'traces')
+        self.worker("import json; print(json.dumps({'tokens': 4321})); open('out.txt','w').write('hi\\n')")
+        result = self.job(test_cmd='test -f out.txt', task_class='feature')
+        self.assertTrue(result['ok'], result)
+        spans = traces.load_trace(self.policy, result['job_id'])
+        dispatch = next(span for span in spans if span['name'] == 'dispatch')
+        self.assertEqual(dispatch['tokens'], 4321)
+        self.assertEqual(dispatch['cost_estimate'], estimate_cost('codex', 4321))
+        for name in ('plan', 'test', 'judge', 'approval_wait'):
+            span = next(item for item in spans if item['name'] == name)
+            self.assertIsNone(span['tokens'], name)
+            self.assertIsNone(span['cost_estimate'], name)
 
 
 if __name__ == '__main__':

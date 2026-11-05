@@ -336,7 +336,7 @@ def _in_report(span, cutoff):
 
 
 def report_traces(policy, since, now=None):
-    """p50/p95 latency and cost per worker per task class for phase spans at or after `since`."""
+    """p50/p95 latency and cost per worker per task class. Approval wait is a separate phase."""
     cutoff = parse_since(since, now=now)
     groups = {}
     for span in iter_spans(policy):
@@ -347,17 +347,21 @@ def report_traces(policy, since, now=None):
         latency = (finished - started).total_seconds()
         worker = span.get('worker') or 'unknown'
         task_class = span.get('task_class') or 'unset'
-        bucket = groups.setdefault((str(worker), str(task_class)), {'latency': [], 'cost': []})
+        phase = span.get('name') if span.get('name') in PHASE_NAMES else span.get('kind')
+        # Owner wait is its own phase so it does not inflate worker p95.
+        group_phase = 'approval_wait' if phase == 'approval_wait' else ''
+        bucket = groups.setdefault((str(worker), str(task_class), group_phase), {'latency': [], 'cost': []})
         bucket['latency'].append(latency)
         cost = _metric(span.get('cost_estimate'))
         if cost is not None:
             bucket['cost'].append(float(cost))
     rows = []
-    for worker, task_class in sorted(groups):
-        bucket = groups[(worker, task_class)]
+    for worker, task_class, phase in sorted(groups):
+        bucket = groups[(worker, task_class, phase)]
         rows.append({
             'worker': worker,
             'task_class': task_class,
+            'phase': phase,
             'p50_latency_s': _format_metric(percentile(bucket['latency'], 50), 3),
             'p95_latency_s': _format_metric(percentile(bucket['latency'], 95), 3),
             'p50_cost': _format_metric(percentile(bucket['cost'], 50), 6),
@@ -367,7 +371,9 @@ def report_traces(policy, since, now=None):
     if not rows:
         lines.append('no spans')
     for row in rows:
+        phase = ' phase=approval_wait' if row['phase'] == 'approval_wait' else ''
         lines.append(
-            'worker={worker} task_class={task_class} p50_latency_s={p50_latency_s} '
-            'p95_latency_s={p95_latency_s} p50_cost={p50_cost} p95_cost={p95_cost}'.format(**row))
+            f"worker={row['worker']} task_class={row['task_class']}{phase} "
+            f"p50_latency_s={row['p50_latency_s']} p95_latency_s={row['p95_latency_s']} "
+            f"p50_cost={row['p50_cost']} p95_cost={row['p95_cost']}")
     return {'since': cutoff.isoformat(timespec='seconds'), 'rows': rows, 'text': '\n'.join(lines) + '\n'}

@@ -38,6 +38,7 @@ def _count(value):
 
 
 def _tokens_in(value):
+    """Tokens on a run_task result: top-level `tokens`, else each attempt record, else nested runs."""
     if not isinstance(value, dict):
         return None
     found = _count(value.get('tokens'))
@@ -46,6 +47,11 @@ def _tokens_in(value):
     total, seen = 0, False
     for attempt in value.get('attempts') or []:
         if not isinstance(attempt, dict):
+            continue
+        count = _count(attempt.get('tokens'))
+        if count is not None:
+            total += count
+            seen = True
             continue
         for run in attempt.get('runs') or []:
             if not isinstance(run, dict):
@@ -94,20 +100,25 @@ def _exit_status(result, error):
     return 'ok'
 
 
-def phase_attributes(policy, summary, result, error=None):
-    """worker, model, tokens, cost estimate, and exit status for one phase."""
+def phase_attributes(policy, summary, result, error=None, bill_usage=False):
+    """worker, model, tokens, cost estimate, and exit status for one phase.
+
+    Tokens and cost come only from a dispatch or fix `run_task` result. Plan, test, judge,
+    and approval wait do not inherit the job total.
+    """
     worker = _worker(summary, result)
-    tokens = _tokens_in(result)
-    if tokens is None:
-        tokens = _tokens_in(summary)
-    explicit = result.get('cost_estimate') if isinstance(result, dict) else None
-    if type(explicit) not in (int, float) or type(explicit) is bool:
-        explicit = estimate_cost(worker, tokens)
+    tokens = _tokens_in(result) if bill_usage else None
+    cost = None
+    if bill_usage:
+        explicit = result.get('cost_estimate') if isinstance(result, dict) else None
+        if type(explicit) not in (int, float) or type(explicit) is bool:
+            explicit = estimate_cost(worker, tokens)
+        cost = explicit
     return {
         'worker': worker,
         'model': _model(policy, worker, result),
         'tokens': tokens,
-        'cost_estimate': explicit,
+        'cost_estimate': cost,
         'exit_status': _exit_status(result, error),
         'task_class': (summary or {}).get('task_class'),
     }
@@ -139,7 +150,8 @@ class TracingOrchestrator:
 
     def _record(self, phase, started, finished, result, error):
         try:
-            attrs = phase_attributes(self.policy, self.summary, result, error)
+            attrs = phase_attributes(
+                self.policy, self.summary, result, error, bill_usage=phase in ('dispatch', 'fix'))
             job_id = self.summary.get('job_id') or 'job'
             span = traces.record_span(
                 self.policy, job_id, name=phase, kind=phase,
