@@ -233,7 +233,10 @@ every push and pull request with zero secrets required. See [CONTRIBUTING.md](CO
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Vendor CLIs are not bundled or redistributed.
+Copyright (C) 2026 Abhirup Banerjee. Licensed under the GNU Affero General Public License v3.0 only
+(AGPL-3.0-only), see [LICENSE](LICENSE) and [COPYRIGHT](COPYRIGHT). Contributions require agreeing to the
+[Contributor License Agreement](CLA.md), see [CONTRIBUTING.md](CONTRIBUTING.md). Vendor CLIs are not bundled or
+redistributed.
 
 ### Optional Stackwich verification
 
