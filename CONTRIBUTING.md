@@ -2,6 +2,20 @@
 
 Thanks for helping. Small, focused pull requests are easiest to review.
 
+## Contributor License Agreement
+
+All contributions require agreeing to the [Contributor License Agreement](CLA.md) (CLA). You keep the copyright in
+your work; the CLA gives the maintainer, Abhirup Banerjee, a broad licence to use, sublicense and relicense it, so
+the project's licensing can stay flexible. The CLA is a template pending legal review.
+
+To agree, tick the CLA box in the pull request template, or post this comment on your pull request from the
+GitHub account that authored the commits:
+
+> I have read the CLA and agree.
+
+Pull requests without this statement will not be merged. Agreeing once covers later pull requests from the same
+account unless the CLA changes. DLR is licensed under AGPL-3.0-only, see [LICENSE](LICENSE) and [COPYRIGHT](COPYRIGHT).
+
 ## Setup
 
 ```bash

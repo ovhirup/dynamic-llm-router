@@ -1,0 +1,20 @@
+Dynamic LLM Router (DLR)
+Copyright (C) 2026 Abhirup Banerjee
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License, version 3 only
+(SPDX-License-Identifier: AGPL-3.0-only), as published by the Free Software
+Foundation. The full licence text is in the LICENSE file.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+details.
+
+Contributions are accepted under the Individual Contributor License Agreement
+in CLA.md. Contributors keep the copyright in their own contributions.
+
+Third-party material:
+- src/llm_router/templates/supervisor_skill.md is adapted from `babysit-runs`
+  in https://github.com/swyxio/skills (MIT License, Copyright (c) swyx). The
+  attribution notice in that file must be kept.
