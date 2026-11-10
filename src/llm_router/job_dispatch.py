@@ -53,6 +53,44 @@ def _job_review_packet(summary, worktree, paths):
                       'returncode': tests.get('returncode'), 'tail': tests.get('tail') or ''}}
 
 
+def record_review(job_id, verdict, notes='', reviewer=DEFAULT_REVIEWER, policy=None):
+    """Record an out-of-band verdict on a run-job. Merge-queue `units review --verdict` is unchanged.
+
+    Notes use the same redaction as a parsed batch verdict. A reject fails the job.
+    """
+    policy = policy or config.load_policy()
+    if verdict not in ('approve', 'reject'):
+        raise Refused('verdict must be approve or reject')
+    if not reviewer:
+        raise Refused('reviewer identity is required')
+    if not re.fullmatch(r'[A-Za-z0-9._-]+', job_id or ''):
+        raise Refused('invalid job id')
+    path = _path(policy, 'jobs_dir', 'logs/jobs') / f'{job_id}.json'
+    try:
+        job = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise Refused(f'no run-job record for {job_id}') from None
+    except json.JSONDecodeError:
+        raise Refused(f'job {job_id} record is unreadable') from None
+    with RepoLock(_path(policy, 'lock_dir', 'logs/locks'), Path(job.get('repo') or '.')):
+        job = json.loads(path.read_text())
+        if job.get('review_required') is not True:
+            raise Refused(f'job {job_id} does not require a stronger-model review')
+        review = dict(job.get('review') or {})
+        if review.get('status') != 'pending':
+            raise Refused(f'job {job_id} review is {review.get("status")}, not pending')
+        if not job.get('commit'):
+            raise Refused(f'job {job_id} has no commit to bind the verdict to')
+        review.update(status='recorded', verdict=verdict, reviewer=reviewer,
+                      notes=security.redact((notes or '').strip()[-4000:]), head=job['commit'])
+        job['review'] = review
+        if verdict == 'reject':
+            job['ok'] = False
+            job['status'] = 'review_rejected'
+        path.write_text(json.dumps(job, indent=2))
+    return job
+
+
 def _job_review_record(report, prompt_path):
     """Store a batch-review report on the job. A verdict is stored only when one was actually parsed."""
     tried = []
@@ -88,7 +126,11 @@ def _stronger_review(summary, worktree, paths, reviewer, policy):
         return {'status': 'error', 'reviewer': getattr(reviewer, '__name__', 'reviewer'),
                 'prompt_file': None if prompt_path is None else str(prompt_path),
                 'notes': f'{type(error).__name__}: {security.redact(str(error))[:300]}'}
-    return _job_review_record(report, prompt_path)
+    review = _job_review_record(report, prompt_path)
+    if review.get('status') == 'pending' and review.get('reviewer') == DEFAULT_REVIEWER:
+        review['next'] = (f'record the verdict: jobs --job {summary["job_id"]} '
+                          f'--verdict approve|reject --reviewer {DEFAULT_REVIEWER}')
+    return review
 
 
 _SCOPE_HEADING = re.compile(r'^\s*#{1,6}\s*(?:allowed\s+(?:paths|files)|scope)\s*:?\s*$', re.I)
@@ -1065,6 +1107,31 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
             summary['status'] = 'review_rejected'
 
 
+def _retain_pending_packet(policy, summary):
+    """Copy a pending Grok Bot packet out of the worktree before that worktree is removed.
+
+    Returns False when a pending packet could not be kept, so the caller must not prune.
+    Returns None when there is no pending Grok Bot packet to preserve.
+    """
+    review = summary.get('review') or {}
+    if review.get('status') != 'pending' or review.get('reviewer') != DEFAULT_REVIEWER:
+        return None
+    source = Path(review.get('prompt_file') or '')
+    if source.is_symlink() or not source.is_file():
+        summary['warnings'].append('pending Grok Bot review packet is missing; worktree left in place')
+        return False
+    dest_dir = _path(policy, 'jobs_dir', 'logs/jobs')
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f'{summary["job_id"]}-review-prompt.md'
+    if source.resolve() != dest.resolve():
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(source.read_text())
+        os.chmod(dest, 0o600)
+    review['prompt_file'] = str(dest)
+    return True
+
+
 def _finish(policy, summary, repo, worktree, branch, base_sha, keep):
     if summary['status'] is None:
         summary['status'] = 'failed'
@@ -1072,6 +1139,9 @@ def _finish(policy, summary, repo, worktree, branch, base_sha, keep):
     leak = summary['blocked_by_leak_check']
     blocked = summary['status'] in ('blocked_by_stackwich', 'no_tests', 'review_rejected')
     prune = keep is False or (keep is None and not success and not leak and not blocked)
+    if prune and _retain_pending_packet(policy, summary) is False:
+        prune = False
+        summary['warnings'].append('pending Grok Bot review: worktree kept so the packet stays reachable')
     if summary['status'] == 'blocked_by_stackwich' and keep is None:
         summary['warnings'].append('Stackwich blocked: worktree kept for review')
     if leak and keep is None:
@@ -1152,6 +1222,15 @@ def cleanup(older_than, dry_run=False, policy=None, now=None):
         branch = _git(worktree, 'symbolic-ref', '-q', '--short', 'HEAD').stdout.strip()
         entry = {'worktree': str(worktree), 'branch': branch, 'branch_action': 'kept'}
         if not dry_run:
+            # A pending Grok Bot packet lives in the worktree git dir. Keep a copy, and point the
+            # job record at it, before the worktree and that git dir go away.
+            kept = _retain_pending_packet(policy, job) if job else None
+            if kept is False:
+                report['skipped'].append({'worktree': str(worktree), 'why': 'pending review packet missing'})
+                continue
+            if kept is True:
+                (_path(policy, 'jobs_dir', 'logs/jobs') / f'{job["job_id"]}.json').write_text(
+                    json.dumps(job, indent=2))
             # --force only discards the job's own recorded test artifacts and untracked interpreter caches
             # (changed_paths hides those, so git still sees them as dirty); both were checked above.
             force = bool(pending) or _has_changes(worktree)

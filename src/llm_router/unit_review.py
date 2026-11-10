@@ -99,6 +99,27 @@ def parse_verdict(text):
     return outputs.parse_json(text, outputs.UNIT_VERDICT_V1, outputs.MAX_UNIT_VERDICT_BYTES)
 
 
+def _stdout_from_task_log(raw):
+    """Stdout sections of a run_task log. A log with no sections is already the process output."""
+    if '--- stdout\n' not in raw:
+        return raw
+    chunks = []
+    for part in raw.split('--- stdout\n')[1:]:
+        chunks.append(part.split('\n--- stderr\n', 1)[0])
+    return '\n'.join(chunks)
+
+
+def review_output_text(raw):
+    """The reviewer text inside a run_task transcript.
+
+    Claude's command is stream-json, so the verdict is the last result event, the same extraction
+    batch review uses. Plain stdout is its own final text.
+    """
+    from . import claude_handoff
+    stdout = _stdout_from_task_log(raw or '')
+    return claude_handoff.inspect(stdout).get('text') or ''
+
+
 def _write_prompt(worktree, prompt):
     """Prompt file under the worktree's git dir, so it never shows up as a change in the unit."""
     git_dir = Path(_git(worktree, 'rev-parse', '--absolute-git-dir', check=True).stdout.strip())
@@ -127,6 +148,10 @@ def default_reviewer(name, packet, prompt, policy):
                                          policy=policy, runner=capture_stdout)
     except task_dispatch.Refused as refusal:
         return {'status': 'unavailable', 'reason': str(refusal)}
+    except OSError as error:
+        # A configured Claude whose executable is missing is unavailable, same as a meter refusal.
+        return {'status': 'unavailable',
+                'reason': security.redact(f'{type(error).__name__}: {error}')[:300]}
     text = output.get('text', '')
     if not summary.get('ok'):
         return {'status': 'unavailable', 'reason': summary.get('reason') or 'reviewer run failed', 'text': text}

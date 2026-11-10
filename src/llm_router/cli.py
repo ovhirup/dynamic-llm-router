@@ -97,10 +97,17 @@ def build_parser():
     dispatch_keep.add_argument('--keep', action='store_true', help='keep the worktree even on failure')
     dispatch_keep.add_argument('--prune', action='store_true', help='remove the worktree even on success')
 
-    jobs = commands.add_parser('jobs', help='List recent run-job jobs and worktrees')
+    jobs = commands.add_parser('jobs', help='List recent run-job jobs and worktrees, or record an out-of-band '
+                                'verdict on one job')
     jobs.add_argument('--limit', type=int, default=20)
     jobs.add_argument('--live-feed', action='store_true',
                       help='emit the live jobs feed (running, 30m recent, history, 3-line redacted log preview)')
+    jobs.add_argument('--job', help='run-job id when recording an out-of-band verdict')
+    jobs.add_argument('--verdict', choices=('approve', 'reject'),
+                      help='record this verdict on --job (for example a returned Grok Bot review); '
+                           'does not record a merge-queue verdict')
+    jobs.add_argument('--reviewer', help='reviewer identity stored on the job (default: grok-bot)')
+    jobs.add_argument('--notes', default='', help='verdict notes; redacted the same way as batch review')
     clean = commands.add_parser('cleanup', help='Remove old router worktrees')
     clean.add_argument('--older-than', required=True, help='age like 30m, 12h or 7d')
     clean.add_argument('--dry-run', action='store_true')
@@ -772,7 +779,12 @@ def main(argv=None):
                 if 'worker_override' in overrides:
                     result['worker_override'] = overrides['worker_override']
             elif args.command == 'jobs':
-                if getattr(args, 'live_feed', False):
+                if args.verdict:
+                    if not args.job:
+                        raise job_dispatch.Refused('--verdict needs --job')
+                    result = job_dispatch.record_review(args.job, args.verdict, notes=args.notes,
+                                                        reviewer=args.reviewer or 'grok-bot', policy=policy)
+                elif getattr(args, 'live_feed', False):
                     from . import live_jobs_feed
                     result = live_jobs_feed.build_live_jobs_feed(policy=policy)
                 else:
