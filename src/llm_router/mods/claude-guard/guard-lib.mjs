@@ -336,30 +336,58 @@ function ansiC(body) {
   return out;
 }
 
-// Splits a command line into simple commands (arrays of unquoted words). Separators: newline ; & | ( ) < >.
-// Braces stay in the word (brace expansion is checked by rm/glob rules). Line continuations are joined, quotes,
-// $'...' (ANSI-C, decoded) and $"..." and backslashes removed. $(...), `...` and <(...) bodies are returned as nested
-// scripts and leave a "$" in the word, so a target built from them is never treated as resolvable.
+// Splits a command line into simple commands (arrays of unquoted words). Separators: newline ; & | ( ).
+// A redirection (< > >> <> >& &> &>> >| and an fd prefix such as 2>) does not end the command and its target is
+// not an operand: targets come back in `redirects`, parallel to `commands`. Braces stay in the word (brace
+// expansion is checked by rm/glob rules). Line continuations are joined, quotes, $'...' (ANSI-C, decoded) and
+// $"..." and backslashes removed. $(...), `...` and <(...) bodies are returned as nested scripts and leave a "$"
+// in the word, so a target built from them is never treated as resolvable.
 export function parseShell(script) {
   const commands = [];
   const nested = [];
+  const redirects = [];
   let words = [];
   let word = null;
+  let pendingRedirects = [];
+  let takingRedirect = false;
   const src = String(script ?? "").replace(/\\\r?\n/g, "");
   const endWord = () => {
-    if (word !== null) words.push(word);
+    if (word !== null) {
+      if (takingRedirect) {
+        pendingRedirects.push(word);
+        takingRedirect = false;
+      } else words.push(word);
+    }
     word = null;
   };
   const piped = [];  // piped[n]: a "|" came anywhere before commands[n]
   let pipeSeen = false;
   const endCommand = (separator) => {
     endWord();
-    if (words.length) {
+    if (words.length || pendingRedirects.length) {
       commands.push(words);
       piped.push(pipeSeen);
+      redirects.push(pendingRedirects);
     }
     words = [];
+    pendingRedirects = [];
+    takingRedirect = false;
     if (separator === "|") pipeSeen = true;
+  };
+  // Index after a redirection operator starting at `at`, or null when src[at] is not one.
+  const consumeRedirect = (at) => {
+    if (src.startsWith("&>>", at)) return at + 3;
+    if (src.startsWith("&>", at)) return at + 2;
+    if (at >= src.length || (src[at] !== "<" && src[at] !== ">")) return null;
+    let j = at + 1;
+    if (src[at] === ">") {
+      if (src[j] === ">") j++;  // >>
+      else if (src[j] === "&" || src[j] === "|") j++;  // >& >|
+    } else if (src[j] === "<") {  // << <<- <<<
+      j++;
+      if (src[j] === "<" || src[j] === "-") j++;
+    } else if (src[j] === ">" || src[j] === "&") j++;  // <> <&
+    return j;
   };
   const add = (text) => {
     word = (word ?? "") + text;
@@ -429,16 +457,27 @@ export function parseShell(script) {
     } else if (ch === "|" && src[i + 1] === "|") {
       endCommand("||");
       i += 2;
-    } else if ("\n;&|()<>".includes(ch)) {
-      endCommand(ch);
-      i++;
     } else {
-      add(ch);
-      i++;
+      const opEnd = consumeRedirect(i);
+      if (opEnd !== null && !(ch === "<" && src[i + 1] === "(")) {
+        // A digit glued to the operator (`2>file`) is its file descriptor. A digit that is already the target
+        // of a redirect (`>2>file`) is a filename and stays with the redirect it belongs to.
+        if (takingRedirect && word !== null) endWord();
+        else if (ch !== "&" && word !== null && /^\d+$/.test(word)) word = null;
+        else endWord();
+        takingRedirect = true;
+        i = opEnd;
+      } else if ("\n;&|()".includes(ch)) {
+        endCommand(ch);
+        i++;
+      } else {
+        add(ch);
+        i++;
+      }
     }
   }
   endCommand();
-  return { commands, nested, piped };
+  return { commands, nested, piped, redirects };
 }
 
 function stripPrefix(words) {
@@ -595,18 +634,23 @@ function checkScript(script, root, cwd, depth = 0) {
   if (FORBIDDEN_GIT.test(String(script).replace(/\\\r?\n/g, " ").replace(/\s+/g, " "))) {
     return "blocked destructive git/gh command in headless Claude job";
   }
-  const { commands, nested, piped } = parseShell(script);
+  const { commands, nested, piped, redirects } = parseShell(script);
   for (const inner of nested) {
     const why = checkScript(inner, root, cwd, depth + 1);
     if (why) return why;
   }
   let moved = false;  // after cd/pushd/popd a relative path no longer resolves against the hook's cwd
+  const scan = (text) => {
+    for (const piece of text.split("=")) {
+      const found = forbiddenPath(piece, cwd) || forbiddenWildcard(piece, cwd);
+      if (found) return found;
+    }
+    return null;
+  };
   for (const [index, raw] of commands.entries()) {
-    for (const word of raw) {
-      for (const piece of word.split("=")) {
-        const why = forbiddenPath(piece, cwd) || forbiddenWildcard(piece, cwd);
-        if (why) return why;
-      }
+    for (const word of raw.concat(redirects[index])) {
+      const why = scan(word);
+      if (why) return why;
     }
     // Wrappers and keywords can put a command anywhere in the word list (nice -n 5 rm, then rm, xargs rm, ! rm),
     // so shells, eval, rm and recursive readers are recognised at every position, not only the first.

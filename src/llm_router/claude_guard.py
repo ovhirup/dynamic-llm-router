@@ -404,11 +404,14 @@ def _ansi_c(body):
 
 
 def parse_shell(script):
-    """(commands, nested): simple commands as lists of unquoted words, split on newline ; & | ( ) < >, with line
-    continuations joined; braces stay in the word; $'...' (ANSI-C, decoded) and $"..." are strings; $(...), `...`
-    and <(...) bodies come back as nested scripts and leave a '$' in the word. Mirrors guard-lib.mjs parseShell."""
+    """(commands, nested, piped, redirects): simple commands as lists of unquoted words, split on newline ; & | ( ),
+    with line continuations joined. A redirection (`<` `>` `>>` `<>` `>&` `&>` `&>>` `>|` and an fd prefix such as
+    `2>`) does not end the command and its target is not an operand: targets come back in `redirects`, parallel to
+    `commands`. Braces stay in the word; $'...' (ANSI-C, decoded) and $"..." are strings; $(...), `...` and <(...)
+    bodies come back as nested scripts and leave a '$' in the word. Mirrors guard-lib.mjs parseShell."""
     src = re.sub(r'\\\r?\n', '', str(script if script is not None else ''))
-    commands, nested, words, word = [], [], [], None
+    commands, nested, redirects, words, word = [], [], [], [], None
+    pending_redirects, taking_redirect = [], False
     i, n = 0, len(src)
 
     def substitution(start):  # src[start] is the '(' of $( or <(
@@ -430,22 +433,49 @@ def parse_shell(script):
         return end + 1 if end >= 0 else n
 
     def end_word():
-        nonlocal word
+        nonlocal word, taking_redirect
         if word is not None:
-            words.append(word)
+            if taking_redirect:
+                pending_redirects.append(word)
+                taking_redirect = False
+            else:
+                words.append(word)
         word = None
 
     piped, pipe_seen = [], False  # piped[n]: a '|' came anywhere before commands[n]
 
     def end_command(separator=None):
-        nonlocal words, pipe_seen
+        nonlocal words, pipe_seen, pending_redirects, taking_redirect
         end_word()
-        if words:
+        if words or pending_redirects:
             commands.append(words)
             piped.append(pipe_seen)
-        words = []
+            redirects.append(list(pending_redirects))
+        words, pending_redirects, taking_redirect = [], [], False
         if separator == '|':
             pipe_seen = True
+
+    def consume_redirect(at):
+        """Index after a redirection operator starting at `at`, or None when `src[at]` is not one."""
+        if src.startswith('&>>', at):
+            return at + 3
+        if src.startswith('&>', at):
+            return at + 2
+        if at >= n or src[at] not in '<>':
+            return None
+        j = at + 1
+        if src[at] == '>':
+            if j < n and src[j] == '>':  # >>
+                j += 1
+            elif j < n and src[j] in '&|':  # >& >|
+                j += 1
+        elif j < n and src[j] == '<':  # << <<- <<<
+            j += 1
+            if j < n and src[j] in '<-':
+                j += 1
+        elif j < n and src[j] in '>&':  # <> <&
+            j += 1
+        return j
 
     while i < n:
         ch = src[i]
@@ -493,14 +523,25 @@ def parse_shell(script):
         elif ch == '|' and src[i + 1:i + 2] == '|':
             end_command('||')
             i += 2
-        elif ch in '\n;&|()<>':
+        elif (op_end := consume_redirect(i)) is not None and not (ch == '<' and src[i + 1:i + 2] == '('):
+            # A digit glued to the operator (`2>file`) is its file descriptor. A digit that is already the target
+            # of a redirect (`>2>file`) is a filename and stays with the redirect it belongs to.
+            if taking_redirect and word is not None:
+                end_word()
+            elif ch != '&' and word is not None and word.isdigit():
+                word = None
+            else:
+                end_word()
+            taking_redirect = True
+            i = op_end
+        elif ch in '\n;&|()':
             end_command(ch)
             i += 1
         else:
             word = (word or '') + ch
             i += 1
     end_command()
-    return commands, nested, piped
+    return commands, nested, piped, redirects
 
 
 def _strip_prefix(words):
@@ -673,18 +714,25 @@ def _check_script(script, root, cwd, depth=0):
         return 'blocked deeply nested shell command'
     if FORBIDDEN_GIT_RE.search(re.sub(r'\s+', ' ', re.sub(r'\\\r?\n', ' ', str(script)))):
         return 'blocked destructive git/gh command in headless Claude job'
-    commands, nested, piped = parse_shell(script)
+    commands, nested, piped, redirects = parse_shell(script)
     for inner in nested:
         why = _check_script(inner, root, cwd, depth + 1)
         if why:
             return why
     moved = False  # after cd/pushd/popd a relative path no longer resolves against the hook's cwd
+
+    def scan(text):
+        for piece in text.split('='):
+            why = forbidden_path(piece, cwd) or _forbidden_wildcard(piece, cwd)
+            if why:
+                return why
+        return None
+
     for index, raw in enumerate(commands):
-        for word in raw:
-            for piece in word.split('='):
-                why = forbidden_path(piece, cwd) or _forbidden_wildcard(piece, cwd)
-                if why:
-                    return why
+        for word in list(raw) + redirects[index]:
+            why = scan(word)
+            if why:
+                return why
         # Wrappers and keywords can put a command anywhere (nice -n 5 rm, then rm, xargs rm, ! rm), so shells, eval,
         # rm and recursive readers are recognised at every position, not only the first.
         for k, word in enumerate(raw):
