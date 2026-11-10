@@ -13,6 +13,7 @@ const SHELL_KEYWORDS = new Set(["if", "then", "else", "elif", "fi", "while", "un
 const SUBSHELL = "\0(";  // a (...) group: its cd must not change the parent command's directory
 const GLOB_CHARS = /[*?[{]/;
 const GLOB_LIMIT = 20000;
+const BRACE_LIMIT = 256;
 const SEARCH_LIMIT = 20000;
 const DOT_SECRETS = [".env", ".env.local", ".codex"];
 const FORBIDDEN_GIT = /\bgit\s+(?:\S+\s+)*push\b|\bgit\s+(?:\S+\s+)*reset\s+--hard\b|\bgit\s+(?:\S+\s+)*merge\b[^\n;|&]*\b(?:main|master)\b|\bgh\s+pr\s+merge\b|\bgh\s+pr\s+review\b[^\n;|&]*--approve\b/i;
@@ -171,6 +172,49 @@ function braceAlts(body) {
   return alts;
 }
 
+// Bash expands braces before it splits the word on '/'. The smallest brace that contains a comma is expanded
+// first, so {regular,{sub/shortcut,regular}} yields sub/shortcut rather than a broken pair of segments.
+function expandableBrace(text) {
+  let best = null;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== "{") continue;
+    const end = braceEnd(text, i);
+    if (end < 0) continue;
+    const alts = braceAlts(text.slice(i + 1, end));
+    if (alts.length < 2) continue;
+    const span = end - i;
+    if (!best || span < best.span) best = { start: i, end, span, alts };
+  }
+  return best;
+}
+
+function expandBraces(text) {
+  const found = expandableBrace(text);
+  if (!found) return [text];
+  const out = [];
+  for (const alt of found.alts) {
+    const parts = expandBraces(text.slice(0, found.start) + alt + text.slice(found.end + 1));
+    if (parts === null) return null;
+    for (const part of parts) {
+      out.push(part);
+      if (out.length > BRACE_LIMIT) return null;
+    }
+  }
+  return out;
+}
+
+// A symlink is followed before '..' is applied, matching the kernel: escape/.. leaves from escape's target.
+function followLink(target) {
+  if (lstatOrNull(target)?.isSymbolicLink()) {
+    try {
+      return fs.realpathSync(target);
+    } catch {
+      return null;
+    }
+  }
+  return target;
+}
+
 // One glob segment as an anchored regex: * ? [..] [!..] {a,b} and nested {a,{b,c}}; dotfiles match like any name.
 export function globRegex(segment) {
   let out = "";
@@ -206,6 +250,15 @@ export function globRegex(segment) {
 export function forbiddenGlob(raw) {
   const text = expandHome(String(raw ?? "").trim()).toLowerCase().replace(/\\/g, "/");
   if (!text) return null;
+  const pieces = expandBraces(text);
+  if (pieces === null) return `blocked glob too broad to check: ${raw}`;
+  if (pieces.length !== 1 || pieces[0] !== text) {
+    for (const piece of pieces) {
+      const why = forbiddenGlob(piece);
+      if (why) return why;
+    }
+    return null;
+  }
   if (/\.config\/llm-router/.test(text)) return "blocked pattern naming ~/.config/llm-router";
   const segments = text.split("/");
   for (let k = 0; k < segments.length; k++) {
@@ -241,13 +294,33 @@ function descendants(root) {
 }
 
 // Expand a glob against the filesystem segment by segment ("**" = any depth); {overflow: true} past GLOB_LIMIT.
+// Braces are expanded before the word is split on '/', and an existing symlink is resolved before '..'.
 export function expandGlob(word, cwd) {
   const expanded = expandHome(String(word));
+  const pieces = expandBraces(expanded);
+  if (pieces === null) return { overflow: true, matches: [] };
+  if (pieces.length !== 1 || pieces[0] !== expanded) {
+    const matches = [];
+    for (const piece of pieces) {
+      const got = expandGlob(piece, cwd);
+      if (got.overflow) return got;
+      matches.push(...got.matches);
+      if (matches.length > GLOB_LIMIT) return { overflow: true, matches: [] };
+    }
+    return { overflow: false, matches };
+  }
   let current = [path.isAbsolute(expanded) ? "/" : path.resolve(String(cwd))];
   for (const segment of expanded.split("/")) {
     if (!segment || segment === ".") continue;
-    if (segment === "..") current = current.map((p) => path.dirname(p));
-    else if (segment === "**") {
+    if (segment === "..") {
+      const next = [];
+      for (const dir of current) {
+        const real = followLink(dir);
+        if (real === null) return { overflow: false, matches: [dir] };
+        next.push(path.dirname(real));
+      }
+      current = next;
+    } else if (segment === "**") {
       const next = [];
       for (const dir of current) {
         const below = descendants(dir);
@@ -256,8 +329,16 @@ export function expandGlob(word, cwd) {
         if (next.length > GLOB_LIMIT) return { overflow: true, matches: [] };
       }
       current = next;
-    } else if (!GLOB_CHARS.test(segment)) current = current.map((p) => path.join(p, segment));
-    else {
+    } else if (!GLOB_CHARS.test(segment)) {
+      const next = [];
+      for (const dir of current) {
+        const joined = path.join(dir, segment);
+        const real = followLink(joined);
+        if (real === null) return { overflow: false, matches: [joined] };
+        next.push(real);
+      }
+      current = next;
+    } else {
       const rx = globRegex(segment);
       const next = [];
       for (const dir of current) {

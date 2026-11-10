@@ -131,6 +131,7 @@ FIND_EXEC = {'-exec', '-execdir', '-ok', '-okdir'}
 GLOB_CHARS = re.compile(r'[*?[{]')
 ASSIGNMENT = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 GLOB_LIMIT = 20000
+BRACE_LIMIT = 256
 SEARCH_LIMIT = 20000
 DOT_SECRETS = ('.env', '.env.local', '.codex')
 
@@ -228,6 +229,52 @@ def _brace_alts(body):
     return alts
 
 
+def _expandable_brace(text):
+    """Smallest brace whose body has a comma. None when the text has nothing to expand."""
+    best = None
+    for i, ch in enumerate(text):
+        if ch != '{':
+            continue
+        end = _brace_end(text, i)
+        if end < 0:
+            continue
+        alts = _brace_alts(text[i + 1:end])
+        if len(alts) < 2:
+            continue
+        span = end - i
+        if best is None or span < best[0]:
+            best = (span, i, end, alts)
+    return None if best is None else best[1:]
+
+
+def _expand_braces(text):
+    """Bash brace expansion of the whole word, before '/' is treated as a separator. None past BRACE_LIMIT."""
+    found = _expandable_brace(text)
+    if found is None:
+        return [text]
+    start, end, alts = found
+    out = []
+    for alt in alts:
+        parts = _expand_braces(text[:start] + alt + text[end + 1:])
+        if parts is None:
+            return None
+        for part in parts:
+            out.append(part)
+            if len(out) > BRACE_LIMIT:
+                return None
+    return out
+
+
+def _follow_link(target):
+    """realpath of a symlink, the path itself otherwise, None when the link is dangling or looping."""
+    if os.path.islink(target):
+        try:
+            return os.path.realpath(target, strict=True)
+        except (OSError, RuntimeError):
+            return None
+    return target
+
+
 def glob_regex(segment):
     """One glob segment as an anchored regex: * ? [..] [!..] {a,b} and nested {a,{b,c}}; dotfiles match like any name."""
     out, i = '', 0
@@ -263,10 +310,16 @@ def glob_regex(segment):
 
 def forbidden_glob(raw):
     """A glob or search pattern naming a secret: .env (not .env.example), .p8, auth.json, .codex or
-    .config/llm-router; a dot-segment glob that can match .env/.env.local/.codex; or .config then llm-router."""
+    .config/llm-router; a dot-segment glob that can match .env/.env.local/.codex; or .config then llm-router.
+    Braces are expanded before the pattern is split on '/'."""
     text = _expand(str(raw if raw is not None else '').strip()).lower().replace('\\', '/')
     if not text:
         return None
+    pieces = _expand_braces(text)
+    if pieces is None:
+        return f'blocked glob too broad to check: {raw}'
+    if pieces != [text]:
+        return next(filter(None, (forbidden_glob(piece) for piece in pieces)), None)
     if '.config/llm-router' in text:
         return 'blocked pattern naming ~/.config/llm-router'
     segments = text.split('/')
@@ -304,14 +357,36 @@ def _descendants(root):
 
 
 def expand_glob(word, cwd):
-    """(overflow, matches): the glob expanded against the filesystem segment by segment (`**` = any depth)."""
+    """(overflow, matches): the glob expanded against the filesystem segment by segment (`**` = any depth).
+
+    Braces expand before the word is split on `/`. An existing symlink is resolved before `..`, so
+    `escape/../*.witness` lists the directory that contains the link's target."""
     expanded = _expand(str(word))
+    pieces = _expand_braces(expanded)
+    if pieces is None:
+        return True, []
+    if pieces != [expanded]:
+        found = []
+        for piece in pieces:
+            overflow, matches = expand_glob(piece, cwd)
+            if overflow:
+                return True, []
+            found += matches
+            if len(found) > GLOB_LIMIT:
+                return True, []
+        return False, found
     current = ['/' if os.path.isabs(expanded) else os.path.abspath(str(cwd))]
     for segment in expanded.split('/'):
         if segment in ('', '.'):
             continue
         if segment == '..':
-            current = [os.path.dirname(p) for p in current]
+            nxt = []
+            for directory in current:
+                real = _follow_link(directory)
+                if real is None:
+                    return False, [directory]
+                nxt.append(os.path.dirname(real))
+            current = nxt
         elif segment == '**':
             found = []
             for directory in current:
@@ -323,7 +398,14 @@ def expand_glob(word, cwd):
                     return True, []
             current = found
         elif not GLOB_CHARS.search(segment):
-            current = [os.path.join(p, segment) for p in current]
+            nxt = []
+            for directory in current:
+                joined = os.path.join(directory, segment)
+                real = _follow_link(joined)
+                if real is None:
+                    return False, [joined]
+                nxt.append(real)
+            current = nxt
         else:
             rx, found = glob_regex(segment), []
             for directory in current:
