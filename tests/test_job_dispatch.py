@@ -619,13 +619,17 @@ class JobTests(unittest.TestCase):
         for name in ('claude', 'grok-build', None, ''):
             self.assertFalse(jd.review_required(name), name)
 
-    def test_codex_commit_writes_review_prompt_and_stays_pending_for_grok_bot(self):
+    def test_codex_commit_dispatches_claude_then_hands_off_without_a_verdict(self):
         self.worker("open('out.txt','w').write('hi\\n')")
         result = self.job(test_cmd='test -f out.txt')
         self.assertTrue(result['ok'], result)
         self.assertTrue(result['review_required'])
         review = result['review']
         self.assertEqual((review['status'], review['reviewer']), ('pending', 'grok-bot'))
+        self.assertNotIn('verdict', review)
+        self.assertEqual([row['reviewer'] for row in review['tried']], ['claude', 'grok-bot'])
+        self.assertEqual(review['tried'][0]['status'], 'unavailable')
+        self.assertEqual(review['tried'][1]['status'], 'handoff_to_orchestrator')
         prompt = Path(review['prompt_file'])
         self.assertEqual(prompt.name, '.llm-router-review-prompt.md')
         self.assertEqual(stat_mode(prompt), 0o600)
@@ -633,23 +637,27 @@ class JobTests(unittest.TestCase):
         self.assertIn('+hi', text)
         self.assertIn('- out.txt', text)
         self.assertIn('passed', text)
+        self.assertIn('schema_version', text)
         self.assertFalse(Path(result['worktree'], prompt.name).exists())  # never in the work tree
         saved = json.loads((self.base / 'jobs' / f'{result["job_id"]}.json').read_text())
         self.assertTrue(saved['review_required'])
         self.assertEqual(saved['review']['status'], 'pending')
+        self.assertNotIn('verdict', saved['review'])
 
     def test_reviewer_gets_diff_and_reject_fails_the_job(self):
         self.worker("open('out.txt','w').write('hi\\n')")
         seen = []
-        def reviewer(summary, diff, prompt_path):
-            seen.append((summary['commit'], diff, Path(prompt_path).read_text()))
-            return {'status': 'recorded', 'reviewer': 'claude', 'verdict': 'reject', 'notes': 'no'}
+
+        def reviewer(name, packet, prompt, policy):
+            seen.append((name, packet, prompt))
+            return review_done('reject', 'no')
+
         result = self.job(test_cmd='test -f out.txt', reviewer=reviewer)
-        self.assertEqual(len(seen), 1)
-        commit, diff, prompt = seen[0]
-        self.assertEqual(commit, result['commit'])
-        self.assertIn('+hi', diff)
-        self.assertIn(diff.strip(), prompt)
+        self.assertEqual([row[0] for row in seen], ['claude'])
+        packet, prompt = seen[0][1], seen[0][2]
+        self.assertEqual(packet['head'], result['commit'])
+        self.assertIn('+hi', packet['diff'])
+        self.assertIn(packet['diff'].strip(), prompt)
         self.assertFalse(result['ok'])
         self.assertEqual(result['status'], 'review_rejected')
         self.assertEqual((result['review']['reviewer'], result['review']['verdict']), ('claude', 'reject'))
@@ -684,6 +692,76 @@ class JobTests(unittest.TestCase):
             pg.approve(result['job_id'], 'push', policy=self.policy)
         self.assertNotIn('stronger-model review', str(caught.exception))
 
+    def test_run_job_dispatches_claude_and_stores_redacted_verdict(self):
+        from llm_router import security
+        self.worker("open('out.txt','w').write('hi\\n')")
+        secret = 'sk-' + 'Q9w8E7r6T5y4U3i2O1p0A9s8D7f6'
+        seen = []
+
+        def reviewer(name, packet, prompt, policy):
+            seen.append({'name': name, 'packet': packet, 'prompt': prompt})
+            return review_done('approve', f'looks good; token {secret}')
+
+        result = self.job(test_cmd='test -f out.txt', reviewer=reviewer)
+        self.assertEqual([call['name'] for call in seen], ['claude'])
+        self.assertIn('+hi', seen[0]['packet']['diff'])
+        self.assertIn('never judge', seen[0]['prompt'].lower())
+        self.assertEqual(result['status'], 'committed')
+        self.assertEqual((result['review']['status'], result['review']['verdict'], result['review']['reviewer']),
+                         ('recorded', 'approve', 'claude'))
+        self.assertEqual(result['review']['head'], result['commit'])
+        self.assertNotIn(secret, result['review']['notes'])
+        self.assertIn(security.REDACTED, result['review']['notes'])
+        saved = json.loads((self.base / 'jobs' / f'{result["job_id"]}.json').read_text())
+        self.assertEqual(saved['review']['reviewer'], 'claude')
+        self.assertEqual(saved['review']['verdict'], 'approve')
+        self.assertNotIn(secret, json.dumps(saved))
+
+    def test_claude_unavailable_hands_packet_to_grok_bot_and_records_nothing(self):
+        from llm_router import pr_gate as pg
+        self.worker("open('out.txt','w').write('hi\\n')")
+        seen = []
+
+        def reviewer(name, packet, prompt, policy):
+            seen.append({'name': name, 'prompt': prompt})
+            if name == 'grok-bot':
+                return {'status': 'handoff_to_orchestrator'}
+            return {'status': 'unavailable', 'reason': 'quota'}
+
+        result = self.job(test_cmd='test -f out.txt', reviewer=reviewer)
+        self.assertEqual([call['name'] for call in seen], ['claude', 'grok-bot'])
+        self.assertIn('+hi', seen[1]['prompt'])
+        self.assertIn('schema_version', seen[1]['prompt'])
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['status'], 'committed')
+        self.assertEqual((result['review']['status'], result['review']['reviewer']), ('pending', 'grok-bot'))
+        self.assertNotIn('verdict', result['review'])
+        saved = json.loads((self.base / 'jobs' / f'{result["job_id"]}.json').read_text())
+        self.assertNotIn('verdict', saved['review'])
+        self.assertIn('+hi', Path(saved['review']['prompt_file']).read_text())
+        with self.assertRaisesRegex(pg.Refused, 'stronger-model review required'):
+            pg.approve(result['job_id'], 'push', policy=self.policy)
+
+    def test_no_reviewer_stays_pending_and_is_not_approved(self):
+        from llm_router import pr_gate as pg
+        self.worker("open('out.txt','w').write('hi\\n')")
+        seen = []
+
+        def reviewer(name, packet, prompt, policy):
+            seen.append(name)
+            return {'status': 'unavailable', 'reason': 'offline'}
+
+        result = self.job(test_cmd='test -f out.txt', reviewer=reviewer)
+        self.assertEqual(seen, ['claude', 'grok-bot'])
+        self.assertNotEqual(result['review'].get('verdict'), 'approve')
+        self.assertNotIn('verdict', result['review'])
+        self.assertEqual(result['review']['status'], 'pending')
+        saved = json.loads((self.base / 'jobs' / f'{result["job_id"]}.json').read_text())
+        self.assertNotIn('verdict', saved['review'])
+        self.assertNotEqual(saved['review'].get('verdict'), 'approve')
+        with self.assertRaisesRegex(pg.Refused, 'stronger-model review required'):
+            pg.approve(result['job_id'], 'push', policy=self.policy)
+
 
 # Export fixture methods without exposing the TestCase to unittest discovery.
 job_setup = JobTests.setUp
@@ -696,6 +774,11 @@ assert_job_main_untouched = JobTests.assert_main_untouched
 
 def stat_mode(path):
     return os.stat(path).st_mode & 0o777
+
+
+def review_done(verdict, notes='ok'):
+    return {'status': 'done', 'text': json.dumps(
+        {'schema_version': 1, 'verdict': verdict, 'notes': notes})}
 
 
 class AllWorkersOutNeverIdleTests(unittest.TestCase):

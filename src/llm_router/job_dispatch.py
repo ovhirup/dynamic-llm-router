@@ -27,7 +27,6 @@ Refused = td.Refused
 
 # Output from these (weaker or local) workers needs a stronger-model review before the owner sees it.
 REVIEWED_WORKERS = ('codex', 'cursor', 'local', 'developer', 'nativ')
-REVIEW_PROMPT_FILE = '.llm-router-review-prompt.md'
 DEFAULT_REVIEWER = 'grok-bot'
 
 
@@ -35,39 +34,61 @@ def review_required(worker):
     return worker in REVIEWED_WORKERS or str(worker or '').startswith('aider')
 
 
-def build_review_prompt(summary, diff, paths, tests_status):
-    scope = '\n'.join(f'- {path}' for path in sorted(paths)) or '- (none)'
-    return (f'# Stronger-model review: job {summary["job_id"]}\n\n'
-            f'Workers: {", ".join(summary.get("workers") or []) or "unknown"}\n'
-            f'Branch: {summary.get("branch")}\nBase: {summary.get("base_sha")}\n'
-            f'Commit: {summary.get("commit")}\n\n'
-            f'## Declared scope / changed paths\n{scope}\n\n'
-            f'## Test status\n{tests_status}\n\n'
-            '## Instructions\nReview the diff for correctness, scope creep, leaked secrets and missing tests. '
-            'Answer with a verdict of `approve` or `reject` and short notes.\n\n'
-            f'## Diff\n```diff\n{diff}\n```\n')
+def _job_review_packet(summary, worktree, paths):
+    """Evidence packet in the same shape `unit_review.review_prompt` already reviews."""
+    from . import unit_review
+    diff = _git(worktree, 'diff', '--no-renames', '--no-color',
+                f'{summary["base_sha"]}..{summary["commit"]}').stdout
+    changed = sorted(paths)
+    scope = list(summary.get('allowed_paths') or changed)
+    tests = (summary.get('tests') or [{}])[-1] or {}
+    producer = ((summary.get('attempts') or [{}])[-1]).get('worker')
+    return {'subject': 'job', 'batch_id': summary['job_id'], 'unit': summary['job_id'],
+            'worker': producer or (summary.get('workers') or ['unknown'])[-1],
+            'head': summary['commit'], 'base_sha': summary['base_sha'], 'branch': summary.get('branch'),
+            'worktree': str(worktree), 'scope': scope, 'changed': changed,
+            'diff': security.redact(diff[:unit_review.MAX_DIFF_CHARS]),
+            'diff_truncated': len(diff) > unit_review.MAX_DIFF_CHARS,
+            'tests': {'command': tests.get('command'), 'status': tests.get('status') or summary.get('tests_status'),
+                      'returncode': tests.get('returncode'), 'tail': tests.get('tail') or ''}}
 
 
-def _stronger_review(summary, worktree, paths, reviewer):
-    """Write the review prompt into the worktree's git dir and record the review (or mark it pending)."""
-    git_dir = Path(_git(worktree, 'rev-parse', '--absolute-git-dir', check=True).stdout.strip())
-    diff = _git(worktree, 'diff', f'{summary["base_sha"]}..{summary["commit"]}').stdout
-    prompt_path = git_dir / REVIEW_PROMPT_FILE
-    prompt_path.unlink(missing_ok=True)
-    fd = os.open(prompt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, 'w') as handle:
-        handle.write(build_review_prompt(summary, diff, paths, summary.get('tests_status')))
-    os.chmod(prompt_path, 0o600)
-    if reviewer is None:
-        return {'status': 'pending', 'reviewer': DEFAULT_REVIEWER, 'prompt_file': str(prompt_path)}
+def _job_review_record(report, prompt_path):
+    """Store a batch-review report on the job. A verdict is stored only when one was actually parsed."""
+    tried = []
+    for item in report.get('tried') or []:
+        row = {'reviewer': item.get('reviewer'), 'status': item.get('status')}
+        if item.get('reason'):
+            row['reason'] = security.redact(str(item['reason']))[:300]
+        tried.append(row)
+    prompt_file = str(report.get('task_file') or prompt_path)
+    if report.get('status') == 'recorded':
+        return {'status': 'recorded', 'verdict': report['verdict'], 'reviewer': report.get('reviewer'),
+                'notes': report.get('notes') or '', 'head': report.get('head'),
+                'prompt_file': prompt_file, 'tried': tried}
+    reviewer_name = report.get('reviewer')
+    if report.get('status') == 'handoff_to_orchestrator':
+        reviewer_name = reviewer_name or DEFAULT_REVIEWER
+    review = {'status': 'pending', 'reviewer': reviewer_name, 'prompt_file': prompt_file, 'tried': tried}
+    if report.get('reason'):
+        review['reason'] = security.redact(str(report['reason']))[:300]
+    return review
+
+
+def _stronger_review(summary, worktree, paths, reviewer, policy):
+    """Dispatch the batch stronger-model review and store its verdict on the job, or leave it pending."""
+    from . import unit_review
+    prompt_path = None
     try:
-        review = dict(reviewer(summary, diff, prompt_path) or {})
+        packet = _job_review_packet(summary, worktree, paths)
+        prompt = unit_review.review_prompt(packet)
+        prompt_path = unit_review._write_prompt(Path(worktree), prompt)
+        report = unit_review.dispatch_review(packet, prompt, policy, reviewer=reviewer)
     except Exception as error:  # an unreviewed change is never treated as approved
         return {'status': 'error', 'reviewer': getattr(reviewer, '__name__', 'reviewer'),
-                'prompt_file': str(prompt_path),
+                'prompt_file': None if prompt_path is None else str(prompt_path),
                 'notes': f'{type(error).__name__}: {security.redact(str(error))[:300]}'}
-    review.setdefault('prompt_file', str(prompt_path))
-    return review
+    return _job_review_record(report, prompt_path)
 
 
 _SCOPE_HEADING = re.compile(r'^\s*#{1,6}\s*(?:allowed\s+(?:paths|files)|scope)\s*:?\s*$', re.I)
@@ -366,6 +387,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
     meter(worker) -> percent used or None (default: the cached meter, never a live read).
     task_class ranks workers by class_order.<task_class> (see selection.select).
     adapter runs the job phase hooks; the default is NativeOrchestrator.
+    reviewer(name, packet, prompt, policy) is the batch-review callable; None uses unit_review.default_reviewer.
     record_decision(orchestrator_decision) logs a deferred orchestrator switch once the repo, task and
     branch checks have passed, so a refused job records none (#212)."""
     policy = policy or config.load_policy()
@@ -1037,7 +1059,7 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
     producer = last.get('worker')
     summary['review_required'] = any(review_required(w) for w in [producer, *summary['workers']] if w)
     if summary['review_required']:
-        summary['review'] = adapter.judge(_stronger_review, summary, worktree, worker_paths, reviewer)
+        summary['review'] = adapter.judge(_stronger_review, summary, worktree, worker_paths, reviewer, policy)
         if summary['review'].get('verdict') == 'reject':
             summary['ok'] = False
             summary['status'] = 'review_rejected'

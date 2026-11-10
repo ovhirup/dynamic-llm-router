@@ -24,7 +24,10 @@ class OrchestratorAdapterTests(unittest.TestCase):
     def test_run_job_uses_adapter_for_each_phase(self):
         self.worker("open('n.txt', 'a').write('x\\n')")
         adapter = mock.Mock(wraps=NativeOrchestrator())
-        reviewer = mock.Mock(return_value={'reviewer': 'claude', 'verdict': 'approve'})
+        reviewer = mock.Mock(return_value={
+            'status': 'done',
+            'text': '{"schema_version": 1, "verdict": "approve", "notes": "ok"}',
+        })
 
         result = self.job(
             adapter=adapter,
