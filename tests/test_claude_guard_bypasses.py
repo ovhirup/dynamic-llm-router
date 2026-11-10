@@ -84,6 +84,9 @@ CASES = [
     # '=' is not a filename delimiter; paths resolve after cd; nested braces reach the same credential (#215)
     blocked('Bash', {'command': 'cat notes=public'}),
     blocked('Bash', {'command': 'cd sub && cat shortcut'}),
+    # `&&` does not run cd when the left side fails; $(...) runs in the directory the command actually reaches (#215)
+    blocked('Bash', {'command': 'false && cd sub; cat notes.txt'}),
+    blocked('Bash', {'command': "cd sub && printf '%s\\n' \"$(cat shortcut)\""}),
     blocked('Glob', {'pattern': '*.{py,{txt,md}}'}),
     blocked('Bash', {'command': 'cat *.{py,{txt,md}}'}),
     blocked('Bash', {'command': '(cd sub); cat notes.txt'}),
