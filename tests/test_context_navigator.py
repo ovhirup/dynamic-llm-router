@@ -1,5 +1,6 @@
 """Tests for Repo context navigator (#115): hierarchical retrieval, grep fallback, and recall metrics."""
 from pathlib import Path
+import subprocess
 import unittest
 
 from llm_router import context_navigator
@@ -52,6 +53,45 @@ class ContextNavigatorTests(unittest.TestCase):
             context_navigator.compute_recall(nav['selected_files'], ['src/routing/selector.py', 'misc/hidden_helper.py']),
             1.0,
         )
+
+    def assert_excluded_from_context(self, relative_path, marker):
+        tree = context_navigator.build_hierarchy(self.repo)
+        self.assertNotIn(relative_path, tree['files'])
+        self.assertNotIn(relative_path, tree['chunks'])
+        for folder in tree['folders'].values():
+            self.assertNotIn(relative_path, folder['files'])
+        query = f'select_worker {marker}'
+        self.assertNotIn(relative_path, context_navigator.grep_fallback(tree, query, limit=20))
+        navigation = context_navigator.navigate(self.repo, query, hierarchy=tree)
+        self.assertNotIn(relative_path, navigation['selected_files'])
+        self.assertNotIn(relative_path, navigation['recovered_files'])
+        prompt = context_navigator.format_for_prompt(navigation)
+        self.assertNotIn(relative_path, prompt)
+        self.assertNotIn(marker, prompt)
+
+    def test_gitignored_text_is_excluded_from_context(self):
+        (self.repo / 'docs/.gitignore').write_text('draft*.md\n!draft-public.md\n')
+        (self.repo / 'docs/draft-private.md').write_text('private_draft_marker\n')
+        (self.repo / 'docs/draft-public.md').write_text('public_draft_marker\n')
+
+        self.assert_excluded_from_context('docs/draft-private.md', 'private_draft_marker')
+        self.assertIn('docs/draft-public.md', context_navigator.build_hierarchy(self.repo)['files'])
+
+    def test_denylisted_tracked_path_is_excluded_from_context(self):
+        relative_path = 'docs/auth.json'
+        (self.repo / relative_path).write_text('{"example": "credential_fixture_marker"}\n')
+        subprocess.run(['git', 'add', '-f', '--', relative_path], cwd=self.repo, check=True)
+
+        self.assert_excluded_from_context(relative_path, 'credential_fixture_marker')
+
+    def test_tracked_source_is_indexed_and_formatted_for_prompt(self):
+        relative_path = 'src/routing/selector.py'
+        tree = context_navigator.build_hierarchy(self.repo)
+        self.assertIn(relative_path, tree['files'])
+        navigation = context_navigator.navigate(self.repo, 'select_worker selector.py', hierarchy=tree)
+        prompt = context_navigator.format_for_prompt(navigation)
+        self.assertIn(f'### `{relative_path}`', prompt)
+        self.assertIn('def select_worker(meters):', prompt)
 
     def test_run_job_behind_flag_injects_context_and_records_recall_metrics(self):
         self.policy['run_job']['context_navigator'] = {'enabled': True, 'top_folders': 2, 'top_files': 3}
