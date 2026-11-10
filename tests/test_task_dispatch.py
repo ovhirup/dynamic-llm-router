@@ -151,15 +151,17 @@ class TaskDispatchTests(unittest.TestCase):
         # Regression for #101: a94efba (#188) silently dropped the --plugin-dir injection and the mod files
         from importlib import resources
         mod = resources.files('llm_router').joinpath('mods', 'claude-guard')
-        self.assertTrue(mod.joinpath('plugin.json').is_file())
+        self.assertTrue(mod.joinpath('.claude-plugin', 'plugin.json').is_file())
+        self.assertTrue(mod.joinpath('hooks', 'hooks.json').is_file())
         self.assertTrue(mod.joinpath('guard.mjs').is_file())
+        self.assertTrue(mod.joinpath('guard-lib.mjs').is_file())
         policy = copy.deepcopy(self.policy)
         policy['run_task']['claude_guard_mod'] = True
         warnings = []
         argv = td.build_argv(policy, 'claude', self.repo, claude_version='2.1.309', warnings=warnings)
         self.assertEqual(warnings, [])
         plugin = Path(argv[argv.index('--plugin-dir') + 1])
-        self.assertTrue((plugin / 'plugin.json').is_file())
+        self.assertTrue((plugin / '.claude-plugin' / 'plugin.json').is_file())
         if '--' in argv:
             self.assertLess(argv.index('--plugin-dir'), argv.index('--'))
         self.assertNotIn('--plugin-dir', td.build_argv(self.policy, 'claude', self.repo, claude_version='2.1.309'))

@@ -1,79 +1,39 @@
 #!/usr/bin/env node
-// DLR Claude Code PreToolUse guard hook (#101). Fails closed on any error (.catch).
+// DLR Claude Code PreToolUse guard hook (#101, hardened in #215). Claude Code runs this file only as a hook, so it
+// always evaluates: there is no "am I the entrypoint?" check that a path with spaces or a symlink could defeat.
+// Exit 2 blocks the tool call. Any failure (bad input, missing rules file, internal error) also exits 2: only
+// exit 2 blocks in Claude Code, so every error path must end there. An allow prints nothing and grants nothing,
+// so Claude Code's own permission rules still apply.
 import fs from "node:fs";
-import path from "node:path";
 
-function isForbiddenPath(rawPath) {
-  const text = String(rawPath || "").trim();
-  if (!text) return null;
-  const base = path.basename(text).toLowerCase();
-  const norm = text.replace(/\\/g, "/");
-  if (base === ".env" || (base.startsWith(".env.") && base !== ".env.example")) {
-    return `blocked secret file access: ${base}`;
+function block(reason) {
+  if (process.env.DLR_GUARD_LOG) {
+    try {
+      fs.appendFileSync(process.env.DLR_GUARD_LOG, `${new Date().toISOString()} blocked: ${reason}\n`);
+    } catch {}
   }
-  if (base.endsWith(".p8") || base === "auth.json") {
-    return `blocked credential file access: ${base}`;
-  }
-  if (norm.includes("/.codex/") || norm.endsWith("/.codex") || text.startsWith("~/.codex")) {
-    return "blocked access to ~/.codex";
-  }
-  if (norm.includes("/.config/llm-router/") || norm.endsWith("/.config/llm-router") || text.startsWith("~/.config/llm-router")) {
-    return "blocked access to ~/.config/llm-router";
-  }
-  return null;
-}
-
-const FORBIDDEN_GIT = /\bgit\s+(?:\S+\s+)*push\b|\bgit\s+(?:\S+\s+)*reset\s+--hard\b|\bgit\s+(?:\S+\s+)*merge\b[^\n;|&]*\b(?:main|master)\b|\bgh\s+pr\s+merge\b|\bgh\s+pr\s+review\b[^\n;|&]*--approve\b/i;
-
-export function evaluateEvent(event, worktree = process.env.DLR_WORKTREE || process.cwd()) {
-  const toolName = String(event?.tool_name || "").toLowerCase();
-  const input = event?.tool_input && typeof event.tool_input === "object" ? event.tool_input : {};
-  const fileCandidate = input.file_path || input.path || input.notebook_path || "";
-  const pathBlock = isForbiddenPath(fileCandidate);
-  if (pathBlock) return { allow: false, reason: pathBlock };
-
-  if (toolName === "bash" || typeof input.command === "string") {
-    const cmd = String(input.command || "");
-    if (FORBIDDEN_GIT.test(cmd)) {
-      return { allow: false, reason: "blocked destructive git/gh command in headless Claude job" };
-    }
-    for (const token of cmd.split(/[\s"'=]+/)) {
-      const tokenBlock = isForbiddenPath(token);
-      if (tokenBlock) return { allow: false, reason: tokenBlock };
-    }
-    const rmMatch = cmd.match(/\brm\s+-(?:[A-Za-z]*r[A-Za-z]*f|[A-Za-z]*f[A-Za-z]*r|--recursive)\s+(.+)$/);
-    if (rmMatch) {
-      const wt = path.resolve(worktree);
-      const targets = rmMatch[1].split(/\s+/).filter((t) => t && !t.startsWith("-"));
-      for (const target of targets) {
-        const cleaned = target.replace(/^['"]|['"]$/g, "");
-        const resolved = path.resolve(wt, cleaned);
-        if (resolved === wt || !resolved.startsWith(wt + path.sep)) {
-          return { allow: false, reason: `blocked rm -rf outside worktree: ${cleaned}` };
-        }
-      }
-    }
-  }
-  return { allow: true, reason: null };
+  process.stderr.write(`dlr-claude-guard: ${reason}\n`);
+  process.exit(2);
 }
 
 async function main() {
   const raw = fs.readFileSync(0, "utf8");
-  const event = raw.trim() ? JSON.parse(raw) : {};
-  const verdict = evaluateEvent(event);
-  if (!verdict.allow) {
-    if (process.env.DLR_GUARD_LOG) {
-      fs.appendFileSync(process.env.DLR_GUARD_LOG, `${new Date().toISOString()} blocked: ${verdict.reason}\n`);
-    }
-    process.stderr.write(`dlr-claude-guard: ${verdict.reason}\n`);
-    process.exit(2);
+  if (!raw.trim()) block("empty hook event (failing closed)");
+  let event;
+  try {
+    event = JSON.parse(raw);
+  } catch {
+    block("unparseable hook event (failing closed)");
   }
-  process.stdout.write(JSON.stringify({ decision: "allow" }) + "\n");
+  const { evaluateEvent, jobRoot } = await import("./guard-lib.mjs");
+  // Containment is checked against the job root, DLR_WORKTREE, never a later event.cwd; relative paths resolve
+  // against the real cwd of this call. Without DLR_WORKTREE there is no trusted boundary: block everything.
+  const root = jobRoot();
+  if (!root) block("DLR_WORKTREE is not set: no trusted job root (failing closed)");
+  const cwd = (typeof event?.cwd === "string" && event.cwd) || process.cwd();
+  const verdict = evaluateEvent(event, root, cwd);
+  if (!verdict.allow) block(verdict.reason);
+  process.exit(0);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((err) => {
-    process.stderr.write(`dlr-claude-guard internal error (failing closed): ${err?.message || err}\n`);
-    process.exit(2);
-  });
-}
+main().catch((err) => block(`internal error (failing closed): ${err?.message || err}`));

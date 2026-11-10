@@ -1,0 +1,8 @@
+{
+  "name": "dlr-headless-guard",
+  "version": "0.2.0",
+  "description": "DLR safety guard hook for headless Claude Code runs (fail-closed).",
+  "author": {
+    "name": "Dynamic LLM Router contributors"
+  }
+}

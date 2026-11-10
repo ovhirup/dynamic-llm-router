@@ -47,4 +47,4 @@ dlr = "llm_router.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-llm_router = ["default_policy.json", "capabilities.json", "templates/*", "examples/*", "examples/*.jsonl", "examples/workers/*", "examples/plugins/*", "examples/skills/*", "mods/claude-guard/*", "examples/claude/agents/*"]
+llm_router = ["default_policy.json", "capabilities.json", "templates/*", "examples/*", "examples/*.jsonl", "examples/workers/*", "examples/plugins/*", "examples/skills/*", "mods/claude-guard/*", "mods/claude-guard/.claude-plugin/*", "mods/claude-guard/hooks/*", "examples/claude/agents/*"]
