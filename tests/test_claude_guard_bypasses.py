@@ -78,6 +78,15 @@ CASES = [
     blocked('Bash', {'command': 'rm -r -f inside 2>/dev/null ../outside'}),
     blocked('Bash', {'command': 'rm -r -f inside &>/dev/null ../outside'}),
     allowed('Bash', {'command': 'rm -rf build/cache >/dev/null'}),
+    # '=' is not a filename delimiter; paths resolve after cd; nested braces reach the same credential (#215)
+    blocked('Bash', {'command': 'cat notes=public'}),
+    blocked('Bash', {'command': 'cd sub && cat shortcut'}),
+    blocked('Glob', {'pattern': '*.{py,{txt,md}}'}),
+    blocked('Bash', {'command': 'cat *.{py,{txt,md}}'}),
+    blocked('Bash', {'command': '(cd sub); cat notes.txt'}),
+    allowed('Bash', {'command': 'cd src && cat app.py'}),
+    allowed('Glob', {'pattern': '*.{py,md}'}),
+    allowed('Bash', {'command': 'ls *.{py,md}'}),
     # secrets reached through symlinks or Grep/Glob patterns and search roots
     blocked('Read', {'file_path': 'notes.txt'}),
     blocked('Read', {'file_path': 'cfglink/config.json'}),
@@ -187,9 +196,10 @@ def discover_pretooluse_commands(root):
 
 
 class GuardFixture:
-    """worktree/ (src/app.py, build/cache/, inside/, .env, .env.example, config/keys/auth.json, notes.txt and
-    'notes2.txt ' -> ~/.codex/auth.json, cfglink -> ~/.config/llm-router, escape -> ../outside, dang -> a missing
-    path), outside/, home/.codex (+ sub/), home/link -> ~/.codex/sub, home/.config/llm-router."""
+    """worktree/ (src/app.py, build/cache/, inside/, .env, .env.example, config/keys/auth.json, notes.txt,
+    'notes2.txt ' and notes=public -> ~/.codex/auth.json, sub/shortcut -> the same auth.json, cfglink ->
+    ~/.config/llm-router, escape -> ../outside, dang -> a missing path), outside/, home/.codex (+ sub/),
+    home/link -> ~/.codex/sub, home/.config/llm-router."""
 
     def __init__(self):
         self.tmp = tempfile.TemporaryDirectory()  # under /var/folders on macOS, i.e. through a symlink
@@ -206,6 +216,9 @@ class GuardFixture:
         (self.worktree / '.env').write_text('SECRET=1\n')
         self.outside.mkdir()
         (self.worktree / 'notes.txt').symlink_to(self.home / '.codex' / 'auth.json')
+        (self.worktree / 'notes=public').symlink_to(self.home / '.codex' / 'auth.json')
+        (self.worktree / 'sub').mkdir()
+        (self.worktree / 'sub' / 'shortcut').symlink_to(self.home / '.codex' / 'auth.json')
         (self.worktree / 'cfglink').symlink_to(self.home / '.config' / 'llm-router')
         (self.worktree / 'escape').symlink_to(self.outside)
         (self.worktree / 'notes2.txt ').symlink_to(self.home / '.codex' / 'auth.json')
