@@ -68,6 +68,9 @@ FILE_KEYS = ('file_path', 'path', 'notebook_path')
 SEARCH_TOOLS = {'grep', 'glob', 'ls'}
 SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh'}
 WRAPPERS = {'sudo', 'command', 'builtin', 'exec', 'nohup', 'time', 'nice', 'env', 'xargs', 'doas'}
+SHELL_KEYWORDS = {'if', 'then', 'else', 'elif', 'fi', 'while', 'until', 'do', 'done', 'for', 'in', 'case', 'esac',
+                  '{', '}', '!', '[[', ']]', 'select', 'coproc'}
+_SUBSHELL = '\0('  # a (...) group: its cd must not change the parent command's directory
 FEEDERS = {'xargs', 'parallel', 'rush'}
 # Recursive-capable readers and every option the guard understands, fully spelled (mirrors READERS in
 # guard-lib.mjs). Anything else (an abbreviation, an unknown long option, -d/--directories, a path-list option such
@@ -197,8 +200,36 @@ def forbidden_path(raw, cwd):
     return f'blocked path through a dangling or looping symlink: {text}' if real is None else _denied_name(real)
 
 
+def _brace_end(segment, start):
+    """Index of the `}` matching the `{` at `start`, or -1. Nested braces count."""
+    depth = 0
+    for j in range(start, len(segment)):
+        if segment[j] == '{':
+            depth += 1
+        elif segment[j] == '}':
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def _brace_alts(body):
+    """Split a brace body on commas that are not inside a nested brace."""
+    alts, depth, start = [], 0, 0
+    for j, ch in enumerate(body):
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+        elif ch == ',' and depth == 0:
+            alts.append(body[start:j])
+            start = j + 1
+    alts.append(body[start:])
+    return alts
+
+
 def glob_regex(segment):
-    """One glob segment as an anchored regex: * ? [..] [!..] {a,b}; dotfiles match like any name."""
+    """One glob segment as an anchored regex: * ? [..] [!..] {a,b} and nested {a,{b,c}}; dotfiles match like any name."""
     out, i = '', 0
     while i < len(segment):
         ch = segment[i]
@@ -217,11 +248,11 @@ def glob_regex(segment):
                 out += '[' + ('^' if negate else '') + re.sub(r'([\\\]^])', r'\\\1', body) + ']'
                 i = end
         elif ch == '{':
-            end = segment.find('}', i + 1)
+            end = _brace_end(segment, i)
             if end < 0:
                 out += r'\{'
             else:
-                alternatives = [glob_regex(alt).pattern[1:-1] for alt in segment[i + 1:end].split(',')]
+                alternatives = [glob_regex(alt).pattern[1:-1] for alt in _brace_alts(segment[i + 1:end])]
                 out += '(?:' + '|'.join(alternatives) + ')'
                 i = end
         else:
@@ -432,6 +463,30 @@ def parse_shell(script):
         nested.append(src[start + 1:end if end >= 0 else n])
         return end + 1 if end >= 0 else n
 
+    def take_group(start):
+        """Body of a `(...)` group and the index after its closing `)`. Quotes hide parentheses."""
+        depth, j = 0, start
+        while j < n:
+            c = src[j]
+            if c == '\\':
+                j += 2
+                continue
+            if c in "'\"":
+                quote = c
+                j += 1
+                while j < n and src[j] != quote:
+                    j += 2 if quote == '"' and src[j] == '\\' else 1
+                j += 1
+                continue
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    return src[start + 1:j], j + 1
+            j += 1
+        return src[start + 1:], n
+
     def end_word():
         nonlocal word, taking_redirect
         if word is not None:
@@ -517,6 +572,14 @@ def parse_shell(script):
         elif ch == '`':
             word = (word or '') + '$'
             i = backtick(i)
+        elif ch == '(':  # a subshell: cd inside it does not change the directory of later commands
+            end_word()
+            if words or pending_redirects:
+                end_command()
+            body, i = take_group(i)
+            words.append(_SUBSHELL)
+            words.append(body)
+            end_command()
         elif ch in ' \t':
             end_word()
             i += 1
@@ -534,7 +597,7 @@ def parse_shell(script):
                 end_word()
             taking_redirect = True
             i = op_end
-        elif ch in '\n;&|()':
+        elif ch in '\n;&|)':
             end_command(ch)
             i += 1
         else:
@@ -709,6 +772,47 @@ def _check_git(name, args):
     return None
 
 
+def _path_spellings(word):
+    """Spellings of one shell word that can name a path.
+
+    The word itself is always one path, so '=' inside a filename (`notes=public`) is not a delimiter. An
+    assignment (`VAR=value`) or an option (`--flag=value`) also contributes the text after the first '='."""
+    if not word:
+        return []
+    spellings = [word]
+    if '=' in word and (ASSIGNMENT.match(word) or word.startswith('-')):
+        value = word.split('=', 1)[1]
+        if value and value != word:
+            spellings.append(value)
+    return spellings
+
+
+def _directory_after_cd(args, cwd):
+    """Directory a static `cd` lands in. The unchanged `cwd` when `cd` fails. None when the destination is unknowable
+    (`cd -`, a variable, a glob, an option this does not model)."""
+    if not cwd:
+        return None
+    dest, end_options = None, False
+    for arg in args:
+        if not end_options and arg == '--':
+            end_options = True
+            continue
+        if not end_options and arg.startswith('-'):
+            if arg in ('-L', '-P', '-e', '-@') or re.fullmatch(r'-[LPe@]+', arg):
+                continue
+            return None
+        if dest is not None:
+            return None
+        dest = arg
+    if dest is None:
+        home = resolve_real('~', '/')
+        return home if home and os.path.isdir(home) else cwd
+    if re.search(r'[$`*?[{]', dest):
+        return None
+    landed = resolve_real(dest, cwd)
+    return landed if landed and os.path.isdir(landed) else cwd
+
+
 def _check_script(script, root, cwd, depth=0):
     if depth > 8:
         return 'blocked deeply nested shell command'
@@ -719,16 +823,28 @@ def _check_script(script, root, cwd, depth=0):
         why = _check_script(inner, root, cwd, depth + 1)
         if why:
             return why
-    moved = False  # after cd/pushd/popd a relative path no longer resolves against the hook's cwd
+    moved = False  # after cd/pushd/popd a relative rm no longer resolves against the hook's starting directory
+    here = cwd  # directory the command actually runs in; cd/pushd update it, a subshell does not
 
     def scan(text):
-        for piece in text.split('='):
-            why = forbidden_path(piece, cwd) or _forbidden_wildcard(piece, cwd)
+        for spelling in _path_spellings(text):
+            why = forbidden_path(spelling, here) or _forbidden_wildcard(spelling, here)
             if why:
                 return why
         return None
 
     for index, raw in enumerate(commands):
+        if here is None:
+            return 'blocked command after a cd whose destination cannot be known'
+        if raw[:1] == [_SUBSHELL]:
+            for target in redirects[index]:
+                why = scan(target)
+                if why:
+                    return why
+            why = _check_script(raw[1] if len(raw) > 1 else '', root, here, depth + 1)
+            if why:
+                return why
+            continue
         for word in list(raw) + redirects[index]:
             why = scan(word)
             if why:
@@ -741,13 +857,13 @@ def _check_script(script, root, cwd, depth=0):
             if name in SHELLS:
                 flag = next((j for j, a in enumerate(args) if re.fullmatch(r'-[A-Za-z]*c[A-Za-z]*', a)), None)
                 if flag is not None and flag + 1 < len(args):
-                    why = _check_script(args[flag + 1], root, cwd, depth + 1)
+                    why = _check_script(args[flag + 1], root, here, depth + 1)
             elif name == 'eval':
-                why = _check_script(' '.join(args), root, cwd, depth + 1)
+                why = _check_script(' '.join(args), root, here, depth + 1)
             elif name == 'rm':
-                why = _check_rm(args, root, cwd, moved)
+                why = _check_rm(args, root, here, moved)
             elif name in READERS or name == 'find':
-                why = _check_reader(name, args, cwd,
+                why = _check_reader(name, args, here,
                                     piped[index] or any(os.path.basename(w) in FEEDERS for w in raw[:k]))
             if why:
                 return why
@@ -758,7 +874,18 @@ def _check_script(script, root, cwd, depth=0):
         why = _check_git(name, words[1:]) if name in ('git', 'gh') else None
         if why:
             return why
-        moved = moved or name in ('cd', 'pushd', 'popd')
+        cmd = words
+        while cmd and os.path.basename(cmd[0]) in SHELL_KEYWORDS:
+            cmd = cmd[1:]
+        if not cmd:
+            continue
+        cmd_name = os.path.basename(cmd[0])
+        if cmd_name == 'cd':
+            here = _directory_after_cd(cmd[1:], here)
+            moved = True
+        elif cmd_name in ('pushd', 'popd'):
+            here = _directory_after_cd(cmd[1:], here) if cmd_name == 'pushd' and len(cmd) > 1 else None
+            moved = True
     return None
 
 

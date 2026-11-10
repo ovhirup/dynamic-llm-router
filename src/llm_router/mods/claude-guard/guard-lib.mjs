@@ -8,6 +8,9 @@ const FILE_KEYS = ["file_path", "path", "notebook_path"];
 const SEARCH_TOOLS = new Set(["grep", "glob", "ls"]);
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
 const WRAPPERS = new Set(["sudo", "command", "builtin", "exec", "nohup", "time", "nice", "env", "xargs", "doas"]);
+const SHELL_KEYWORDS = new Set(["if", "then", "else", "elif", "fi", "while", "until", "do", "done", "for", "in",
+  "case", "esac", "{", "}", "!", "[[", "]]", "select", "coproc"]);
+const SUBSHELL = "\0(";  // a (...) group: its cd must not change the parent command's directory
 const GLOB_CHARS = /[*?[{]/;
 const GLOB_LIMIT = 20000;
 const SEARCH_LIMIT = 20000;
@@ -142,7 +145,33 @@ export function forbiddenPath(raw, cwd) {
   return real === null ? `blocked path through a dangling or looping symlink: ${text}` : deniedName(real);
 }
 
-// One glob segment as an anchored regex: * ? [..] [!..] {a,b}; dotfiles are matched like any name.
+function braceEnd(segment, start) {
+  let depth = 0;
+  for (let j = start; j < segment.length; j++) {
+    if (segment[j] === "{") depth++;
+    else if (segment[j] === "}" && --depth === 0) return j;
+  }
+  return -1;
+}
+
+function braceAlts(body) {
+  const alts = [];
+  let depth = 0;
+  let start = 0;
+  for (let j = 0; j < body.length; j++) {
+    const ch = body[j];
+    if (ch === "{") depth++;
+    else if (ch === "}") depth--;
+    else if (ch === "," && depth === 0) {
+      alts.push(body.slice(start, j));
+      start = j + 1;
+    }
+  }
+  alts.push(body.slice(start));
+  return alts;
+}
+
+// One glob segment as an anchored regex: * ? [..] [!..] {a,b} and nested {a,{b,c}}; dotfiles match like any name.
 export function globRegex(segment) {
   let out = "";
   for (let i = 0; i < segment.length; i++) {
@@ -160,10 +189,10 @@ export function globRegex(segment) {
         i = end;
       }
     } else if (ch === "{") {
-      const end = segment.indexOf("}", i + 1);
+      const end = braceEnd(segment, i);
       if (end < 0) out += "\\{";
       else {
-        const alternatives = segment.slice(i + 1, end).split(",").map((alt) => globRegex(alt).source.slice(1, -1));
+        const alternatives = braceAlts(segment.slice(i + 1, end)).map((alt) => globRegex(alt).source.slice(1, -1));
         out += `(?:${alternatives.join("|")})`;
         i = end;
       }
@@ -451,6 +480,38 @@ export function parseShell(script) {
     } else if (ch === "`") {
       add("$");
       i = backtick(i);
+    } else if (ch === "(") {  // a subshell: cd inside it does not change the directory of later commands
+      endWord();
+      if (words.length || pendingRedirects.length) endCommand();
+      const takeGroup = (start) => {
+        let depth = 0;
+        let j = start;
+        while (j < src.length) {
+          const c = src[j];
+          if (c === "\\") {
+            j += 2;
+            continue;
+          }
+          if (c === "'" || c === '"') {
+            const quote = c;
+            j++;
+            while (j < src.length && src[j] !== quote) j += quote === '"' && src[j] === "\\" ? 2 : 1;
+            j++;
+            continue;
+          }
+          if (c === "(") depth++;
+          else if (c === ")") {
+            depth--;
+            if (depth === 0) return [src.slice(start + 1, j), j + 1];
+          }
+          j++;
+        }
+        return [src.slice(start + 1), src.length];
+      };
+      const [body, next] = takeGroup(i);
+      words.push(SUBSHELL, body);
+      endCommand();
+      i = next;
     } else if (ch === " " || ch === "\t") {
       endWord();
       i++;
@@ -467,7 +528,7 @@ export function parseShell(script) {
         else endWord();
         takingRedirect = true;
         i = opEnd;
-      } else if ("\n;&|()".includes(ch)) {
+      } else if ("\n;&|)".includes(ch)) {
         endCommand(ch);
         i++;
       } else {
@@ -629,6 +690,53 @@ function checkGit(name, args) {
   return null;
 }
 
+function pathSpellings(word) {
+  // The word itself is always one path, so "=" inside a filename ("notes=public") is not a delimiter. An assignment
+  // (VAR=value) or an option (--flag=value) also contributes the text after the first "=".
+  if (!word) return [];
+  const spellings = [word];
+  if (word.includes("=") && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || word.startsWith("-"))) {
+    const value = word.slice(word.indexOf("=") + 1);
+    if (value && value !== word) spellings.push(value);
+  }
+  return spellings;
+}
+
+function isDir(target) {
+  try {
+    return fs.statSync(target).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+// Directory a static cd lands in. The unchanged cwd when cd fails. null when the destination is unknowable
+// (cd -, a variable, a glob, an option this does not model).
+function directoryAfterCd(args, cwd) {
+  if (!cwd) return null;
+  let dest = null;
+  let endOptions = false;
+  for (const arg of args) {
+    if (!endOptions && arg === "--") {
+      endOptions = true;
+      continue;
+    }
+    if (!endOptions && arg.startsWith("-")) {
+      if (arg === "-L" || arg === "-P" || arg === "-e" || arg === "-@" || /^-[LPe@]+$/.test(arg)) continue;
+      return null;
+    }
+    if (dest !== null) return null;
+    dest = arg;
+  }
+  if (dest === null) {
+    const homeDir = resolveReal("~", "/");
+    return homeDir && isDir(homeDir) ? homeDir : cwd;
+  }
+  if (/[$`*?[{]/.test(dest)) return null;
+  const landed = resolveReal(dest, cwd);
+  return landed && isDir(landed) ? landed : cwd;
+}
+
 function checkScript(script, root, cwd, depth = 0) {
   if (depth > 8) return "blocked deeply nested shell command";
   if (FORBIDDEN_GIT.test(String(script).replace(/\\\r?\n/g, " ").replace(/\s+/g, " "))) {
@@ -639,15 +747,26 @@ function checkScript(script, root, cwd, depth = 0) {
     const why = checkScript(inner, root, cwd, depth + 1);
     if (why) return why;
   }
-  let moved = false;  // after cd/pushd/popd a relative path no longer resolves against the hook's cwd
+  let moved = false;  // after cd/pushd/popd a relative rm no longer resolves against the hook's starting directory
+  let here = cwd;  // directory the command actually runs in; cd/pushd update it, a subshell does not
   const scan = (text) => {
-    for (const piece of text.split("=")) {
-      const found = forbiddenPath(piece, cwd) || forbiddenWildcard(piece, cwd);
+    for (const spelling of pathSpellings(text)) {
+      const found = forbiddenPath(spelling, here) || forbiddenWildcard(spelling, here);
       if (found) return found;
     }
     return null;
   };
   for (const [index, raw] of commands.entries()) {
+    if (here === null) return "blocked command after a cd whose destination cannot be known";
+    if (raw[0] === SUBSHELL) {
+      for (const target of redirects[index]) {
+        const why = scan(target);
+        if (why) return why;
+      }
+      const why = checkScript(raw[1] ?? "", root, here, depth + 1);
+      if (why) return why;
+      continue;
+    }
     for (const word of raw.concat(redirects[index])) {
       const why = scan(word);
       if (why) return why;
@@ -660,11 +779,11 @@ function checkScript(script, root, cwd, depth = 0) {
       let why = null;
       if (SHELLS.has(name)) {
         const flag = args.findIndex((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
-        if (flag >= 0 && args[flag + 1] !== undefined) why = checkScript(args[flag + 1], root, cwd, depth + 1);
-      } else if (name === "eval") why = checkScript(args.join(" "), root, cwd, depth + 1);
-      else if (name === "rm") why = checkRm(args, root, cwd, moved);
+        if (flag >= 0 && args[flag + 1] !== undefined) why = checkScript(args[flag + 1], root, here, depth + 1);
+      } else if (name === "eval") why = checkScript(args.join(" "), root, here, depth + 1);
+      else if (name === "rm") why = checkRm(args, root, here, moved);
       else if (name in READERS || name === "find") {
-        why = checkReader(name, args, cwd, piped[index] || raw.slice(0, k).some((w) => FEEDERS.has(path.basename(w))));
+        why = checkReader(name, args, here, piped[index] || raw.slice(0, k).some((w) => FEEDERS.has(path.basename(w))));
       }
       if (why) return why;
     }
@@ -673,7 +792,17 @@ function checkScript(script, root, cwd, depth = 0) {
     const name = path.basename(words[0]);
     const why = name === "git" || name === "gh" ? checkGit(name, words.slice(1)) : null;
     if (why) return why;
-    moved ||= ["cd", "pushd", "popd"].includes(name);
+    let cmd = words;
+    while (cmd.length && SHELL_KEYWORDS.has(path.basename(cmd[0]))) cmd = cmd.slice(1);
+    if (!cmd.length) continue;
+    const cmdName = path.basename(cmd[0]);
+    if (cmdName === "cd") {
+      here = directoryAfterCd(cmd.slice(1), here);
+      moved = true;
+    } else if (cmdName === "pushd" || cmdName === "popd") {
+      here = cmdName === "pushd" && cmd.length > 1 ? directoryAfterCd(cmd.slice(1), here) : null;
+      moved = true;
+    }
   }
   return null;
 }
