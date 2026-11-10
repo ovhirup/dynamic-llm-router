@@ -71,6 +71,13 @@ CASES = [
     blocked('Bash', {'command': 'env bash -c "cd ..; rm -rf outside"'}),
     blocked('Bash', {'command': '/bin/bash --norc -c "rm -r -f {outside}"'}),
     blocked('Bash', {'command': 'rm -rf dang/../victim'}),
+    # a redirection is not a separator: Bash still passes every later operand to rm (#215)
+    blocked('Bash', {'command': 'rm -r -f inside >/dev/null ../outside'}),
+    blocked('Bash', {'command': 'rm -r -f inside </dev/null ../outside'}),
+    blocked('Bash', {'command': 'rm -r -f inside >>/dev/null ../outside'}),
+    blocked('Bash', {'command': 'rm -r -f inside 2>/dev/null ../outside'}),
+    blocked('Bash', {'command': 'rm -r -f inside &>/dev/null ../outside'}),
+    allowed('Bash', {'command': 'rm -rf build/cache >/dev/null'}),
     # secrets reached through symlinks or Grep/Glob patterns and search roots
     blocked('Read', {'file_path': 'notes.txt'}),
     blocked('Read', {'file_path': 'cfglink/config.json'}),
@@ -180,9 +187,9 @@ def discover_pretooluse_commands(root):
 
 
 class GuardFixture:
-    """worktree/ (src/app.py, build/cache/, .env, .env.example, config/keys/auth.json, notes.txt and 'notes2.txt '
-    -> ~/.codex/auth.json, cfglink -> ~/.config/llm-router, escape -> ../outside, dang -> a missing path),
-    outside/, home/.codex (+ sub/), home/link -> ~/.codex/sub, home/.config/llm-router."""
+    """worktree/ (src/app.py, build/cache/, inside/, .env, .env.example, config/keys/auth.json, notes.txt and
+    'notes2.txt ' -> ~/.codex/auth.json, cfglink -> ~/.config/llm-router, escape -> ../outside, dang -> a missing
+    path), outside/, home/.codex (+ sub/), home/link -> ~/.codex/sub, home/.config/llm-router."""
 
     def __init__(self):
         self.tmp = tempfile.TemporaryDirectory()  # under /var/folders on macOS, i.e. through a symlink
@@ -192,7 +199,7 @@ class GuardFixture:
         (self.home / '.codex' / 'auth.json').write_text('{}')
         (self.home / '.config' / 'llm-router').mkdir(parents=True)
         (self.home / '.config' / 'llm-router' / 'config.json').write_text('{}')
-        for path in ('src', 'build/cache'):
+        for path in ('src', 'build/cache', 'inside'):
             (self.worktree / path).mkdir(parents=True)
         (self.worktree / 'src' / 'app.py').write_text('')
         (self.worktree / '.env.example').write_text('')
