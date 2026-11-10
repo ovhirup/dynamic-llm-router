@@ -374,11 +374,13 @@ function ansiC(body) {
 // including as the target of a redirect (`2> >(cmd)`): it does not end the command, so later operands stay.
 export function parseShell(script) {
   const commands = [];
-  const nested = [];
+  const nested = [];  // nested[i]: $(...), `...`, <(...) and >(...) bodies in commands[i]
   const redirects = [];
+  const separators = [];  // operator that ended commands[i]; null on the last command
   let words = [];
   let word = null;
   let pendingRedirects = [];
+  let pendingNested = [];
   let takingRedirect = false;
   const src = String(script ?? "").replace(/\\\r?\n/g, "");
   const endWord = () => {
@@ -398,9 +400,12 @@ export function parseShell(script) {
       commands.push(words);
       piped.push(pipeSeen);
       redirects.push(pendingRedirects);
+      nested.push(pendingNested);
+      separators.push(separator || null);
     }
     words = [];
     pendingRedirects = [];
+    pendingNested = [];
     takingRedirect = false;
     if (separator === "|") pipeSeen = true;
   };
@@ -427,16 +432,16 @@ export function parseShell(script) {
     for (let j = start; j < src.length; j++) {
       if (src[j] === "(") depth++;
       else if (src[j] === ")" && --depth === 0) {
-        nested.push(src.slice(start + 1, j));
+        pendingNested.push(src.slice(start + 1, j));
         return j + 1;
       }
     }
-    nested.push(src.slice(start + 1));
+    pendingNested.push(src.slice(start + 1));
     return src.length;
   };
   const backtick = (start) => {
     const end = src.indexOf("`", start + 1);
-    nested.push(src.slice(start + 1, end < 0 ? src.length : end));
+    pendingNested.push(src.slice(start + 1, end < 0 ? src.length : end));
     return end < 0 ? src.length : end + 1;
   };
   let i = 0;
@@ -517,6 +522,9 @@ export function parseShell(script) {
     } else if (ch === " " || ch === "\t") {
       endWord();
       i++;
+    } else if (ch === "&" && src[i + 1] === "&") {
+      endCommand("&&");
+      i += 2;
     } else if (ch === "|" && src[i + 1] === "|") {
       endCommand("||");
       i += 2;
@@ -540,7 +548,7 @@ export function parseShell(script) {
     }
   }
   endCommand();
-  return { commands, nested, piped, redirects };
+  return { commands, nested, piped, redirects, separators };
 }
 
 function stripPrefix(words) {
@@ -712,10 +720,10 @@ function isDir(target) {
   }
 }
 
-// Directory a static cd lands in. The unchanged cwd when cd fails. null when the destination is unknowable
-// (cd -, a variable, a glob, an option this does not model).
+// Where a static cd lands. {status:'ok', dir} when the destination is a directory, {status:'fail', dir:cwd} when
+// it is not (Bash stays put), {status:'unknown'} for cd -, a variable, a glob, or an option this does not model.
 function directoryAfterCd(args, cwd) {
-  if (!cwd) return null;
+  if (!cwd) return { status: "unknown" };
   let dest = null;
   let endOptions = false;
   for (const arg of args) {
@@ -725,32 +733,107 @@ function directoryAfterCd(args, cwd) {
     }
     if (!endOptions && arg.startsWith("-")) {
       if (arg === "-L" || arg === "-P" || arg === "-e" || arg === "-@" || /^-[LPe@]+$/.test(arg)) continue;
-      return null;
+      return { status: "unknown" };
     }
-    if (dest !== null) return null;
+    if (dest !== null) return { status: "unknown" };
     dest = arg;
   }
   if (dest === null) {
     const homeDir = resolveReal("~", "/");
-    return homeDir && isDir(homeDir) ? homeDir : cwd;
+    return homeDir && isDir(homeDir) ? { status: "ok", dir: homeDir } : { status: "fail", dir: cwd };
   }
-  if (/[$`*?[{]/.test(dest)) return null;
+  if (/[$`*?[{]/.test(dest)) return { status: "unknown" };
   const landed = resolveReal(dest, cwd);
-  return landed && isDir(landed) ? landed : cwd;
+  return landed && isDir(landed) ? { status: "ok", dir: landed } : { status: "fail", dir: cwd };
 }
 
-function checkScript(script, root, cwd, depth = 0) {
-  if (depth > 8) return "blocked deeply nested shell command";
-  if (FORBIDDEN_GIT.test(String(script).replace(/\\\r?\n/g, " ").replace(/\s+/g, " "))) {
-    return "blocked destructive git/gh command in headless Claude job";
+// cd/pushd/popd after wrappers and keywords, or null when this command does not change the directory.
+function directoryCommand(raw) {
+  if (raw[0] === SUBSHELL) return null;
+  let words = stripPrefix(raw);
+  while (words.length && SHELL_KEYWORDS.has(path.basename(words[0]))) words = words.slice(1);
+  if (!words.length) return null;
+  const name = path.basename(words[0]);
+  if (name === "cd" || name === "pushd" || name === "popd") return { name, args: words.slice(1) };
+  return null;
+}
+
+// Effect on later commands when this one actually runs. 'opaque': directory unchanged, exit status unknown.
+function directoryEffect(raw, dir) {
+  const spec = directoryCommand(raw);
+  if (!spec) return { kind: "opaque" };
+  if (spec.name === "popd" || (spec.name === "pushd" && spec.args.length === 0)) return { kind: "unknown" };
+  const result = directoryAfterCd(spec.args, dir);
+  if (result.status === "ok") return { kind: "ok", dir: result.dir };
+  if (result.status === "fail") return { kind: "fail" };
+  return { kind: "unknown" };
+}
+
+function dedupeWorlds(worlds) {
+  const seen = new Set();
+  const out = [];
+  for (const w of worlds) {
+    const key = `${w.alive ? 1 : 0}\0${w.moved ? 1 : 0}\0${w.dir}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(w);
   }
-  const { commands, nested, piped, redirects } = parseShell(script);
-  for (const inner of nested) {
-    const why = checkScript(inner, root, cwd, depth + 1);
+  return out;
+}
+
+// Worlds in which the next command might run. null when a cd leaves that directory unknowable.
+// A pipeline stage or a backgrounded command is a subshell: its cd does not stick. && and || run the next
+// command only on success or failure, so a cd on the other side of && (false && cd sub; cat) must not be the
+// only directory cat is checked in.
+function advanceWorlds(worlds, raw, prevOp, nextOp) {
+  const inSubshell = prevOp === "|" || nextOp === "|" || nextOp === "&";
+  const sequential = nextOp == null || nextOp === ";" || nextOp === "\n";
+  const out = [];
+  for (const w of worlds) {
+    if (!w.alive) {
+      out.push(sequential ? { dir: w.dir, alive: true, moved: w.moved } : w);
+      continue;
+    }
+    const effect = inSubshell ? { kind: "opaque" } : directoryEffect(raw, w.dir);
+    if (effect.kind === "unknown") {
+      if (nextOp == null) {
+        out.push({ dir: null, alive: false, moved: true });
+        continue;
+      }
+      return null;
+    }
+    const dirAfter = effect.kind === "ok" ? effect.dir : w.dir;
+    const moved = w.moved || effect.kind === "ok";
+    const succeeded = effect.kind === "ok" ? true : effect.kind === "fail" ? false : null;
+    if (nextOp === "&&") {
+      if (succeeded === true) out.push({ dir: dirAfter, alive: true, moved });
+      else if (succeeded === false) out.push({ dir: w.dir, alive: false, moved: w.moved });
+      else {
+        out.push({ dir: w.dir, alive: true, moved: w.moved });
+        out.push({ dir: w.dir, alive: false, moved: w.moved });
+      }
+    } else if (nextOp === "||") {
+      if (succeeded === true) out.push({ dir: dirAfter, alive: false, moved });
+      else if (succeeded === false) out.push({ dir: w.dir, alive: true, moved: w.moved });
+      else {
+        out.push({ dir: w.dir, alive: false, moved: w.moved });
+        out.push({ dir: w.dir, alive: true, moved: w.moved });
+      }
+    } else if (inSubshell) {
+      out.push({ dir: w.dir, alive: true, moved: w.moved });
+    } else {
+      out.push({ dir: dirAfter, alive: true, moved });
+    }
+  }
+  const deduped = dedupeWorlds(out);
+  return deduped.length > 16 ? null : deduped;
+}
+
+function checkCommand(raw, bodies, redirs, wasPiped, here, moved, root, depth) {
+  for (const inner of bodies) {
+    const why = checkScript(inner, root, here, depth + 1);
     if (why) return why;
   }
-  let moved = false;  // after cd/pushd/popd a relative rm no longer resolves against the hook's starting directory
-  let here = cwd;  // directory the command actually runs in; cd/pushd update it, a subshell does not
   const scan = (text) => {
     for (const spelling of pathSpellings(text)) {
       const found = forbiddenPath(spelling, here) || forbiddenWildcard(spelling, here);
@@ -758,53 +841,62 @@ function checkScript(script, root, cwd, depth = 0) {
     }
     return null;
   };
-  for (const [index, raw] of commands.entries()) {
-    if (here === null) return "blocked command after a cd whose destination cannot be known";
-    if (raw[0] === SUBSHELL) {
-      for (const target of redirects[index]) {
-        const why = scan(target);
-        if (why) return why;
-      }
-      const why = checkScript(raw[1] ?? "", root, here, depth + 1);
-      if (why) return why;
-      continue;
-    }
-    for (const word of raw.concat(redirects[index])) {
-      const why = scan(word);
+  if (raw[0] === SUBSHELL) {
+    for (const target of redirs) {
+      const why = scan(target);
       if (why) return why;
     }
-    // Wrappers and keywords can put a command anywhere in the word list (nice -n 5 rm, then rm, xargs rm, ! rm),
-    // so shells, eval, rm and recursive readers are recognised at every position, not only the first.
-    for (let k = 0; k < raw.length; k++) {
-      const name = path.basename(raw[k]);
-      const args = raw.slice(k + 1);
-      let why = null;
-      if (SHELLS.has(name)) {
-        const flag = args.findIndex((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
-        if (flag >= 0 && args[flag + 1] !== undefined) why = checkScript(args[flag + 1], root, here, depth + 1);
-      } else if (name === "eval") why = checkScript(args.join(" "), root, here, depth + 1);
-      else if (name === "rm") why = checkRm(args, root, here, moved);
-      else if (name in READERS || name === "find") {
-        why = checkReader(name, args, here, piped[index] || raw.slice(0, k).some((w) => FEEDERS.has(path.basename(w))));
-      }
-      if (why) return why;
-    }
-    const words = stripPrefix(raw);
-    if (!words.length) continue;
-    const name = path.basename(words[0]);
-    const why = name === "git" || name === "gh" ? checkGit(name, words.slice(1)) : null;
+    return checkScript(raw[1] ?? "", root, here, depth + 1);
+  }
+  for (const word of raw.concat(redirs)) {
+    const why = scan(word);
     if (why) return why;
-    let cmd = words;
-    while (cmd.length && SHELL_KEYWORDS.has(path.basename(cmd[0]))) cmd = cmd.slice(1);
-    if (!cmd.length) continue;
-    const cmdName = path.basename(cmd[0]);
-    if (cmdName === "cd") {
-      here = directoryAfterCd(cmd.slice(1), here);
-      moved = true;
-    } else if (cmdName === "pushd" || cmdName === "popd") {
-      here = cmdName === "pushd" && cmd.length > 1 ? directoryAfterCd(cmd.slice(1), here) : null;
-      moved = true;
+  }
+  // Wrappers and keywords can put a command anywhere in the word list (nice -n 5 rm, then rm, xargs rm, ! rm),
+  // so shells, eval, rm and recursive readers are recognised at every position, not only the first.
+  for (let k = 0; k < raw.length; k++) {
+    const name = path.basename(raw[k]);
+    const args = raw.slice(k + 1);
+    let why = null;
+    if (SHELLS.has(name)) {
+      const flag = args.findIndex((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
+      if (flag >= 0 && args[flag + 1] !== undefined) why = checkScript(args[flag + 1], root, here, depth + 1);
+    } else if (name === "eval") why = checkScript(args.join(" "), root, here, depth + 1);
+    else if (name === "rm") why = checkRm(args, root, here, moved);
+    else if (name in READERS || name === "find") {
+      why = checkReader(name, args, here, wasPiped || raw.slice(0, k).some((w) => FEEDERS.has(path.basename(w))));
     }
+    if (why) return why;
+  }
+  const words = stripPrefix(raw);
+  if (!words.length) return null;
+  const name = path.basename(words[0]);
+  return name === "git" || name === "gh" ? checkGit(name, words.slice(1)) : null;
+}
+
+function checkScript(script, root, cwd, depth = 0) {
+  if (depth > 8) return "blocked deeply nested shell command";
+  if (FORBIDDEN_GIT.test(String(script).replace(/\\\r?\n/g, " ").replace(/\s+/g, " "))) {
+    return "blocked destructive git/gh command in headless Claude job";
+  }
+  const { commands, nested, piped, redirects, separators } = parseShell(script);
+  // Each world is a directory this command might actually run in. &&/|| keep both sides: Bash skips
+  // `cd` after a failing command, and a command substitution runs in the directory its command reaches.
+  let worlds = [{ dir: cwd, alive: true, moved: false }];
+  for (const [index, raw] of commands.entries()) {
+    const seen = new Set();
+    for (const w of worlds) {
+      if (!w.alive) continue;
+      if (!w.dir) return "blocked command after a cd whose destination cannot be known";
+      const key = `${w.moved ? 1 : 0}\0${w.dir}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const why = checkCommand(raw, nested[index] || [], redirects[index], piped[index], w.dir, w.moved, root, depth);
+      if (why) return why;
+    }
+    const prevOp = index === 0 ? null : separators[index - 1];
+    worlds = advanceWorlds(worlds, raw, prevOp, separators[index]);
+    if (worlds === null) return "blocked command after a cd whose destination cannot be known";
   }
   return null;
 }

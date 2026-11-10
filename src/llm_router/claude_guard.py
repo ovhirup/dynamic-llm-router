@@ -435,19 +435,21 @@ def _ansi_c(body):
 
 
 def parse_shell(script):
-    """(commands, nested, piped, redirects): simple commands as lists of unquoted words, split on newline ; & | ( ),
-    with line continuations joined. A redirection (`<` `>` `>>` `<>` `>&` `&>` `&>>` `>|` and an fd prefix such as
-    `2>`) does not end the command and its target is not an operand: targets come back in `redirects`, parallel to
-    `commands`. Braces stay in the word; $'...' (ANSI-C, decoded) and $"..." are strings; $(...), `...`, <(...) and
-    >(...) bodies come back as nested scripts and leave a '$' in the word. >(...) is a process substitution, including
-    as the target of a redirect (`2> >(cmd)`): it does not end the command, so later operands stay. Mirrors
-    guard-lib.mjs parseShell."""
+    """(commands, nested, piped, redirects, separators): simple commands as lists of unquoted words, split on
+    newline ; & | ( ), with line continuations joined. `separators[i]` is the operator that ended `commands[i]`
+    (`&&` and `||` are one operator each; null on the last command). A redirection (`<` `>` `>>` `<>` `>&` `&>`
+    `&>>` `>|` and an fd prefix such as `2>`) does not end the command and its target is not an operand: targets
+    come back in `redirects`, parallel to `commands`. Braces stay in the word; $'...' (ANSI-C, decoded) and $"..."
+    are strings; $(...), `...`, <(...) and >(...) bodies come back in `nested[i]` and leave a '$' in the word.
+    >(...) is a process substitution, including as the target of a redirect (`2> >(cmd)`): it does not end the
+    command, so later operands stay. Mirrors guard-lib.mjs parseShell."""
     src = re.sub(r'\\\r?\n', '', str(script if script is not None else ''))
     commands, nested, redirects, words, word = [], [], [], [], None
-    pending_redirects, taking_redirect = [], False
+    pending_redirects, pending_nested, taking_redirect = [], [], False
+    separators = []
     i, n = 0, len(src)
 
-    def substitution(start):  # src[start] is the '(' of $( or <(
+    def substitution(start):  # src[start] is the '(' of $(, <( or >(
         depth = 0
         for j in range(start, n):
             if src[j] == '(':
@@ -455,14 +457,14 @@ def parse_shell(script):
             elif src[j] == ')':
                 depth -= 1
                 if depth == 0:
-                    nested.append(src[start + 1:j])
+                    pending_nested.append(src[start + 1:j])
                     return j + 1
-        nested.append(src[start + 1:])
+        pending_nested.append(src[start + 1:])
         return n
 
     def backtick(start):
         end = src.find('`', start + 1)
-        nested.append(src[start + 1:end if end >= 0 else n])
+        pending_nested.append(src[start + 1:end if end >= 0 else n])
         return end + 1 if end >= 0 else n
 
     def take_group(start):
@@ -502,13 +504,15 @@ def parse_shell(script):
     piped, pipe_seen = [], False  # piped[n]: a '|' came anywhere before commands[n]
 
     def end_command(separator=None):
-        nonlocal words, pipe_seen, pending_redirects, taking_redirect
+        nonlocal words, pipe_seen, pending_redirects, pending_nested, taking_redirect
         end_word()
         if words or pending_redirects:
             commands.append(words)
             piped.append(pipe_seen)
             redirects.append(list(pending_redirects))
-        words, pending_redirects, taking_redirect = [], [], False
+            nested.append(list(pending_nested))
+            separators.append(separator or None)
+        words, pending_redirects, pending_nested, taking_redirect = [], [], [], False
         if separator == '|':
             pipe_seen = True
 
@@ -586,6 +590,9 @@ def parse_shell(script):
         elif ch in ' \t':
             end_word()
             i += 1
+        elif ch == '&' and src[i + 1:i + 2] == '&':
+            end_command('&&')
+            i += 2
         elif ch == '|' and src[i + 1:i + 2] == '|':
             end_command('||')
             i += 2
@@ -607,7 +614,7 @@ def parse_shell(script):
             word = (word or '') + ch
             i += 1
     end_command()
-    return commands, nested, piped, redirects
+    return commands, nested, piped, redirects, separators
 
 
 def _strip_prefix(words):
@@ -791,10 +798,10 @@ def _path_spellings(word):
 
 
 def _directory_after_cd(args, cwd):
-    """Directory a static `cd` lands in. The unchanged `cwd` when `cd` fails. None when the destination is unknowable
-    (`cd -`, a variable, a glob, an option this does not model)."""
+    """Where a static cd lands. {'status': 'ok', 'dir'} when the destination is a directory, {'status': 'fail'}
+    when it is not (Bash stays put), {'status': 'unknown'} for cd -, a variable, a glob, or an unmodelled option."""
     if not cwd:
-        return None
+        return {'status': 'unknown'}
     dest, end_options = None, False
     for arg in args:
         if not end_options and arg == '--':
@@ -803,31 +810,112 @@ def _directory_after_cd(args, cwd):
         if not end_options and arg.startswith('-'):
             if arg in ('-L', '-P', '-e', '-@') or re.fullmatch(r'-[LPe@]+', arg):
                 continue
-            return None
+            return {'status': 'unknown'}
         if dest is not None:
-            return None
+            return {'status': 'unknown'}
         dest = arg
     if dest is None:
         home = resolve_real('~', '/')
-        return home if home and os.path.isdir(home) else cwd
+        return {'status': 'ok', 'dir': home} if home and os.path.isdir(home) else {'status': 'fail', 'dir': cwd}
     if re.search(r'[$`*?[{]', dest):
-        return None
+        return {'status': 'unknown'}
     landed = resolve_real(dest, cwd)
-    return landed if landed and os.path.isdir(landed) else cwd
+    return {'status': 'ok', 'dir': landed} if landed and os.path.isdir(landed) else {'status': 'fail', 'dir': cwd}
 
 
-def _check_script(script, root, cwd, depth=0):
-    if depth > 8:
-        return 'blocked deeply nested shell command'
-    if FORBIDDEN_GIT_RE.search(re.sub(r'\s+', ' ', re.sub(r'\\\r?\n', ' ', str(script)))):
-        return 'blocked destructive git/gh command in headless Claude job'
-    commands, nested, piped, redirects = parse_shell(script)
-    for inner in nested:
-        why = _check_script(inner, root, cwd, depth + 1)
+def _directory_command(raw):
+    """cd/pushd/popd after wrappers and keywords, or None when this command does not change the directory."""
+    if raw[:1] == [_SUBSHELL]:
+        return None
+    words = _strip_prefix(raw)
+    while words and os.path.basename(words[0]) in SHELL_KEYWORDS:
+        words = words[1:]
+    if not words:
+        return None
+    name = os.path.basename(words[0])
+    if name in ('cd', 'pushd', 'popd'):
+        return name, words[1:]
+    return None
+
+
+def _directory_effect(raw, directory):
+    """Effect on later commands when this one actually runs. 'opaque': directory unchanged, exit status unknown."""
+    spec = _directory_command(raw)
+    if spec is None:
+        return {'kind': 'opaque'}
+    name, args = spec
+    if name == 'popd' or (name == 'pushd' and not args):
+        return {'kind': 'unknown'}
+    result = _directory_after_cd(args, directory)
+    if result['status'] == 'ok':
+        return {'kind': 'ok', 'dir': result['dir']}
+    if result['status'] == 'fail':
+        return {'kind': 'fail'}
+    return {'kind': 'unknown'}
+
+
+def _dedupe_worlds(worlds):
+    seen, out = set(), []
+    for world in worlds:
+        key = (world['alive'], world['moved'], world['dir'])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(world)
+    return out
+
+
+def _advance_worlds(worlds, raw, prev_op, next_op):
+    """Worlds in which the next command might run. None when a cd leaves that directory unknowable.
+
+    A pipeline stage or a backgrounded command is a subshell: its cd does not stick. && and || run the next
+    command only on success or failure, so a cd on the other side of && (`false && cd sub; cat`) must not be the
+    only directory cat is checked in."""
+    in_subshell = prev_op == '|' or next_op == '|' or next_op == '&'
+    sequential = next_op is None or next_op in (';', '\n')
+    out = []
+    for world in worlds:
+        if not world['alive']:
+            out.append({'dir': world['dir'], 'alive': True, 'moved': world['moved']} if sequential else world)
+            continue
+        effect = {'kind': 'opaque'} if in_subshell else _directory_effect(raw, world['dir'])
+        if effect['kind'] == 'unknown':
+            if next_op is None:
+                out.append({'dir': None, 'alive': False, 'moved': True})
+                continue
+            return None
+        dir_after = effect['dir'] if effect['kind'] == 'ok' else world['dir']
+        moved = world['moved'] or effect['kind'] == 'ok'
+        succeeded = True if effect['kind'] == 'ok' else False if effect['kind'] == 'fail' else None
+        if next_op == '&&':
+            if succeeded is True:
+                out.append({'dir': dir_after, 'alive': True, 'moved': moved})
+            elif succeeded is False:
+                out.append({'dir': world['dir'], 'alive': False, 'moved': world['moved']})
+            else:
+                out.append({'dir': world['dir'], 'alive': True, 'moved': world['moved']})
+                out.append({'dir': world['dir'], 'alive': False, 'moved': world['moved']})
+        elif next_op == '||':
+            if succeeded is True:
+                out.append({'dir': dir_after, 'alive': False, 'moved': moved})
+            elif succeeded is False:
+                out.append({'dir': world['dir'], 'alive': True, 'moved': world['moved']})
+            else:
+                out.append({'dir': world['dir'], 'alive': False, 'moved': world['moved']})
+                out.append({'dir': world['dir'], 'alive': True, 'moved': world['moved']})
+        elif in_subshell:
+            out.append({'dir': world['dir'], 'alive': True, 'moved': world['moved']})
+        else:
+            out.append({'dir': dir_after, 'alive': True, 'moved': moved})
+    deduped = _dedupe_worlds(out)
+    return None if len(deduped) > 16 else deduped
+
+
+def _check_command(raw, bodies, redirs, was_piped, here, moved, root, depth):
+    for inner in bodies:
+        why = _check_script(inner, root, here, depth + 1)
         if why:
             return why
-    moved = False  # after cd/pushd/popd a relative rm no longer resolves against the hook's starting directory
-    here = cwd  # directory the command actually runs in; cd/pushd update it, a subshell does not
 
     def scan(text):
         for spelling in _path_spellings(text):
@@ -836,59 +924,68 @@ def _check_script(script, root, cwd, depth=0):
                 return why
         return None
 
-    for index, raw in enumerate(commands):
-        if here is None:
-            return 'blocked command after a cd whose destination cannot be known'
-        if raw[:1] == [_SUBSHELL]:
-            for target in redirects[index]:
-                why = scan(target)
-                if why:
-                    return why
-            why = _check_script(raw[1] if len(raw) > 1 else '', root, here, depth + 1)
+    if raw[:1] == [_SUBSHELL]:
+        for target in redirs:
+            why = scan(target)
             if why:
                 return why
-            continue
-        for word in list(raw) + redirects[index]:
-            why = scan(word)
-            if why:
-                return why
-        # Wrappers and keywords can put a command anywhere (nice -n 5 rm, then rm, xargs rm, ! rm), so shells, eval,
-        # rm and recursive readers are recognised at every position, not only the first.
-        for k, word in enumerate(raw):
-            name, args = os.path.basename(word), raw[k + 1:]
-            why = None
-            if name in SHELLS:
-                flag = next((j for j, a in enumerate(args) if re.fullmatch(r'-[A-Za-z]*c[A-Za-z]*', a)), None)
-                if flag is not None and flag + 1 < len(args):
-                    why = _check_script(args[flag + 1], root, here, depth + 1)
-            elif name == 'eval':
-                why = _check_script(' '.join(args), root, here, depth + 1)
-            elif name == 'rm':
-                why = _check_rm(args, root, here, moved)
-            elif name in READERS or name == 'find':
-                why = _check_reader(name, args, here,
-                                    piped[index] or any(os.path.basename(w) in FEEDERS for w in raw[:k]))
-            if why:
-                return why
-        words = _strip_prefix(raw)
-        if not words:
-            continue
-        name = os.path.basename(words[0])
-        why = _check_git(name, words[1:]) if name in ('git', 'gh') else None
+        return _check_script(raw[1] if len(raw) > 1 else '', root, here, depth + 1)
+    for word in list(raw) + redirs:
+        why = scan(word)
         if why:
             return why
-        cmd = words
-        while cmd and os.path.basename(cmd[0]) in SHELL_KEYWORDS:
-            cmd = cmd[1:]
-        if not cmd:
-            continue
-        cmd_name = os.path.basename(cmd[0])
-        if cmd_name == 'cd':
-            here = _directory_after_cd(cmd[1:], here)
-            moved = True
-        elif cmd_name in ('pushd', 'popd'):
-            here = _directory_after_cd(cmd[1:], here) if cmd_name == 'pushd' and len(cmd) > 1 else None
-            moved = True
+    # Wrappers and keywords can put a command anywhere (nice -n 5 rm, then rm, xargs rm, ! rm), so shells, eval,
+    # rm and recursive readers are recognised at every position, not only the first.
+    for k, word in enumerate(raw):
+        name, args = os.path.basename(word), raw[k + 1:]
+        why = None
+        if name in SHELLS:
+            flag = next((j for j, a in enumerate(args) if re.fullmatch(r'-[A-Za-z]*c[A-Za-z]*', a)), None)
+            if flag is not None and flag + 1 < len(args):
+                why = _check_script(args[flag + 1], root, here, depth + 1)
+        elif name == 'eval':
+            why = _check_script(' '.join(args), root, here, depth + 1)
+        elif name == 'rm':
+            why = _check_rm(args, root, here, moved)
+        elif name in READERS or name == 'find':
+            why = _check_reader(name, args, here, was_piped or any(os.path.basename(w) in FEEDERS for w in raw[:k]))
+        if why:
+            return why
+    words = _strip_prefix(raw)
+    if not words:
+        return None
+    name = os.path.basename(words[0])
+    return _check_git(name, words[1:]) if name in ('git', 'gh') else None
+
+
+def _check_script(script, root, cwd, depth=0):
+    if depth > 8:
+        return 'blocked deeply nested shell command'
+    if FORBIDDEN_GIT_RE.search(re.sub(r'\s+', ' ', re.sub(r'\\\r?\n', ' ', str(script)))):
+        return 'blocked destructive git/gh command in headless Claude job'
+    commands, nested, piped, redirects, separators = parse_shell(script)
+    # Each world is a directory this command might actually run in. &&/|| keep both sides: Bash skips cd after a
+    # failing command, and a command substitution runs in the directory its command reaches.
+    worlds = [{'dir': cwd, 'alive': True, 'moved': False}]
+    for index, raw in enumerate(commands):
+        seen = set()
+        for world in worlds:
+            if not world['alive']:
+                continue
+            if not world['dir']:
+                return 'blocked command after a cd whose destination cannot be known'
+            key = (world['moved'], world['dir'])
+            if key in seen:
+                continue
+            seen.add(key)
+            why = _check_command(raw, nested[index] if index < len(nested) else [], redirects[index], piped[index],
+                                 world['dir'], world['moved'], root, depth)
+            if why:
+                return why
+        prev_op = None if index == 0 else separators[index - 1]
+        worlds = _advance_worlds(worlds, raw, prev_op, separators[index])
+        if worlds is None:
+            return 'blocked command after a cd whose destination cannot be known'
     return None
 
 
