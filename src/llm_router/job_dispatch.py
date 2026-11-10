@@ -593,16 +593,14 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
     except Exception as error:
         summary['warnings'].append(f'scorecard update failed: {type(error).__name__}: '
                                    f'{security.redact(str(error))[:200]}')
-    jobs_dir = _path(policy, 'jobs_dir', 'logs/jobs')
-    jobs_dir.mkdir(parents=True, exist_ok=True)
-    (jobs_dir / f'{job_id}.json').write_text(json.dumps(summary, indent=2))
+    summary = _store_job(policy, summary)
     try:  # the vault note is a by-product: never fail the job over it
         note_path = brain.write_job_outcome(policy, summary)
     except OSError as error:
         note_path = None
         summary['warnings'].append(f'vault note not written: {security.redact(str(error))[:200]}')
     summary['vault_note'] = str(note_path) if note_path else None
-    (jobs_dir / f'{job_id}.json').write_text(json.dumps(summary, indent=2))
+    summary = _store_job(policy, summary)
     td.append_ledger(td._router_path(policy, 'ledger', 'logs/ledger.csv'),
                      [started.strftime('%Y-%m-%d %H:%M'), 'run-job', f'run-job {job_id} {task_path.name}',
                       '+'.join(summary['workers']) or 'none', '',
@@ -1107,6 +1105,36 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
             summary['status'] = 'review_rejected'
 
 
+def _verdict_recorded(job):
+    review = (job or {}).get('review') or {}
+    return review.get('status') == 'recorded' and review.get('verdict') in ('approve', 'reject')
+
+
+def _store_job(policy, job):
+    """Persist a job. A recorded verdict already on disk wins over this snapshot.
+
+    ``--prune`` and worktree cleanup can still hold the pending summary from before the
+    verdict was recorded. Writing that snapshot back would restore ``ok`` and drop the verdict.
+    """
+    jobs_dir = _path(policy, 'jobs_dir', 'logs/jobs')
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    path = jobs_dir / f'{job["job_id"]}.json'
+    with RepoLock(_path(policy, 'lock_dir', 'logs/locks'), Path(job.get('repo') or '.')):
+        current = None
+        if path.is_file():
+            try:
+                current = json.loads(path.read_text())
+            except json.JSONDecodeError:
+                current = None
+        if _verdict_recorded(current):
+            job = dict(job)
+            job['review'] = current['review']
+            job['ok'] = current['ok']
+            job['status'] = current['status']
+        path.write_text(json.dumps(job, indent=2))
+    return job
+
+
 def _retain_pending_packet(policy, summary):
     """Copy a pending Grok Bot packet out of the worktree before that worktree is removed.
 
@@ -1229,8 +1257,9 @@ def cleanup(older_than, dry_run=False, policy=None, now=None):
                 report['skipped'].append({'worktree': str(worktree), 'why': 'pending review packet missing'})
                 continue
             if kept is True:
-                (_path(policy, 'jobs_dir', 'logs/jobs') / f'{job["job_id"]}.json').write_text(
-                    json.dumps(job, indent=2))
+                # Re-read under the repo lock. A verdict recorded after this snapshot was loaded
+                # must not be replaced by the pending copy, and ok must not flip back to true.
+                _store_job(policy, job)
             # --force only discards the job's own recorded test artifacts and untracked interpreter caches
             # (changed_paths hides those, so git still sees them as dirty); both were checked above.
             force = bool(pending) or _has_changes(worktree)

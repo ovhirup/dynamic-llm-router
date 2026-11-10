@@ -10,6 +10,7 @@ merge_queue.record_review, bound to the head that was reviewed. A single run-job
 Never pushes, never merges, never opens a PR: the best outcome is `ready_for_human`, and a human "yes" for main
 stays outside this module.
 """
+import re
 from pathlib import Path
 
 from . import claude_handoff, config, merge_queue, security
@@ -99,21 +100,54 @@ def parse_verdict(text):
     return outputs.parse_json(text, outputs.UNIT_VERDICT_V1, outputs.MAX_UNIT_VERDICT_BYTES)
 
 
-def _stdout_from_task_log(raw):
-    """Stdout sections of a run_task log. A log with no sections is already the process output."""
-    if '--- stdout\n' not in raw:
-        return raw
+# A run_task record header. A `--- stdout` marker that is not this header is payload, not a new section.
+_RECORD_STDOUT = re.compile(r'(?m)^\$ exit=\S+ timed_out=\S+ elapsed=\S+\n--- stdout\n')
+
+
+def _record_stdouts(raw):
+    """Stdout bodies of run_task records.
+
+    Bytes after ``--- stderr`` stay stderr. A forged ``--- stdout`` header or a forged stream-json
+    result there does not become another stdout section unless it is its own ``$ exit=`` record,
+    and a verdict already in the first record is preferred over any later record.
+    """
+    if not raw or '--- stdout\n' not in raw:
+        return [raw or '']
+    matches = list(_RECORD_STDOUT.finditer(raw))
+    if not matches:
+        return [raw]
     chunks = []
-    for part in raw.split('--- stdout\n')[1:]:
-        chunks.append(part.split('\n--- stderr\n', 1)[0])
-    return '\n'.join(chunks)
+    for match in matches:
+        body = match.end()
+        end = raw.find('\n--- stderr\n', body)
+        chunks.append(raw[body:] if end == -1 else raw[body:end])
+    return chunks
+
+
+def _stdout_from_task_log(raw):
+    """Stdout of a run_task log. A log with no record headers is already the process output.
+
+    When the first stdout record already carries a verdict, later records cannot override it.
+    """
+    from . import claude_handoff
+    chunks = _record_stdouts(raw or '')
+    if len(chunks) <= 1:
+        return chunks[0] if chunks else ''
+    first = claude_handoff.inspect(chunks[0]).get('text') or ''
+    try:
+        parse_verdict(first)
+    except outputs.InvalidStructuredOutput:
+        return '\n'.join(chunks)
+    return chunks[0]
 
 
 def review_output_text(raw):
     """The reviewer text inside a run_task transcript.
 
-    Claude's command is stream-json, so the verdict is the last result event, the same extraction
-    batch review uses. Plain stdout is its own final text.
+    Claude's command is stream-json, so the verdict is the last result event of the trusted
+    stdout, the same extraction batch review uses. Plain stdout is its own final text. Stderr,
+    including a forged stdout header or a forged stream-json result, cannot override a verdict
+    already present on stdout.
     """
     from . import claude_handoff
     stdout = _stdout_from_task_log(raw or '')
@@ -188,6 +222,14 @@ def _dirty(worktree):
     return bool(_git(worktree, 'status', '--porcelain').stdout.strip())
 
 
+def _worktree_status(worktree):
+    """Porcelain status, or None when the worktree is already gone."""
+    worktree = Path(worktree)
+    if not worktree.is_dir():
+        return None
+    return _git(worktree, 'status', '--porcelain').stdout
+
+
 def dispatch_review(packet, prompt, policy, reviewers=REVIEWERS, reviewer=None):
     """Run one stronger-model review. Claude first; if Claude is unavailable, hand the packet to Grok Bot.
 
@@ -200,6 +242,8 @@ def dispatch_review(packet, prompt, policy, reviewers=REVIEWERS, reviewer=None):
         if name not in REVIEWERS:
             raise Refused(f'reviewer must be one of {REVIEWERS}')
     worktree = Path(packet['worktree'])
+    # Dirt that was already present (a test artifact) is not a patch from this review run.
+    before_status = _worktree_status(worktree)
     tried = []
     for name in reviewers:
         result = reviewer(name, packet, prompt, policy)
@@ -231,7 +275,8 @@ def dispatch_review(packet, prompt, policy, reviewers=REVIEWERS, reviewer=None):
             return {'ok': False, 'status': 'stale', 'reviewer': name, 'tried': tried,
                     'reason': 'unit head moved during review; re-queue the unit; nothing recorded'}
         notes = security.redact(parsed['notes'].strip()[-4000:])
-        if verdict == 'approve' and worktree.is_dir() and _dirty(worktree):
+        after_status = _worktree_status(worktree)
+        if verdict == 'approve' and after_status and after_status != before_status:
             verdict, notes = 'reject', ('reviewer left uncommitted patches; commit them and re-queue.\n' + notes)
         return {'ok': verdict == 'approve', 'status': 'recorded', 'verdict': verdict, 'notes': notes,
                 'reviewer': name, 'tried': tried, 'head': packet['head']}
