@@ -438,8 +438,10 @@ def parse_shell(script):
     """(commands, nested, piped, redirects): simple commands as lists of unquoted words, split on newline ; & | ( ),
     with line continuations joined. A redirection (`<` `>` `>>` `<>` `>&` `&>` `&>>` `>|` and an fd prefix such as
     `2>`) does not end the command and its target is not an operand: targets come back in `redirects`, parallel to
-    `commands`. Braces stay in the word; $'...' (ANSI-C, decoded) and $"..." are strings; $(...), `...` and <(...)
-    bodies come back as nested scripts and leave a '$' in the word. Mirrors guard-lib.mjs parseShell."""
+    `commands`. Braces stay in the word; $'...' (ANSI-C, decoded) and $"..." are strings; $(...), `...`, <(...) and
+    >(...) bodies come back as nested scripts and leave a '$' in the word. >(...) is a process substitution, including
+    as the target of a redirect (`2> >(cmd)`): it does not end the command, so later operands stay. Mirrors
+    guard-lib.mjs parseShell."""
     src = re.sub(r'\\\r?\n', '', str(script if script is not None else ''))
     commands, nested, redirects, words, word = [], [], [], [], None
     pending_redirects, taking_redirect = [], False
@@ -566,7 +568,8 @@ def parse_shell(script):
                     word += src[i]
                     i += 1
             i += 1
-        elif ch in '$<' and src[i + 1:i + 2] == '(':
+        elif ch in '$<>' and src[i + 1:i + 2] == '(':
+            # $(...), <(...) and >(...). The last is not '>' plus a subshell: that split would drop later rm operands.
             word = (word or '') + '$'
             i = substitution(i + 1)
         elif ch == '`':

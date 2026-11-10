@@ -369,8 +369,9 @@ function ansiC(body) {
 // A redirection (< > >> <> >& &> &>> >| and an fd prefix such as 2>) does not end the command and its target is
 // not an operand: targets come back in `redirects`, parallel to `commands`. Braces stay in the word (brace
 // expansion is checked by rm/glob rules). Line continuations are joined, quotes, $'...' (ANSI-C, decoded) and
-// $"..." and backslashes removed. $(...), `...` and <(...) bodies are returned as nested scripts and leave a "$"
-// in the word, so a target built from them is never treated as resolvable.
+// $"..." and backslashes removed. $(...), `...`, <(...) and >(...) bodies are returned as nested scripts and leave
+// a "$" in the word, so a target built from them is never treated as resolvable. >(...) is a process substitution,
+// including as the target of a redirect (`2> >(cmd)`): it does not end the command, so later operands stay.
 export function parseShell(script) {
   const commands = [];
   const nested = [];
@@ -474,7 +475,8 @@ export function parseShell(script) {
         }
       }
       i++;
-    } else if ((ch === "$" || ch === "<") && src[i + 1] === "(") {
+    } else if ((ch === "$" || ch === "<" || ch === ">") && src[i + 1] === "(") {
+      // $(...), <(...) and >(...) . The last is not `>` plus a subshell: that split would drop later rm operands.
       add("$");
       i = substitution(i + 1);
     } else if (ch === "`") {
