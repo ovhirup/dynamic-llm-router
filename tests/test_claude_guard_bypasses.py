@@ -77,6 +77,9 @@ CASES = [
     blocked('Bash', {'command': 'rm -r -f inside >>/dev/null ../outside'}),
     blocked('Bash', {'command': 'rm -r -f inside 2>/dev/null ../outside'}),
     blocked('Bash', {'command': 'rm -r -f inside &>/dev/null ../outside'}),
+    # process substitution is not a command boundary: Bash still passes every later operand to rm (#215)
+    blocked('Bash', {'command': 'rm -r -f inside >(cat) ../outside'}),
+    blocked('Bash', {'command': 'rm -r -f inside 2> >(cat) ../outside'}),
     allowed('Bash', {'command': 'rm -rf build/cache >/dev/null'}),
     # '=' is not a filename delimiter; paths resolve after cd; nested braces reach the same credential (#215)
     blocked('Bash', {'command': 'cat notes=public'}),
