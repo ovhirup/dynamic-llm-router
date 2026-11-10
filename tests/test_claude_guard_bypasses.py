@@ -90,6 +90,11 @@ CASES = [
     blocked('Glob', {'pattern': '*.{py,{txt,md}}'}),
     blocked('Bash', {'command': 'cat *.{py,{txt,md}}'}),
     blocked('Bash', {'command': '(cd sub); cat notes.txt'}),
+    # braces expand before '/' is split; '..' follows a symlink before it walks up (#215)
+    blocked('Bash', {'command': 'cat {regular,{sub/shortcut,regular}}'}),
+    blocked('Bash', {'command': 'cat escape/../*.witness'}),
+    blocked('Glob', {'pattern': '{regular,{sub/shortcut,regular}}'}),
+    blocked('Glob', {'pattern': 'escape/../*.witness'}),
     allowed('Bash', {'command': 'cd src && cat app.py'}),
     allowed('Glob', {'pattern': '*.{py,md}'}),
     allowed('Bash', {'command': 'ls *.{py,md}'}),
@@ -204,8 +209,9 @@ def discover_pretooluse_commands(root):
 class GuardFixture:
     """worktree/ (src/app.py, build/cache/, inside/, .env, .env.example, config/keys/auth.json, notes.txt,
     'notes2.txt ' and notes=public -> ~/.codex/auth.json, sub/shortcut -> the same auth.json, cfglink ->
-    ~/.config/llm-router, escape -> ../outside, dang -> a missing path), outside/, home/.codex (+ sub/),
-    home/link -> ~/.codex/sub, home/.config/llm-router."""
+    ~/.config/llm-router, escape -> ../outside, dang -> a missing path, regular is an ordinary file,
+    <tmp>/secret.witness -> ~/.codex/auth.json so escape/../*.witness reaches it only after the link is followed),
+    outside/, home/.codex (+ sub/), home/link -> ~/.codex/sub, home/.config/llm-router."""
 
     def __init__(self):
         self.tmp = tempfile.TemporaryDirectory()  # under /var/folders on macOS, i.e. through a symlink
@@ -229,6 +235,9 @@ class GuardFixture:
         (self.worktree / 'escape').symlink_to(self.outside)
         (self.worktree / 'notes2.txt ').symlink_to(self.home / '.codex' / 'auth.json')
         (self.worktree / 'dang').symlink_to(root / 'missing-dir' / 'a' / 'b')
+        (self.worktree / 'regular').write_text('')
+        # reached only by following escape, then '..'; a lexical '..' cancels the link and stays in the worktree
+        (root / 'secret.witness').symlink_to(self.home / '.codex' / 'auth.json')
         (self.worktree / 'config' / 'keys').mkdir(parents=True)
         (self.worktree / 'config' / 'keys' / 'auth.json').write_text('{}')
         (self.home / '.codex' / 'sub').mkdir()
