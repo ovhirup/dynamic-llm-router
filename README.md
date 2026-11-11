@@ -2,18 +2,27 @@
 
 [![CI](https://github.com/ovhirup/dynamic-llm-router/actions/workflows/ci.yml/badge.svg)](https://github.com/ovhirup/dynamic-llm-router/actions/workflows/ci.yml)
 
-**Bring any worker. You choose and rank your coding workers; there is no default order.**
-Built-in adapters and config-defined adapters let you use any CLI.
-`llm-router` picks a worker (Claude Code, Codex, Grok Build, Cursor or a local model) based on
-each tool's *live* usage meter, runs the task headless in a throwaway git worktree, tests it, leak-checks it,
-commits it on a `router/*` branch and then stops. Nothing is pushed or merged until a human approves the
-exact commit.
+**Dynamic LLM Router is a trust and policy layer for AI coding agents.** It picks who does the work from live quota meters, checks the work with a different model, and will not push or merge anything a human has not approved by exact commit. It is not another multi-agent desktop dashboard; it is open source and headless, so any orchestrator, editor, or agent app can call it.
 
-It is built for people who pay for several AI coding subscriptions and want to spend each pool evenly
-without babysitting terminals, and without ever leaking a private repo name or key into a public PR.
+You choose and rank your workers; there is no default order. Built-in and config-defined adapters let you use any CLI. It is built for people who pay for several AI coding subscriptions and want to spend each pool evenly without babysitting terminals, and without leaking a private repo name or key into a public PR.
 
-> Status: alpha (0.4). macOS and Linux. Python 3.10+, no third-party dependencies.
+> Status: alpha (0.4). macOS and Linux. Python 3.10+, no third-party dependencies. Licensed under AGPL-3.0.
 > Works with Codex, Grok, Cursor and Claude Code CLIs; not affiliated with or endorsed by any of them.
+
+### Built
+
+- **Routing by live quota.** Unknown, stale, or unparseable meters make that worker ineligible; the router never guesses a number.
+- **Isolated jobs.** Every job runs headless in a throwaway worktree. Untested work is refused. The main checkout is never touched.
+- **Leak gate.** Every run, commit, and push is scanned for secrets and your private terms.
+- **SHA-bound approval.** Push and merge need a human approval tied to the exact commit. Approvals expire and are single-use.
+- **Stronger-model review.** Review-required `run-job` outputs and queued units are reviewed by Claude first; if Claude is unavailable, a packet is handed to the orchestrator for Grok Bot and review stays pending until a verdict is recorded.
+- **Local MCP server.** The same CLI is available over local stdio. Default tools are read-only; this has been verified with Codex and Cursor. Approval, push, and merge stay in the CLI.
+- **Local models.** An optional OpenAI-compatible `developer` worker can draft against a local endpoint. It is off by default.
+
+### Coming
+
+- A check-command gate any tool can run, such as CI, a git hook, or an agent app.
+- An honest end-to-end demo recorded from real runs of shipped commands only.
 
 > **Routing strategy:** see [docs/ROUTING_STRATEGY.md](docs/ROUTING_STRATEGY.md), the master architecture (worker order, selection, parallel dispatch, switching, Router Brain).
 > Worker ranking and fallback rules: see [docs/STRATEGY_WORKERS_FALLBACK.md](docs/STRATEGY_WORKERS_FALLBACK.md).
