@@ -9,16 +9,18 @@ from llm_router import claude_guard, task_dispatch as td
 
 class ClaudeGuardTests(unittest.TestCase):
     def test_blocks_secrets_reads_and_allows_env_example(self):
+        wt = tempfile.mkdtemp(prefix='guard-wt-')
+        self.addCleanup(lambda: __import__('shutil').rmtree(wt, ignore_errors=True))
         for forbidden in ('.env', '.env.local', '~/.codex/auth.json', '~/.config/llm-router/config.json',
                           'keys/AuthKey_123.p8', '/tmp/auth.json'):
             with self.subTest(path=forbidden):
-                verdict = claude_guard.evaluate_tool_call('Read', {'file_path': forbidden})
+                verdict = claude_guard.evaluate_tool_call('Read', {'file_path': forbidden}, worktree=wt)
                 self.assertFalse(verdict['allow'], forbidden)
                 self.assertIsNotNone(verdict['reason'])
 
         for allowed in ('.env.example', 'src/llm_router/cli.py', 'tests/test_cli.py'):
             with self.subTest(path=allowed):
-                verdict = claude_guard.evaluate_tool_call('Read', {'file_path': allowed})
+                verdict = claude_guard.evaluate_tool_call('Read', {'file_path': allowed}, worktree=wt)
                 self.assertTrue(verdict['allow'], allowed)
 
     def test_blocks_pushes_destructive_git_and_outside_rm_rf(self):
@@ -65,7 +67,7 @@ class ClaudeGuardTests(unittest.TestCase):
         self.assertIn('< 2.1.287', warnings_old[0])
 
     def test_blocked_attempts_written_to_job_log_and_mod_files_exist(self):
-        self.assertTrue((claude_guard.plugin_dir() / 'plugin.json').is_file())
+        self.assertTrue((claude_guard.plugin_dir() / '.claude-plugin' / 'plugin.json').is_file())
         self.assertTrue((claude_guard.plugin_dir() / 'guard.mjs').is_file())
         self.assertIn('.catch(', (claude_guard.plugin_dir() / 'guard.mjs').read_text())
         with tempfile.TemporaryDirectory() as tmp:

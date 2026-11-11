@@ -238,6 +238,8 @@ def build_argv(policy, worker, cwd, prompt_file=None, prompt=None, repo=None, en
                         template = template[:idx] + ['--plugin-dir', mod_path] + template[idx:]
                     else:
                         template = template + ['--plugin-dir', mod_path]
+                if env is not None:  # the guard checks containment against the job root, never a later cwd
+                    env['DLR_WORKTREE'] = str(repo or cwd)
             elif warnings is not None:
                 warnings.append(f'claude guard mod skipped: claude version {ver_text or "unknown"!r} < 2.1.287')
         chosen_effort = claude_handoff.effort(size, template,

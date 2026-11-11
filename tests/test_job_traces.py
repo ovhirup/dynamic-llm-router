@@ -230,7 +230,8 @@ class OptionalExtraTests(unittest.TestCase):
             if path.name != 'otlp.py':
                 for node in ast.walk(tree):
                     module = getattr(node, 'module', None)
-                    names = [alias.name for alias in getattr(node, 'names', [])]
+                    # Import aliases have .name; global/nonlocal store plain strings in .names.
+                    names = [alias.name for alias in getattr(node, 'names', []) if hasattr(alias, 'name')]
                     imported = [module] if isinstance(node, ast.ImportFrom) and module else names
                     self.assertFalse(
                         any(str(name).split('.', 1)[0] == 'opentelemetry' for name in imported if name),
