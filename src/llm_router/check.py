@@ -41,10 +41,32 @@ def _link_stays_inside(link, parent):
     return True
 
 
-def _copy_files(repo, scratch, env):
+def _populated_submodule_roots(repo, env):
+    roots = []
+    for entry in jobs._git(repo, 'ls-files', '-z', '--stage', check=True, env=env).stdout.split('\0'):
+        if not entry:
+            continue
+        mode, _, _, name = entry.split(maxsplit=3)
+        if mode == '160000' and (repo / name / '.git').exists():
+            roots.append(name)
+    return roots
+
+
+def _note_submodule_path(name, roots, populated):
+    for root in roots:
+        if name == root or name.startswith(f'{root}/'):
+            if root not in populated:
+                populated.append(root)
+            return
+
+
+def _copy_files(repo, scratch, env, populated=None):
+    submodule_roots = _populated_submodule_roots(repo, env) if populated is not None else []
     listed = jobs._git(repo, 'ls-files', '-z', '--cached', '--others', '--exclude-standard',
                        check=True, env=env).stdout
     for name in dict.fromkeys(filter(None, listed.split('\0'))):
+        if populated is not None:
+            _note_submodule_path(name, submodule_roots, populated)
         src, dest = repo / name, scratch / name
         if not src.is_relative_to(repo) or '..' in Path(name).parts or '.git' in Path(name).parts:
             raise jobs.Refused('unsafe path in the checkout')
@@ -62,7 +84,9 @@ def _copy_files(repo, scratch, env):
             shutil.copy2(src, dest)
         elif (src / '.git').exists():
             # A populated submodule has its own tracked and non-ignored files.
-            _copy_files(src, dest, env)
+            if populated is not None:
+                populated.append(name)
+            _copy_files(src, dest, env, populated)
 
 
 def _diff(repo, base, env, *flags):
@@ -72,7 +96,44 @@ def _diff(repo, base, env, *flags):
     return diff.stdout.decode(errors='replace')
 
 
-def _snapshot(repo, scratch, base, head, env, review):
+def _submodule_patches(scratch, root, env):
+    """Git patches for a populated submodule copied into the scratch checkout."""
+    sub = scratch / root
+    if not sub.is_dir() or not (sub / '.git').exists():
+        return []
+    head = jobs.resolve_base(sub, 'HEAD', env=env)
+    if not head:
+        return []
+    patches = []
+    for extra in (('-U0',), ('-U0', '--cached')):
+        try:
+            patches.append(_diff(sub, head, env, *extra))
+        except jobs.Refused:
+            continue
+    return [patch for patch in patches if patch.strip()]
+
+
+def _submodule_review_diff(scratch, root, env):
+    return ''.join(f'\n# Submodule {root}\n{patch}' for patch in _submodule_patches(scratch, root, env))
+
+
+def _submodule_leak_findings(scratch, root, terms, allow, env):
+    sub = scratch / root
+    if not sub.is_dir() or not (sub / '.git').exists():
+        return set()
+    findings = {(f'{root}/{item["file"]}', item['kind'])
+                for patch in _submodule_patches(scratch, root, env)
+                for item in security.scan_diff(patch, terms, allow)}
+    head = jobs.resolve_base(sub, 'HEAD', env=env)
+    if head:
+        scan = security.leak_check(sub, head, None, terms, allow=allow)
+        if scan.get('status') == 'blocked':
+            findings.update((f'{root}/{item["file"]}', item['kind']) for item in scan['findings'])
+    return findings
+
+
+def _snapshot(repo, scratch, base, head, env, review, populated=None):
+    populated = [] if populated is None else populated
     jobs._git(repo, '-c', 'core.hooksPath=/dev/null', 'clone', '--local', '--no-hardlinks',
               '--no-checkout', '--template=', '-c', 'core.hooksPath=/dev/null',
               '--', str(repo), str(scratch), check=True, env=env)
@@ -81,10 +142,15 @@ def _snapshot(repo, scratch, base, head, env, review):
     jobs._git(scratch, 'read-tree', head, check=True, env=env)
     committed = _diff(scratch, base, env, '--cached', '--text', '-U0')
     staged = _diff(repo, base, env, '--cached', '--text', '-U0')
-    _copy_files(repo, scratch, env)
+    _copy_files(repo, scratch, env, populated)
     jobs._git(scratch, 'add', '--intent-to-add', '--force', '--', '.', check=True, env=env)
     working = _diff(scratch, base, env, '--text', '-U0')
-    return (committed, staged, working), _diff(scratch, base, env) if review else ''
+    sub_patches = [patch for root in populated for patch in _submodule_patches(scratch, root, env)]
+    review_patch = _diff(scratch, base, env) if review else ''
+    if review:
+        for root in populated:
+            review_patch += _submodule_review_diff(scratch, root, env)
+    return (committed, staged, working, *sub_patches), review_patch
 
 
 def _test_settings(policy, repo, env):
@@ -160,7 +226,8 @@ def check(policy, repo, base=None, review=False):
         with tempfile.TemporaryDirectory(prefix='llm-router-check-', dir=_temp_root(repo)) as directory:
             temp = Path(directory).resolve()
             scratch = temp / 'checkout'
-            patches, review_patch = _snapshot(repo, scratch, base_sha, head, env, review)
+            populated = []
+            patches, review_patch = _snapshot(repo, scratch, base_sha, head, env, review, populated)
             done_check_path = scratch / DONE_CHECK
             done_check = (done_check_path.read_text() if review and done_check_path.is_file() else '')
             local_policy = deepcopy(policy)
@@ -184,6 +251,8 @@ def check(policy, repo, base=None, review=False):
             terms, allow = tasks.private_terms(policy), tasks.leak_options(policy)['allow']
             findings = {(finding['file'], finding['kind'])
                         for patch in patches for finding in security.scan_diff(patch, terms, allow)}
+            for root in populated:
+                findings.update(_submodule_leak_findings(scratch, root, terms, allow, env))
             findings.update((f'{DONE_CHECK}:{line}', kind)
                             for line, kind, _ in security.scan_text(done_check, terms, allow))
             result['leak_check'] = {'status': 'blocked' if findings else 'clean',
