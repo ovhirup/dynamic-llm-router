@@ -275,13 +275,17 @@ def run_batch(repo, units, assignment=None, base='HEAD', policy=None, batch_id=N
             ok = bool(outcome.get('ok'))
             record.update(ok=ok, status=outcome.get('status') or ('ok' if ok else 'failed'),
                           reason=outcome.get('reason'))
-            traces.record_span(
-                policy, manifest['batch_id'], name=f'unit:{uid}', kind='unit',
-                span_id=f"{manifest['batch_id']}-{uid}", parent_span_id=f"{manifest['batch_id']}-wave-{wave_no}",
-                side_effect='mutating', status='ok' if ok else 'failed', worker=entry['worker'],
-                depends_on=[f"{manifest['batch_id']}-{d}" for d in by_id[uid]['deps']],
-                error=outcome.get('reason') if not ok else None,
-            )
+            try:  # trace write is best-effort: never abort the wave over it
+                traces.record_span(
+                    policy, manifest['batch_id'], name=f'unit:{uid}', kind='unit',
+                    span_id=f"{manifest['batch_id']}-{uid}", parent_span_id=f"{manifest['batch_id']}-wave-{wave_no}",
+                    side_effect='mutating', status='ok' if ok else 'failed', worker=entry['worker'],
+                    depends_on=[f"{manifest['batch_id']}-{d}" for d in by_id[uid]['deps']],
+                    error=outcome.get('reason') if not ok else None,
+                )
+            except Exception as error:
+                summary.setdefault('warnings', []).append(
+                    f'trace not recorded: {type(error).__name__}: {security.redact(str(error))[:200]}')
             summary['ok'] = summary['ok'] and ok
             if ok:
                 succeeded.add(uid)

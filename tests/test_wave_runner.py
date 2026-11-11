@@ -257,6 +257,26 @@ class WaveRunnerTests(unittest.TestCase):
         self.assertIsNotNone(no_worker['stall_notice'])
         self.assertEqual(no_worker['stall_notice']['cause'], 'all_units_deferred_no_eligible_worker')
 
+    def test_unit_trace_write_failure_does_not_abort_the_wave(self):
+        """A unit span write must not stop the wave: later units still run and the failure is logged."""
+        runner = FakeRunner()
+        with mock.patch.object(wr.traces, 'record_span', side_effect=OSError('disk full')):
+            result = self.run_batch(
+                assignment={'api': 'claude', 'ui': 'claude', 'docs': 'claude'},
+                unit_runner=runner,
+            )
+        self.assertTrue(result['ok'], result)
+        self.assertEqual([c[0] for c in runner.calls], ['api', 'ui', 'docs'])
+        self.assertEqual([[r['id'] for r in wave] for wave in result['waves']], [['api', 'ui'], ['docs']])
+        self.assertTrue(all(record['ok'] for wave in result['waves'] for record in wave))
+        warnings = result.get('warnings') or []
+        self.assertTrue(
+            any('trace not recorded' in warning and 'OSError' in warning for warning in warnings),
+            warnings,
+        )
+        statuses = {entry['unit']: entry['status'] for entry in result['queue']['entries']}
+        self.assertEqual(statuses, {'api': 'ready_for_human', 'ui': 'ready_for_human', 'docs': 'ready_for_human'})
+
 
 if __name__ == '__main__':
     unittest.main()
