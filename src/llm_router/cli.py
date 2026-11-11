@@ -100,10 +100,10 @@ def build_parser():
     jobs = commands.add_parser('jobs', help='List recent run-job jobs and worktrees, or record an out-of-band '
                                 'verdict on one job')
     jobs.add_argument('--limit', type=int, default=20)
-    jobs.add_argument('--job', dest='job_id', help='show one job from the same jobs projection')
+    jobs.add_argument('--job', dest='job_id',
+                      help='show one job from the same jobs projection, or the run-job id when recording an out-of-band verdict')
     jobs.add_argument('--live-feed', action='store_true',
                       help='emit the live jobs feed (running, 30m recent, history, 3-line redacted log preview)')
-    jobs.add_argument('--job', help='run-job id when recording an out-of-band verdict')
     jobs.add_argument('--verdict', choices=('approve', 'reject'),
                       help='record this verdict on --job (for example a returned Grok Bot review); '
                            'does not record a merge-queue verdict')
@@ -792,9 +792,9 @@ def main(argv=None, *, policy=None):
                     result['worker_override'] = overrides['worker_override']
             elif args.command == 'jobs':
                 if args.verdict:
-                    if not args.job:
+                    if not args.job_id:
                         raise job_dispatch.Refused('--verdict needs --job')
-                    result = job_dispatch.record_review(args.job, args.verdict, notes=args.notes,
+                    result = job_dispatch.record_review(args.job_id, args.verdict, notes=args.notes,
                                                         reviewer=args.reviewer or 'grok-bot', policy=policy)
                 elif getattr(args, 'live_feed', False):
                     from . import live_jobs_feed

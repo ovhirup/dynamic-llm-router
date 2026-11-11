@@ -42,6 +42,15 @@ class CliTests(unittest.TestCase):
                 sub.format_help()
         self.assertIn('used %,', parser.format_help())  # '%%' renders as a literal '%'
 
+    def test_jobs_job_flag_serves_status_and_verdict(self):
+        parser, _ = cli.build_parser()
+        shown = parser.parse_args(['jobs', '--job', 'abc'])
+        self.assertEqual(shown.job_id, 'abc')
+        self.assertIsNone(shown.verdict)
+        recorded = parser.parse_args(['jobs', '--job', 'abc', '--verdict', 'approve'])
+        self.assertEqual(recorded.job_id, 'abc')
+        self.assertEqual(recorded.verdict, 'approve')
+
     def test_init_never_overwrites(self):
         import os
         saved = os.environ['LLM_ROUTER_CONFIG_DIR']
