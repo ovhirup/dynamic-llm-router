@@ -112,20 +112,21 @@ def out_of_scope(paths, scope):
     return sorted(p for p in paths if not any(s == p or task_dag._covers(s, p) for s in scope))
 
 
-def _git(cwd, *args, check=False):
+def _git(cwd, *args, check=False, env=None, errors=None, binary=False):
     done = subprocess.run(['git', '-C', str(cwd), *args], stdin=subprocess.DEVNULL,
-                          capture_output=True, text=True, timeout=120)
+                          capture_output=True, text=not binary, timeout=120, env=env, errors=errors)
     if check and done.returncode != 0:
-        raise Refused(f'git {args[0]} failed: ' + security.redact(done.stderr.strip())[:300])
+        stderr = done.stderr.decode(errors='replace') if binary else done.stderr
+        raise Refused(f'git {args[0]} failed: ' + security.redact(stderr.strip())[:300])
     return done
 
 
-def resolve_base(repo, ref):
+def resolve_base(repo, ref, *, env=None):
     """Commit sha for a base ref, or ''. A branch name wins over a same-named tag (git's own order prefers the tag,
     so `main` could resolve to a stale `main` tag): try refs/heads/, then refs/remotes/, then the ref as given."""
     candidates = [ref] if ref == 'HEAD' or ref.startswith('refs/') else [f'refs/heads/{ref}', f'refs/remotes/{ref}', ref]
     for candidate in candidates:
-        sha = _git(repo, 'rev-parse', '-q', '--verify', candidate + '^{commit}').stdout.strip()
+        sha = _git(repo, 'rev-parse', '-q', '--verify', '--end-of-options', candidate + '^{commit}', env=env).stdout.strip()
         if sha:
             return sha
     return ''
@@ -180,54 +181,72 @@ def repo_settings(policy, repo):
         data = json.loads(path.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
-    return data.get(str(repo)) or data.get(repo.name) or {}
+    if not isinstance(data, dict):
+        raise Refused('repository configuration must be an object')
+    settings = data.get(str(repo)) or data.get(repo.name) or {}
+    if not isinstance(settings, dict):
+        raise Refused('repository settings must be an object')
+    return settings
 
 
 NO_TESTS_REASON = 'no test command configured or detected'
 _NPM_PLACEHOLDER = 'no test specified'
 
 
-def _pytest_configured(root):
-    if (root / 'pytest.ini').is_file():
+def _pytest_configured(is_file, read):
+    if is_file('pytest.ini'):
         return True
     for name, marker in (('pyproject.toml', '[tool.pytest'), ('setup.cfg', '[tool:pytest]')):
         try:
-            if marker in (root / name).read_text(errors='replace'):
+            if marker in read(name, errors='replace'):
                 return True
         except OSError:
             pass
     return False
 
 
-def detect_test_cmd(worktree, source_repo=None):
-    """A test command inferred from the checkout at base (Python, Node, Swift), or None. Python runs with the source
-    repo's .venv interpreter when it has one, else this interpreter."""
+def detect_test_cmd(worktree, source_repo=None, *, base=None, env=None):
+    """Infer a test command from a checkout or pinned base tree (Python, Node, Swift)."""
     root = Path(worktree)
     venv = Path(source_repo or root) / '.venv' / 'bin' / 'python'
     python = shlex.quote(str(venv) if venv.is_file() else sys.executable)
-    if _pytest_configured(root):
+
+    def read(name, errors=None):
+        if base is None:
+            return (root / name).read_text(errors=errors)
+        blob = _git(root, 'cat-file', 'blob', f'{base}:{name}', env=env, errors=errors)
+        if blob.returncode:
+            raise OSError(f'{name} is not a blob at base')
+        return blob.stdout
+
+    def kind(name, expected):
+        if base is None:
+            return (root / name).is_dir() if expected == 'tree' else (root / name).is_file()
+        return _git(root, 'cat-file', '-t', f'{base}:{name}', env=env).stdout.strip() == expected
+
+    if _pytest_configured(lambda name: kind(name, 'blob'), read):
         return f'{python} -m pytest'
-    if (root / 'tests').is_dir():
-        prefix = 'PYTHONPATH=src ' if (root / 'src').is_dir() else ''
+    if kind('tests', 'tree'):
+        prefix = 'PYTHONPATH=src ' if kind('src', 'tree') else ''
         return f'{prefix}{python} -m unittest discover -s tests'
     try:
-        script = (json.loads((root / 'package.json').read_text()).get('scripts') or {}).get('test')
+        script = (json.loads(read('package.json')).get('scripts') or {}).get('test')
     except (OSError, ValueError, AttributeError):
         script = None
     if isinstance(script, str) and script.strip() and _NPM_PLACEHOLDER not in script:
         return 'npm test --silent'
-    if (root / 'Package.swift').is_file():
+    if kind('Package.swift', 'blob'):
         return 'swift test'
     return None
 
 
-def run_tests(policy, cwd, command, timeout, log_path, runner=td.run_bounded):
+def run_tests(policy, cwd, command, timeout, log_path, runner=td.run_bounded, *, temp_dir=None):
     if not command:
         return {'status': 'no_tests', 'command': None}
     env, _ = td.worker_environment(policy)
     # Python reads and writes bytecode only under a fresh router-owned prefix, never an in-tree __pycache__
     # (linked or not), so bytecode planted in the worktree or behind a tracked cache link is never executed.
-    with tempfile.TemporaryDirectory(prefix='llm-router-pycache-') as pycache:
+    with tempfile.TemporaryDirectory(prefix='llm-router-pycache-', dir=temp_dir) as pycache:
         env = dict(env, PYTHONPYCACHEPREFIX=pycache)
         result = runner(['/bin/sh', '-c', command], cwd, timeout, policy['run_task']['kill_grace_seconds'],
                         env=env,

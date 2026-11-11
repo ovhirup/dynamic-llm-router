@@ -11,7 +11,7 @@ stays outside this module.
 """
 from pathlib import Path
 
-from . import config, merge_queue, security
+from . import claude_handoff, config, merge_queue, security
 from . import unit_worktrees as uw
 from .adapters import structured_outputs as outputs
 from .job_dispatch import Refused, _git
@@ -109,16 +109,48 @@ def default_reviewer(name, packet, prompt, policy):
     task_file = _write_prompt(Path(packet['worktree']), prompt)
     if name == 'grok-bot':
         return {'status': 'handoff_to_orchestrator', 'task_file': str(task_file)}
+    output = {}
+
+    def capture_stdout(*args, **kwargs):
+        result = task_dispatch.run_bounded(*args, **kwargs)
+        output['text'] = claude_handoff.inspect(result['stdout'])['text']
+        return result
+
     try:
         summary = task_dispatch.run_task(task_file, packet['worktree'], worker='claude', allow_dirty=True,
-                                         policy=policy)
+                                         policy=policy, runner=capture_stdout)
     except task_dispatch.Refused as refusal:
         return {'status': 'unavailable', 'reason': str(refusal)}
-    output = summary.get('output_path')
-    text = Path(output).read_text() if output and Path(output).is_file() else ''
+    text = output.get('text', '')
     if not summary.get('ok'):
         return {'status': 'unavailable', 'reason': summary.get('reason') or 'reviewer run failed', 'text': text}
     return {'status': 'done', 'text': text}
+
+
+def request_verdict(name, packet, prompt, policy, reviewer=None):
+    """Run one reviewer and allow one repair of an invalid structured verdict."""
+    reviewer = reviewer or default_reviewer
+    result = reviewer(name, packet, prompt, policy)
+    tried = [{'reviewer': name, 'status': result.get('status'), 'reason': result.get('reason')}]
+    if result.get('status') != 'done':
+        return result, None, tried
+    try:
+        return result, parse_verdict(result.get('text')), tried
+    except outputs.InvalidStructuredOutput as error:
+        tried[-1].update(status='invalid_verdict', reason=str(error))
+    repair = reviewer(name, packet, prompt + (
+        '\n## Verdict format repair\nThe previous verdict was invalid. '
+        'Return one schema version 1 object and do not change the worktree.\n'), policy)
+    tried.append({'reviewer': name, 'status': repair.get('status'), 'reason': repair.get('reason')})
+    try:
+        if repair.get('status') != 'done':
+            raise outputs.InvalidStructuredOutput('repair_run_failed')
+        verdict = parse_verdict(repair.get('text'))
+    except outputs.InvalidStructuredOutput as error:
+        tried[-1].update(status='invalid_verdict', reason=str(error))
+        return {'status': 'invalid_verdict', 'reason': str(error)}, None, tried
+    tried[-1]['status'] = 'verdict_repaired'
+    return repair, verdict, tried
 
 
 def _dirty(worktree):
@@ -128,7 +160,6 @@ def _dirty(worktree):
 def review_unit(batch_id, unit_id, policy=None, reviewers=REVIEWERS, reviewer=None):
     """Dispatch one live review and record its verdict; returns a report (never pushes or merges)."""
     policy = policy or config.load_policy()
-    reviewer = reviewer or default_reviewer
     for name in reviewers:
         if name not in REVIEWERS:
             raise Refused(f'reviewer must be one of {REVIEWERS}')
@@ -137,32 +168,18 @@ def review_unit(batch_id, unit_id, policy=None, reviewers=REVIEWERS, reviewer=No
     worktree = Path(packet['worktree'])
     tried = []
     for name in reviewers:
-        result = reviewer(name, packet, prompt, policy)
-        tried.append({'reviewer': name, 'status': result.get('status'), 'reason': result.get('reason')})
+        result, parsed, attempts = request_verdict(name, packet, prompt, policy, reviewer)
+        tried.extend(attempts)
         if result.get('status') == 'handoff_to_orchestrator':
             return {'ok': False, 'unit': unit_id, 'status': 'handoff_to_orchestrator', 'reviewer': name,
                     'task_file': result.get('task_file'), 'tried': tried,
                     'next': f'record the verdict: units review --batch {batch_id} --unit {unit_id} '
                             '--verdict approve|reject --reviewer grok-bot'}
-        if result.get('status') != 'done':
+        if result.get('status') == 'invalid_verdict':
+            return {'ok': False, 'unit': unit_id, 'status': 'invalid_verdict', 'reviewer': name,
+                    'tried': tried, 'reason': result['reason']}
+        if parsed is None:
             continue
-        try:
-            parsed = parse_verdict(result.get('text'))
-        except outputs.InvalidStructuredOutput as error:
-            tried[-1].update(status='invalid_verdict', reason=str(error))
-            repair = reviewer(name, packet, prompt + (
-                '\n## Verdict format repair\nThe previous verdict was invalid. '
-                'Return one schema version 1 object and do not change the worktree.\n'), policy)
-            tried.append({'reviewer': name, 'status': repair.get('status'), 'reason': repair.get('reason')})
-            try:
-                if repair.get('status') != 'done':
-                    raise outputs.InvalidStructuredOutput('repair_run_failed')
-                parsed = parse_verdict(repair.get('text'))
-            except outputs.InvalidStructuredOutput as repair_error:
-                tried[-1].update(status='invalid_verdict', reason=str(repair_error))
-                return {'ok': False, 'unit': unit_id, 'status': 'invalid_verdict', 'reviewer': name,
-                        'tried': tried, 'reason': str(repair_error)}
-            tried[-1]['status'] = 'verdict_repaired'
         verdict = parsed['verdict']
         if _git(worktree, 'rev-parse', 'HEAD').stdout.strip() != packet['head']:
             return {'ok': False, 'unit': unit_id, 'status': 'stale', 'reviewer': name, 'tried': tried,

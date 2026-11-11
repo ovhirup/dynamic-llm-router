@@ -236,6 +236,12 @@ def build_parser():
         'traces', help='p50 and p95 latency and cost per worker per task class')
     traces_cmd.add_argument('--since', required=True, help='window start, such as 7d, 12h, 30m, or an ISO date')
 
+    check = commands.add_parser('check', allow_abbrev=False, help='Run gates on a Git checkout')
+    check.add_argument('--repo', default='.')
+    check.add_argument('--base', help='compare against this commit (default: merge-base with the default branch)')
+    check.add_argument('--review', action='store_true', help='run a stronger-model review against DONE_CHECK.md')
+    check.add_argument('--json', action='store_true', dest='as_json')
+
     scan = commands.add_parser('scan', help='Leak-scan a git tree (tracked + untracked, not ignored) before publishing')
     scan.add_argument('path', nargs='?', default='.')
     scan.add_argument('--terms', help='private terms file (default: the configured private_terms_file)')
@@ -469,7 +475,19 @@ def save_switch_preference(mode, target=None, preferred=None):
 
 def main(argv=None):
     parser, gate_help = build_parser()
-    args = parser.parse_args(argv)
+    argv = sys.argv[1:] if argv is None else list(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as error:
+        command = argv
+        if argv and argv[0] == '--config':
+            command = argv[2:]
+        elif argv and argv[0].startswith('--config='):
+            command = argv[1:]
+        if error.code == 2 and command[:1] == ['check'] and '--json' in command[1:]:
+            _print({'ok': False, 'refused': 'invalid check arguments'})
+            return 2
+        raise
     if args.command == 'gate':
         from . import gate as quality_gate
         return quality_gate.cli_main(args)
@@ -499,6 +517,25 @@ def main(argv=None):
     except config.ConfigError as error:
         print(json.dumps({'ok': False, 'config_error': str(error)}))
         return 2
+    except (OSError, UnicodeError, KeyboardInterrupt):
+        if args.command != 'check':
+            raise
+        _print({'ok': False, 'refused': 'could not load check configuration'})
+        return 2
+    if args.command == 'check':
+        from . import check, security
+        code, result = check.check(policy, args.repo, base=args.base, review=args.review)
+        result = security.redact_obj(result)
+        if args.as_json:
+            _print(result)
+        else:
+            print(result.get('refused') or ('Check passed' if result['ok'] else 'Check failed'))
+            for gate in ('tests', 'leak_check', 'review'):
+                if result.get(gate):
+                    print(f"{gate}: {result[gate]['status']}")
+            for finding in (result.get('leak_check') or {}).get('findings', []):
+                print(f"{finding['file']} ({finding['kind']})")
+        return code
     if args.command == 'batch':
         from . import batch_runner
         return batch_runner.run(args, policy)

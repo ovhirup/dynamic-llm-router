@@ -244,19 +244,46 @@ def _added_lines(cwd, base, cached=False):
     """Map file -> [(new_line_number, text)] for lines added relative to base (or empty tree)."""
     args = ['git', '-C', str(cwd), 'diff', '--no-color', '--no-ext-diff', '-U0'] + (['--cached'] if cached else [])
     args += [base] if base else ['4b825dc642cb6eb9a060e54bf8d69288fbee4904']
-    out = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                         errors='replace', timeout=60).stdout
-    added, current, number = {}, None, 0
-    for line in out.splitlines():
-        if line.startswith('+++ '):
-            current = None if line[4:] == '/dev/null' else line[4:].removeprefix('b/')
-        elif line.startswith('@@'):
+    out = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=60).stdout
+    return _parse_added_lines(out.decode(errors='replace'))
+
+
+def _parse_added_lines(diff):
+    added, current, number, in_hunk = {}, None, 0, False
+    for line in diff.split('\n'):
+        if line.startswith('diff --git '):
+            current, in_hunk = None, False
+        elif not in_hunk and line.startswith('+++ '):
+            name = line[4:].removesuffix('\t')
+            current = None if name == '/dev/null' else name.removeprefix('b/')
+        elif line.startswith('@@ '):
             match = re.search(r'\+(\d+)', line)
             number = int(match.group(1)) if match else 0
-        elif current and line.startswith('+'):
+            in_hunk = True
+        elif in_hunk and current and line.startswith('+'):
             added.setdefault(current, []).append((number, line[1:]))
             number += 1
+        elif in_hunk and line.startswith(' '):
+            number += 1
     return added
+
+
+def mask_private_terms(text, terms):
+    for term in terms or ():
+        text = re.sub(re.escape(term), mask(term), text, flags=re.I)
+    return text
+
+
+def scan_diff(diff, terms, allow=()):
+    """Scan the added lines and paths of a captured Git patch using the usual leak rules."""
+    findings = []
+    for name, lines in _parse_added_lines(diff).items():
+        shown = mask_private_terms(name, terms)
+        findings.extend({'file': f'{shown} (path)', 'kind': kind}
+                        for _, kind, _ in scan_text(name, terms, allow))
+        findings.extend({'file': f'{shown}:{number}', 'kind': kind}
+                        for number, text in lines for _, kind, _ in scan_text(text, terms, allow))
+    return findings
 
 
 DEFAULT_SKIP_DIRS = ('node_modules', '.venv', 'venv', '__pycache__', '.git', 'dist', 'build', '.next',
@@ -336,17 +363,12 @@ def scan_tree(root, terms, allow=(), max_bytes=1_000_000, history=False):
         data = path.read_bytes()
         if b'\0' in data[:8192]:
             continue
-        shown_name = name
-        for term in terms or []:
-            shown_name = re.sub(re.escape(term), mask(term), shown_name, flags=re.I)
+        shown_name = mask_private_terms(name, terms)
         for number, kind, masked in scan_text(data.decode('utf-8', 'replace'), terms, allow):
             findings.append({'file': f'{shown_name}:{number}', 'kind': kind, 'match': masked})
         hits = [t for t in terms or [] if t.lower() in name.lower()]
         if hits:
-            shown = name
-            for term in hits:
-                shown = re.sub(re.escape(term), mask(term), shown, flags=re.I)
-            findings += [{'file': f'{shown} (path)', 'kind': 'private_term', 'match': mask(t)} for t in hits]
+            findings += [{'file': f'{shown_name} (path)', 'kind': 'private_term', 'match': mask(t)} for t in hits]
     if history and listed.returncode == 0:
         log = subprocess.run(['git', '-C', str(root), 'log', '--all', '-p', '--no-color', '--format=%H%n%an <%ae>%n%B'],
                              stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace', timeout=300)
