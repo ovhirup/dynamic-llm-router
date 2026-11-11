@@ -18,10 +18,10 @@ You choose and rank your workers; there is no default order. Built-in and config
 - **Stronger-model review.** Review-required `run-job` outputs and queued units are reviewed by Claude first; if Claude is unavailable, a packet is handed to the orchestrator for Grok Bot and review stays pending until a verdict is recorded.
 - **Local MCP server.** The same CLI is available over local stdio. Default tools are read-only; this has been verified with Codex and Cursor. Approval, push, and merge stay in the CLI.
 - **Local models.** An optional OpenAI-compatible `developer` worker can draft against a local endpoint. It is off by default.
+- **Check-command gate.** `llm-router check` is an exit-code gate any tool can run (CI, a git hook, or an agent app).
 
 ### Coming
 
-- A check-command gate any tool can run, such as CI, a git hook, or an agent app.
 - An honest end-to-end demo recorded from real runs of shipped commands only.
 
 > **Routing strategy:** see [docs/ROUTING_STRATEGY.md](docs/ROUTING_STRATEGY.md), the master architecture (worker order, selection, parallel dispatch, switching, Router Brain).
