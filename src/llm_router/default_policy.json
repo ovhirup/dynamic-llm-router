@@ -1,5 +1,6 @@
 {
   "version": 2,
+  "mcp": {"enable_run_job": false},
   "timezone": "local",
   "worker_order": [],
   "never": [],

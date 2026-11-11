@@ -100,6 +100,7 @@ def build_parser():
     jobs = commands.add_parser('jobs', help='List recent run-job jobs and worktrees, or record an out-of-band '
                                 'verdict on one job')
     jobs.add_argument('--limit', type=int, default=20)
+    jobs.add_argument('--job', dest='job_id', help='show one job from the same jobs projection')
     jobs.add_argument('--live-feed', action='store_true',
                       help='emit the live jobs feed (running, 30m recent, history, 3-line redacted log preview)')
     jobs.add_argument('--job', help='run-job id when recording an out-of-band verdict')
@@ -206,6 +207,8 @@ def build_parser():
     refresh.add_argument('--once', action='store_true', help='one serial pass (what the scheduler runs)')
     refresh.add_argument('--worker')
     commands.add_parser('status', help='Meters, freshness, resets, eligibility, open alerts')
+    commands.add_parser('mcp', help='Serve local MCP tools over stdio (read-only by default)')
+    commands.add_parser('pending-approvals', help='List pending approvals and human CLI commands; never approve')
     usage = commands.add_parser('usage', aliases=['burn-down'],
                                 help='Token burn-down dashboard: used %%, remaining, reset, burn rate and next worker')
     usage.add_argument('--json', action='store_true', dest='as_json', help='print machine-readable JSON')
@@ -480,7 +483,7 @@ def save_switch_preference(mode, target=None, preferred=None):
     return dict(written, switch_policy=setup['switch_policy'], preferred_orchestrator=setup['preferred_orchestrator'])
 
 
-def main(argv=None):
+def main(argv=None, *, policy=None):
     parser, gate_help = build_parser()
     argv = sys.argv[1:] if argv is None else list(argv)
     try:
@@ -520,7 +523,8 @@ def main(argv=None):
             _print({'ok': False, 'config_error': str(error)})
             return 2
     try:
-        policy = config.load_policy(args.config)
+        if policy is None:
+            policy = config.load_policy(args.config)
     except config.ConfigError as error:
         print(json.dumps({'ok': False, 'config_error': str(error)}))
         return 2
@@ -529,6 +533,14 @@ def main(argv=None):
             raise
         _print({'ok': False, 'refused': 'could not load check configuration'})
         return 2
+    if args.command == 'mcp':
+        from .mcp_server import Server
+        Server(policy).serve_stdio()
+        return 0
+    if args.command == 'pending-approvals':
+        from . import pr_gate
+        _print(pr_gate.list_pending_approvals(policy))
+        return 0
     if args.command == 'check':
         from . import check, security
         code, result = check.check(policy, args.repo, base=args.base, review=args.review)
@@ -788,7 +800,7 @@ def main(argv=None):
                     from . import live_jobs_feed
                     result = live_jobs_feed.build_live_jobs_feed(policy=policy)
                 else:
-                    result = job_dispatch.list_jobs(policy=policy, limit=args.limit)
+                    result = job_dispatch.list_jobs(policy=policy, limit=args.limit, job_id=args.job_id)
             else:
                 result = job_dispatch.cleanup(args.older_than, dry_run=args.dry_run, policy=policy)
         except job_dispatch.Refused as refusal:

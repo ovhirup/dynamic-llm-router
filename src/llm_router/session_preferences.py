@@ -17,7 +17,7 @@ from . import config, orchestrator, security, selection, setup_profile, usage_sn
 
 ORCHESTRATORS = SUPPORTED_ORCHESTRATORS = setup_profile.ORCHESTRATORS
 _AUDIT_FIELDS = ('event', 'reason', 'source', 'role', 'caller', 'current', 'proposed',
-                 'orchestrator', 'worker', 'confirmation_required', 'confirmed')
+                 'orchestrator', 'worker', 'confirmation_required', 'confirmed', 'method', 'tool', 'client')
 
 
 def _reason(value, default):
@@ -183,7 +183,7 @@ def _recommendation_id(value):
 
 def _validate_event(event):
     if not isinstance(event, dict) or event.get('event') not in ('orchestrator_decision', 'orchestrator_override',
-                                                                  'worker_override'):
+                                                                  'worker_override', 'mcp_call'):
         raise config.ConfigError('unsupported setup audit event')
     for key in _AUDIT_FIELDS:
         if key not in event:
