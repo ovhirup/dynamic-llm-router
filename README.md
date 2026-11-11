@@ -61,6 +61,7 @@ without babysitting terminals, and without ever leaking a private repo name or k
   come only from an env var you name.
 - **Hang-proof meters.** Every observer runs in a child process in its own session with a hard wall-clock
   timeout; a hung CLI is killed with its whole process group and the reading becomes `unknown`.
+- **Stronger-model review.** Review-required `run-job` outputs and queued units (`llm-router units review`) are reviewed by Claude first; if Claude is unavailable, a packet is handed to the orchestrator for Grok Bot and review stays pending until a verdict is recorded.
 
 See [SECURITY.md](SECURITY.md) for the threat model and how to report issues.
 
