@@ -30,6 +30,7 @@ without babysitting terminals, and without ever leaking a private repo name or k
 | Meters | `llm-router quota refresh --once`, `status`, `alerts` | Background refresh (LaunchAgent / systemd / cron), 70% / 85% / stale / CLI-version alerts, a status table. |
 | Gate | `review`, `approve`, `deny`, `push`, `ci`, `merge` | Evidence bundle, approvals bound to job + action + exact head SHA (expire, single use), push without force, draft PR, CI watch, merge only when the PR head is the approved SHA and required checks are green. |
 | Publish check | `llm-router scan [path] [--history]` | Leak-scan a tree (and optionally its whole history) for secrets and your private terms before you publish it. |
+| MCP | `llm-router mcp` | Exposes the same CLI over local stdio for MCP clients such as Codex and Cursor. Default tools are read-only. Approval, push and merge stay in the CLI. |
 
 ![Workflow](docs/workflow.png)
 
@@ -141,7 +142,7 @@ number, and you are responsible for complying with each vendor's terms. Details:
 [docs/observers.md](docs/observers.md).
 
 
-## Local MCP server (awaiting real-client validation)
+## Local MCP server
 
 Start `llm-router mcp` (or `dlr mcp`) to expose DLR over local stdio. It uses
 the standard library and the same command paths as the CLI. The default tools are
@@ -149,6 +150,12 @@ the standard library and the same command paths as the CLI. The default tools ar
 `check`, and `list_pending_approvals`. Each returns `{ "exit_code": 0, "data": ... }`;
 `data` is the command's JSON result, or the text table for `status`. Nonzero CLI
 exits set MCP `isError`. Input/output JSON schemas are included in tool discovery.
+
+This local stdio server has been verified with Codex and Cursor. Both connected,
+listed the eight default read-only tools, did not expose `run_job`, `approve`,
+`push`, or `merge`, and completed a read-only call. The Claude Code snippet
+below is a setup example for the same command; that client has not been verified
+yet.
 
 Claude Code project configuration (`.mcp.json`):
 
@@ -160,6 +167,17 @@ Claude Code project configuration (`.mcp.json`):
 }
 ```
 
+Codex project configuration (`.codex/config.toml` in a trusted project). Do not
+run `codex mcp add`, which writes to the global Codex config:
+
+```toml
+[mcp_servers.dlr]
+command = "dlr"
+args = ["mcp"]
+```
+
+Confirm the live connection with `/mcp` in the Codex TUI.
+
 Cursor project configuration (`.cursor/mcp.json`):
 
 ```json
@@ -170,8 +188,12 @@ Cursor project configuration (`.cursor/mcp.json`):
 }
 ```
 
+If Cursor lists the server but shows no tools, enable the project `dlr` server
+in Cursor's MCP settings.
+
 Use an absolute executable path if the client does not inherit your shell's PATH.
-To choose a DLR policy, put `"args": ["--config", "/absolute/path/to/policy.json", "mcp"]`.
+To choose a DLR policy, put `--config` and `/absolute/path/to/policy.json` before
+`mcp` in the args list.
 Only the local policy can enable job execution:
 
 ```json
@@ -187,10 +209,6 @@ record approval. `get_review` generates the CLI's evidence bundle and review cac
 the gate's disposable copy, with stronger-model review only when requested.
 These tools do not authorize publication. Every request is redacted and recorded
 with the client/tool name in the existing `logs/setup-decisions.jsonl` decision log.
-
-Validation in two real MCP clients is **still incomplete**. These configuration examples
-are setup instructions, not a claim of validated interoperability; MCP remains
-outside the Built list until those checks pass.
 
 ## Bring your own worker
 
