@@ -1,4 +1,5 @@
 """Tests for Repo context navigator (#115): hierarchical retrieval, grep fallback, and recall metrics."""
+import os
 from pathlib import Path
 import subprocess
 import unittest
@@ -83,6 +84,20 @@ class ContextNavigatorTests(unittest.TestCase):
         subprocess.run(['git', 'add', '-f', '--', relative_path], cwd=self.repo, check=True)
 
         self.assert_excluded_from_context(relative_path, 'credential_fixture_marker')
+
+    def test_tracked_source_indexed_when_dlr_worktree_unset(self):
+        relative_path = 'docs/auth.json'
+        (self.repo / relative_path).write_text('{"token": "credential_fixture_marker"}\n')
+        subprocess.run(['git', 'add', '-f', '--', relative_path], cwd=self.repo, check=True)
+        saved = os.environ.pop('DLR_WORKTREE', None)
+        try:
+            tree = context_navigator.build_hierarchy(self.repo)
+        finally:
+            if saved is not None:
+                os.environ['DLR_WORKTREE'] = saved
+        self.assertIn('src/routing/selector.py', tree['files'])
+        self.assertNotIn(relative_path, tree['files'])
+        self.assertNotIn(relative_path, tree['chunks'])
 
     def test_tracked_source_is_indexed_and_formatted_for_prompt(self):
         relative_path = 'src/routing/selector.py'

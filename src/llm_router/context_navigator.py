@@ -75,7 +75,8 @@ def build_hierarchy(repo_root, max_file_bytes=200_000):
             continue
         if path.suffix.lower() not in TEXT_SUFFIXES:
             continue
-        if not claude_guard.evaluate_tool_call('Read', {'file_path': str(path)})['allow']:
+        # The repo being indexed is the trusted root. The guard fails closed without one.
+        if not claude_guard.evaluate_tool_call('Read', {'file_path': str(path)}, worktree=str(root))['allow']:
             continue
         if path.is_symlink() or not path.is_file():
             continue
