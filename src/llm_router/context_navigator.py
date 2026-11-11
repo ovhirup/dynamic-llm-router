@@ -6,10 +6,12 @@ applies a lexical/grep fallback so relevant files inside pruned folders are stil
 selected context for worker prompts and handoff notes, and computes `recall` against the files a job
 actually touched.
 """
+import os
 from pathlib import Path
 import re
+import subprocess
 
-from . import security
+from . import claude_guard, security
 
 SKIP_DIRS = {
     '.git', '__pycache__', '.venv', 'venv', 'node_modules', 'dist', 'build',
@@ -49,15 +51,33 @@ def _split_chunks(rel_path, text, chunk_lines=40):
 
 
 def build_hierarchy(repo_root, max_file_bytes=200_000):
-    """Build an offline hierarchy `{'folders': {...}, 'files': {...}, 'chunks': {...}}` for `repo_root`."""
+    """Index Git-tracked and non-ignored untracked text files for worker context.
+
+    Files must pass the shared secret-path guard and the directory, suffix, symlink,
+    and size filters. If Git cannot list candidates, the hierarchy is empty.
+    """
     root = Path(repo_root).expanduser().resolve()
-    folders = {}
-    files = {}
-    chunks = {}
+    tree = {'root': str(root), 'folders': {}, 'files': {}, 'chunks': {}}
+    try:
+        listed = subprocess.run(
+            ['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
+            cwd=root, stdin=subprocess.DEVNULL, capture_output=True, check=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return tree
+    eligible_paths = set(os.fsdecode(listed.stdout).split('\0'))
+
+    folders, files, chunks = tree['folders'], tree['files'], tree['chunks']
     for path in sorted(root.rglob('*')):
-        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
+        rel = path.relative_to(root)
+        rel_str = rel.as_posix()
+        if rel_str not in eligible_paths or any(part in SKIP_DIRS for part in rel.parts):
             continue
-        if not path.is_file() or path.is_symlink() or path.suffix.lower() not in TEXT_SUFFIXES:
+        if path.suffix.lower() not in TEXT_SUFFIXES:
+            continue
+        if not claude_guard.evaluate_tool_call('Read', {'file_path': str(path)})['allow']:
+            continue
+        if path.is_symlink() or not path.is_file():
             continue
         try:
             if path.stat().st_size > max_file_bytes:
@@ -65,8 +85,6 @@ def build_hierarchy(repo_root, max_file_bytes=200_000):
             text = path.read_text(errors='replace')
         except OSError:
             continue
-        rel = path.relative_to(root)
-        rel_str = rel.as_posix()
         folder = rel.parent.as_posix() if rel.parent.as_posix() != '.' else '.'
         desc = _describe_file(rel, text)
         files[rel_str] = {'path': rel_str, 'folder': folder, 'description': desc, 'text': text}
@@ -76,7 +94,7 @@ def build_hierarchy(repo_root, max_file_bytes=200_000):
         entry['descriptions'].append(desc)
     for folder, entry in folders.items():
         entry['summary'] = f"{folder} ({len(entry['files'])} files): " + '; '.join(entry['descriptions'][:5])
-    return {'root': str(root), 'folders': folders, 'files': files, 'chunks': chunks}
+    return tree
 
 
 def default_scorer(query, candidate_text):
