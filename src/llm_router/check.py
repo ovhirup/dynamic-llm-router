@@ -209,17 +209,21 @@ def _snapshot(repo, scratch, base, head, env, review, populated=None):
     jobs._git(scratch, 'update-ref', 'HEAD', head, check=True, env=env)
     jobs._git(scratch, 'read-tree', head, check=True, env=env)
     committed = _diff(scratch, base, env, '--cached', '--text', '-U0')
+    committed_paths = security.changed_paths(scratch, base, cached=True, env=env)
     staged = _diff(repo, base, env, '--cached', '--text', '-U0')
+    staged_paths = security.changed_paths(repo, base, cached=True, env=env)
     _copy_files(repo, scratch, env, populated)
     jobs._git(scratch, 'add', '--intent-to-add', '--force', '--', '.', check=True, env=env)
     working = _diff(scratch, base, env, '--text', '-U0')
+    working_paths = security.changed_paths(scratch, base, env=env)
     sub_roots = _submodule_roots_for_evidence(repo, base, head, env)
-    sub_patches = [patch for root in sub_roots for patch in _submodule_patches(repo, root, base, env)]
+    sub_patches = [(patch, ()) for root in sub_roots for patch in _submodule_patches(repo, root, base, env)]
     review_patch = _diff(scratch, base, env) if review else ''
     if review:
         for root in sub_roots:
             review_patch += _submodule_review_diff(repo, root, base, env)
-    return (committed, staged, working, *sub_patches), review_patch
+    return ((committed, committed_paths), (staged, staged_paths), (working, working_paths),
+            *sub_patches), review_patch
 
 
 def _test_settings(policy, repo, env):
@@ -319,7 +323,8 @@ def check(policy, repo, base=None, review=False):
             result['tests'] = {key: tests[key] for key in ('status', 'returncode', 'elapsed_seconds') if key in tests}
             terms, allow = tasks.private_terms(policy), tasks.leak_options(policy)['allow']
             findings = {(finding['file'], finding['kind'])
-                        for patch in patches for finding in security.scan_diff(patch, terms, allow)}
+                        for patch, paths in patches
+                        for finding in security.scan_diff(patch, terms, allow, paths=paths)}
             for root in _submodule_roots_for_evidence(repo, base_sha, head, env):
                 findings.update(_submodule_leak_findings(repo, root, base_sha, terms, allow, env))
             findings.update((f'{DONE_CHECK}:{line}', kind)
