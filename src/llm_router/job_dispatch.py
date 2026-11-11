@@ -1190,15 +1190,19 @@ def _finish(policy, summary, repo, worktree, branch, base_sha, keep):
 
 # ---- jobs / cleanup ----------------------------------------------------------------
 
-def list_jobs(policy=None, limit=20):
+def list_jobs(policy=None, limit=20, job_id=None):
     policy = policy or config.load_policy()
     jobs_dir = _path(policy, 'jobs_dir', 'logs/jobs')
     root = _path(policy, 'worktree_root', 'worktrees')
     records = []
-    for path in sorted(jobs_dir.glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]:
+    if job_id is not None and not re.fullmatch(r'[A-Za-z0-9._-]+', job_id):
+        raise Refused('invalid job id')
+    paths = [jobs_dir / f'{job_id}.json'] if job_id is not None else sorted(
+        jobs_dir.glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+    for path in paths:
         try:
             job = json.loads(path.read_text())
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, FileNotFoundError):
             continue
         records.append({key: job.get(key) for key in ('job_id', 'status', 'ok', 'branch', 'commit', 'workers',
                                                        'tests_status', 'worktree', 'worktree_state',

@@ -354,6 +354,31 @@ def approval_status(policy, job_id, action, sha, now=None):
             'why': f'approved until {expires}', 'approval': latest}
 
 
+def list_pending_approvals(policy):
+    """Project existing SHA-bound approval status; never write approval or gate state."""
+    from . import job_dispatch
+    pending, unavailable = [], []
+    jobs_dir = job_dispatch._path(policy, 'jobs_dir', 'logs/jobs')
+    for path in sorted(jobs_dir.glob('*.json')):
+        job_id = path.stem
+        try:
+            job = load_job(policy, job_id)
+            head = head_sha(job)
+            gate = load_gate(policy, job_id)
+            if (gate.get('merged') or {}).get('sha') == head:
+                continue
+            # Only offer merge after this exact head has been pushed, as approve requires.
+            action = 'merge' if (gate.get('pr') or {}).get('pushed_sha') == head else 'push'
+            status = approval_status(policy, job_id, action, head)
+            if not status['ok']:
+                pending.append({'job_id': job_id, 'action': action, 'sha': head,
+                                'reason': status['why'],
+                                'command': f'llm-router approve {job_id} --action {action} --sha {head}'})
+        except (Refused, OSError, ValueError) as error:
+            unavailable.append({'job_id': job_id, 'reason': str(error)})
+    return security.redact_obj({'pending': pending, 'unavailable': unavailable})
+
+
 def _match_sha(head, sha):
     if sha and (len(sha) < 7 or not head.startswith(sha.lower())):
         raise Refused(f'--sha {sha} is not the current branch head {head[:12]}; review again')

@@ -141,6 +141,57 @@ number, and you are responsible for complying with each vendor's terms. Details:
 [docs/observers.md](docs/observers.md).
 
 
+## Local MCP server (awaiting real-client validation)
+
+Start `llm-router mcp` (or `dlr mcp`) to expose DLR over local stdio. It uses
+the standard library and the same command paths as the CLI. The default tools are
+`select_worker`, `quota_status`, `list_jobs`, `job_status`, `get_review`, `scan`,
+`check`, and `list_pending_approvals`. Each returns `{ "exit_code": 0, "data": ... }`;
+`data` is the command's JSON result, or the text table for `status`. Nonzero CLI
+exits set MCP `isError`. Input/output JSON schemas are included in tool discovery.
+
+Claude Code project configuration (`.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "dlr": { "command": "llm-router", "args": ["mcp"] }
+  }
+}
+```
+
+Cursor project configuration (`.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "dlr": { "command": "dlr", "args": ["mcp"] }
+  }
+}
+```
+
+Use an absolute executable path if the client does not inherit your shell's PATH.
+To choose a DLR policy, put `"args": ["--config", "/absolute/path/to/policy.json", "mcp"]`.
+Only the local policy can enable job execution:
+
+```json
+{ "mcp": { "enable_run_job": true } }
+```
+
+Without that boolean flag, `run_job` is absent and direct calls are refused.
+When enabled, it retains CLI worker bans, pacing, quota evidence, worktree, test,
+leak-scan and local-commit gates. Approval, push and merge are never exposed.
+Pending approvals include a CLI command for a human to run; listing them cannot
+record approval. `get_review` generates the CLI's evidence bundle and review cache
+(including any configured screenshot command); `check` runs configured tests on
+the gate's disposable copy, with stronger-model review only when requested.
+These tools do not authorize publication. Every request is redacted and recorded
+with the client/tool name in the existing `logs/setup-decisions.jsonl` decision log.
+
+Validation in two real MCP clients is **still incomplete**. These configuration examples
+are setup instructions, not a claim of validated interoperability; MCP remains
+outside the Built list until those checks pass.
+
 ## Bring your own worker
 
 Add a CLI using `workers.<name>`; explicitly list unmetered workers when there is no usage reader:

@@ -332,6 +332,9 @@ def materialise_workers(policy):
 
 def validate(policy):
     from . import quota_service, security
+    mcp = policy.get('mcp', {})
+    if not isinstance(mcp, dict) or type(mcp.get('enable_run_job', False)) is not bool:
+        raise ConfigError('mcp.enable_run_job must be boolean')
     if 'setup' in policy:
         from . import setup_profile
         setup_profile.validate_setup(policy['setup'])
