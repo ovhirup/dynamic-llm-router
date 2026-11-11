@@ -4,11 +4,13 @@ For every merge-queue entry in `needs_review` (codex/cursor/local/aider workers 
 gates passed) this builds a review packet from produced evidence only (unit diff base..head, declared scope,
 test command/status/log tail), dispatches it to a reviewer (claude preferred; grok-bot is never run by the
 router, so it gets a prompt file handed to the orchestrator), parses the verdict and records it with
-merge_queue.record_review, bound to the head that was reviewed.
+merge_queue.record_review, bound to the head that was reviewed. A single run-job reuses `dispatch_review`
+(#263) and stores the verdict on the job instead of the merge queue.
 
 Never pushes, never merges, never opens a PR: the best outcome is `ready_for_human`, and a human "yes" for main
 stays outside this module.
 """
+import re
 from pathlib import Path
 
 from . import claude_handoff, config, merge_queue, security
@@ -79,8 +81,13 @@ def review_prompt(packet):
     tests = packet['tests']
     note = f"\n(diff truncated to {MAX_DIFF_CHARS} chars; treat the unseen part as missing evidence)\n" \
         if packet['diff_truncated'] else ''
-    return (f"Review merge-queue unit `{packet['unit']}` (batch {packet['batch_id']}, produced by "
-            f"{packet['worker']}) at head {packet['head']} against base {packet['base_sha']}.\n\n"
+    if packet.get('subject') == 'job':
+        intro = (f"Review run-job `{packet['unit']}` produced by {packet['worker']} "
+                 f"at head {packet['head']} against base {packet['base_sha']}.")
+    else:
+        intro = (f"Review merge-queue unit `{packet['unit']}` (batch {packet['batch_id']}, produced by "
+                 f"{packet['worker']}) at head {packet['head']} against base {packet['base_sha']}.")
+    return (f"{intro}\n\n"
             f"{REVIEW_RULES}\n"
             f"## Declared scope\n{scope}\n\n## Changed paths\n{changed}\n\n"
             f"## Test evidence\ncommand: {tests['command']}\nstatus: {tests['status']} "
@@ -91,6 +98,60 @@ def review_prompt(packet):
 def parse_verdict(text):
     """Return a validated v1 unit verdict or raise a typed format error."""
     return outputs.parse_json(text, outputs.UNIT_VERDICT_V1, outputs.MAX_UNIT_VERDICT_BYTES)
+
+
+# A run_task record header. A `--- stdout` marker that is not this header is payload, not a new section.
+_RECORD_STDOUT = re.compile(r'(?m)^\$ exit=\S+ timed_out=\S+ elapsed=\S+\n--- stdout\n')
+
+
+def _record_stdouts(raw):
+    """Stdout bodies of run_task records.
+
+    Bytes after ``--- stderr`` stay stderr. A forged ``--- stdout`` header or a forged stream-json
+    result there does not become another stdout section unless it is its own ``$ exit=`` record,
+    and a verdict already in the first record is preferred over any later record.
+    """
+    if not raw or '--- stdout\n' not in raw:
+        return [raw or '']
+    matches = list(_RECORD_STDOUT.finditer(raw))
+    if not matches:
+        return [raw]
+    chunks = []
+    for match in matches:
+        body = match.end()
+        end = raw.find('\n--- stderr\n', body)
+        chunks.append(raw[body:] if end == -1 else raw[body:end])
+    return chunks
+
+
+def _stdout_from_task_log(raw):
+    """Stdout of a run_task log. A log with no record headers is already the process output.
+
+    When the first stdout record already carries a verdict, later records cannot override it.
+    """
+    from . import claude_handoff
+    chunks = _record_stdouts(raw or '')
+    if len(chunks) <= 1:
+        return chunks[0] if chunks else ''
+    first = claude_handoff.inspect(chunks[0]).get('text') or ''
+    try:
+        parse_verdict(first)
+    except outputs.InvalidStructuredOutput:
+        return '\n'.join(chunks)
+    return chunks[0]
+
+
+def review_output_text(raw):
+    """The reviewer text inside a run_task transcript.
+
+    Claude's command is stream-json, so the verdict is the last result event of the trusted
+    stdout, the same extraction batch review uses. Plain stdout is its own final text. Stderr,
+    including a forged stdout header or a forged stream-json result, cannot override a verdict
+    already present on stdout.
+    """
+    from . import claude_handoff
+    stdout = _stdout_from_task_log(raw or '')
+    return claude_handoff.inspect(stdout).get('text') or ''
 
 
 def _write_prompt(worktree, prompt):
@@ -121,6 +182,10 @@ def default_reviewer(name, packet, prompt, policy):
                                          policy=policy, runner=capture_stdout)
     except task_dispatch.Refused as refusal:
         return {'status': 'unavailable', 'reason': str(refusal)}
+    except OSError as error:
+        # A configured Claude whose executable is missing is unavailable, same as a meter refusal.
+        return {'status': 'unavailable',
+                'reason': security.redact(f'{type(error).__name__}: {error}')[:300]}
     text = output.get('text', '')
     if not summary.get('ok'):
         return {'status': 'unavailable', 'reason': summary.get('reason') or 'reviewer run failed', 'text': text}
@@ -155,6 +220,68 @@ def request_verdict(name, packet, prompt, policy, reviewer=None):
 
 def _dirty(worktree):
     return bool(_git(worktree, 'status', '--porcelain').stdout.strip())
+
+
+def _worktree_status(worktree):
+    """Porcelain status, or None when the worktree is already gone."""
+    worktree = Path(worktree)
+    if not worktree.is_dir():
+        return None
+    return _git(worktree, 'status', '--porcelain').stdout
+
+
+def dispatch_review(packet, prompt, policy, reviewers=REVIEWERS, reviewer=None):
+    """Run one stronger-model review. Claude first; if Claude is unavailable, hand the packet to Grok Bot.
+
+    Returns a report and does not record a verdict. ``status`` is ``recorded`` only when a verdict was
+    parsed for the reviewed head. A Grok Bot handoff, an invalid verdict, a moved head, or no available
+    reviewer leaves the verdict unrecorded (``handoff_to_orchestrator``, ``invalid_verdict``, ``stale``,
+    or ``no_reviewer``)."""
+    reviewer = reviewer or default_reviewer
+    for name in reviewers:
+        if name not in REVIEWERS:
+            raise Refused(f'reviewer must be one of {REVIEWERS}')
+    worktree = Path(packet['worktree'])
+    # Dirt that was already present (a test artifact) is not a patch from this review run.
+    before_status = _worktree_status(worktree)
+    tried = []
+    for name in reviewers:
+        result = reviewer(name, packet, prompt, policy)
+        tried.append({'reviewer': name, 'status': result.get('status'), 'reason': result.get('reason')})
+        if result.get('status') == 'handoff_to_orchestrator':
+            return {'ok': False, 'status': 'handoff_to_orchestrator', 'reviewer': name,
+                    'task_file': result.get('task_file'), 'tried': tried}
+        if result.get('status') != 'done':
+            continue
+        try:
+            parsed = parse_verdict(result.get('text'))
+        except outputs.InvalidStructuredOutput as error:
+            tried[-1].update(status='invalid_verdict', reason=str(error))
+            repair = reviewer(name, packet, prompt + (
+                '\n## Verdict format repair\nThe previous verdict was invalid. '
+                'Return one schema version 1 object and do not change the worktree.\n'), policy)
+            tried.append({'reviewer': name, 'status': repair.get('status'), 'reason': repair.get('reason')})
+            try:
+                if repair.get('status') != 'done':
+                    raise outputs.InvalidStructuredOutput('repair_run_failed')
+                parsed = parse_verdict(repair.get('text'))
+            except outputs.InvalidStructuredOutput as repair_error:
+                tried[-1].update(status='invalid_verdict', reason=str(repair_error))
+                return {'ok': False, 'status': 'invalid_verdict', 'reviewer': name,
+                        'tried': tried, 'reason': str(repair_error)}
+            tried[-1]['status'] = 'verdict_repaired'
+        verdict = parsed['verdict']
+        if _git(worktree, 'rev-parse', 'HEAD').stdout.strip() != packet['head']:
+            return {'ok': False, 'status': 'stale', 'reviewer': name, 'tried': tried,
+                    'reason': 'unit head moved during review; re-queue the unit; nothing recorded'}
+        notes = security.redact(parsed['notes'].strip()[-4000:])
+        after_status = _worktree_status(worktree)
+        if verdict == 'approve' and after_status and after_status != before_status:
+            verdict, notes = 'reject', ('reviewer left uncommitted patches; commit them and re-queue.\n' + notes)
+        return {'ok': verdict == 'approve', 'status': 'recorded', 'verdict': verdict, 'notes': notes,
+                'reviewer': name, 'tried': tried, 'head': packet['head']}
+    return {'ok': False, 'status': 'no_reviewer', 'tried': tried,
+            'reason': 'no reviewer was available; review stays pending'}
 
 
 def review_unit(batch_id, unit_id, policy=None, reviewers=REVIEWERS, reviewer=None):
