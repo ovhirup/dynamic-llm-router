@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from helpers import TERM, load_policy
-from llm_router import cli, handoff, job_dispatch, selection, unit_review
+from llm_router import cli, handoff, job_dispatch, security, selection, unit_review
 from test_check import PLANTED_VALUE
 from test_task_dispatch import repo
 
@@ -169,6 +169,56 @@ class SubmoduleCheckTests(unittest.TestCase):
         self.settings = {'test_cmd': 'true', 'allow_no_tests': True}
         result, _ = self.check_json(1, '--base', pre)
         self.assertEqual(result['leak_check']['status'], 'blocked')
+
+    def _binary_secret_payload(self):
+        return b'\x00\xff' + b'key = ' + PLANTED_VALUE.encode() + b'\n'
+
+    def test_submodule_committed_binary_nul_secret_blocks_check(self):
+        path = self.target / 'vendor' / 'lib' / 'blob.bin'
+        path.write_bytes(self._binary_secret_payload())
+        self.commit(self.target / 'vendor' / 'lib')
+        base = self.git(self.target, 'rev-parse', 'HEAD~1').strip()
+        result, stdout = self.check_json(1, '--base', base)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertIn('vendor/lib', json.dumps(result['leak_check']['findings']))
+        self.assertNotIn(PLANTED_VALUE, stdout)
+
+    def test_submodule_staged_binary_nul_secret_blocks_check(self):
+        path = self.target / 'vendor' / 'lib' / 'staged.bin'
+        path.write_bytes(self._binary_secret_payload())
+        self.git(self.target / 'vendor' / 'lib', 'add', 'staged.bin')
+        result, stdout = self.check_json(1)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertNotIn(PLANTED_VALUE, stdout)
+
+    def test_submodule_untracked_binary_nul_secret_blocks_check(self):
+        path = self.target / 'vendor' / 'lib' / 'secret.bin'
+        path.write_bytes(self._binary_secret_payload())
+        result, stdout = self.check_json(1)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertNotIn(PLANTED_VALUE, stdout)
+
+    def test_submodule_untracked_secret_in_build_dir_blocks_check(self):
+        build_dir = self.target / 'vendor' / 'lib' / 'build'
+        build_dir.mkdir(parents=True)
+        (build_dir / 'x.env').write_text(TERM + '\n')
+        result, stdout = self.check_json(1)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertIn('vendor/lib/build', json.dumps(result['leak_check']['findings']))
+        self.assertNotIn(TERM, stdout)
+
+    def test_submodule_leak_check_error_refuses(self):
+        original = security.leak_check
+
+        def flaky(*args, **kwargs):
+            if Path(args[0]).resolve() == Path(self.sub).resolve():
+                return {'status': 'error', 'error': 'OSError', 'findings': []}
+            return original(*args, **kwargs)
+
+        with mock.patch.object(security, 'leak_check', side_effect=flaky):
+            result, _ = self.check_json(2)
+        self.assertIn('refused', result)
+        self.assertIn('submodule leak scan failed', result['refused'])
 
 
 class SubmoduleProbeTests(SubmoduleCheckTests):
