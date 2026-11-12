@@ -91,6 +91,33 @@ class SubmoduleCheckTests(unittest.TestCase):
         self.assertEqual(result['ok'], expected == 0)
         return result, stdout
 
+    def _empty_private_path_in_submodule(self, state):
+        name = f'notes/{TERM}-empty.txt'
+        (self.sub / 'notes').mkdir()
+        (self.sub / name).touch()
+        if state == 'staged':
+            self.git(self.sub, 'add', name)
+        elif state == 'committed':
+            self.commit(self.sub, 'empty private path')
+        elif state != 'untracked':
+            raise AssertionError(state)
+        result, stdout = self.check_json(1)
+        self.assertEqual(
+            result['leak_check']['findings'],
+            [{'file': f'vendor/lib/notes/{security.mask(TERM)}-empty.txt (path)', 'kind': 'private_term'}],
+        )
+        self.assertNotIn(TERM, stdout)
+        self.assertNotIn(TERM, json.dumps(result))
+
+    def test_untracked_empty_private_path_in_submodule_is_blocked(self):
+        self._empty_private_path_in_submodule('untracked')
+
+    def test_staged_empty_private_path_in_submodule_is_blocked(self):
+        self._empty_private_path_in_submodule('staged')
+
+    def test_committed_empty_private_path_in_submodule_is_blocked(self):
+        self._empty_private_path_in_submodule('committed')
+
     def test_planted_secret_after_committed_gitlink_blocks_with_empty_parent_diff(self):
         base = self.git(self.target, 'rev-parse', 'HEAD').strip()
         (self.target / 'vendor' / 'lib' / 'planted.txt').write_text(TERM + '\n')

@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from helpers import TERM, load_policy
-from llm_router import cli, handoff, job_dispatch, selection, task_dispatch, unit_review
+from llm_router import cli, handoff, job_dispatch, security, selection, task_dispatch, unit_review
 from test_task_dispatch import repo
 
 
@@ -228,6 +228,26 @@ class CheckTests(unittest.TestCase):
 
     def test_committed_clean_empty_addition_passes(self):
         self.check_empty_addition('committed', private=False)
+
+    def _delete_private_named_file(self, commit_deletion):
+        name = f'{TERM}.txt'
+        (self.repo / name).write_text('public\n')
+        self.commit(self.repo)
+        self.git(self.target, 'merge', '--ff-only', 'main')
+        self.git(self.target, 'rm', '-f', name)
+        if commit_deletion:
+            self.commit(self.target)
+        result, stdout = self.check_json(1)
+        self.assertEqual(result['leak_check']['findings'],
+                         [{'file': f'{security.mask(TERM)}.txt (path)', 'kind': 'private_term'}])
+        self.assertNotIn(TERM, stdout)
+        self.assertNotIn(TERM, json.dumps(result))
+
+    def test_committed_deletion_of_private_path_blocks(self):
+        self._delete_private_named_file(commit_deletion=True)
+
+    def test_staged_deletion_of_private_path_blocks(self):
+        self._delete_private_named_file(commit_deletion=False)
 
     def test_untracked_private_term_and_unstaged_key_are_scanned(self):
         (self.target / 'notes.txt').write_text(TERM)

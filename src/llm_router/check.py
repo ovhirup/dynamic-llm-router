@@ -187,12 +187,24 @@ def _submodule_review_diff(source, root, parent_base, env):
     return ''.join(f'\n# Submodule {root}\n{patch}' for patch in _submodule_patches(source, root, parent_base, env))
 
 
+def _submodule_path_names(sub, start, env):
+    """Changed and untracked paths in a submodule. Empty files have no added lines."""
+    names = []
+    for cached in (False, True):
+        names.extend(security.changed_paths(sub, start, cached=cached, env=env))
+    names.extend(security.untracked_files(sub, skip_dirs=()))
+    return tuple(dict.fromkeys(names))
+
+
 def _submodule_leak_findings(source, root, parent_base, terms, allow, env):
     sub = _require_submodule(source, root)
+    start = _submodule_start_sha(source, root, parent_base, env) or EMPTY_TREE
     findings = {(f'{root}/{item["file"]}', item['kind'])
                 for patch in _submodule_patches(source, root, parent_base, env)
                 for item in security.scan_diff(patch, terms, allow)}
-    start = _submodule_start_sha(source, root, parent_base, env) or EMPTY_TREE
+    findings.update((f'{root}/{item["file"]}', item['kind'])
+                    for item in security.scan_diff('', terms, allow,
+                                                   paths=_submodule_path_names(sub, start, env)))
     for cached in (False, True):
         scan = security.leak_check(sub, start, None, terms, allow=allow, cached=cached,
                                    skip_dirs=(), scan_binary_untracked=True,
