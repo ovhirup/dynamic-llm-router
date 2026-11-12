@@ -249,6 +249,34 @@ class CheckTests(unittest.TestCase):
     def test_staged_deletion_of_private_path_blocks(self):
         self._delete_private_named_file(commit_deletion=False)
 
+    def test_mode_only_change_of_private_path_is_scanned(self):
+        name = f'{TERM}.txt'
+        (self.repo / name).write_text('public\n')
+        self.commit(self.repo)
+        self.git(self.target, 'merge', '--ff-only', 'main')
+        (self.target / name).chmod(0o755)
+        self.commit(self.target)
+        diff = self.git(self.target, 'diff', 'main', 'HEAD')
+        self.assertIn('old mode', diff)
+        self.assertNotIn('@@', diff)
+        result, stdout = self.check_json(1)
+        self.assertEqual(result['leak_check']['findings'],
+                         [{'file': f'{security.mask(TERM)}.txt (path)', 'kind': 'private_term'}])
+        self.assertNotIn(TERM, stdout)
+        self.assertNotIn(TERM, json.dumps(result))
+
+    def test_rename_only_to_private_path_is_scanned(self):
+        original = (self.target / 'README.md').read_text()
+        self.git(self.target, 'mv', 'README.md', f'{TERM}.txt')
+        self.commit(self.target)
+        self.assertEqual((self.target / f'{TERM}.txt').read_text(), original)
+        result, stdout = self.check_json(1)
+        blob = json.dumps(result['leak_check']['findings'])
+        self.assertIn('(path)', blob)
+        self.assertIn(security.mask(TERM), blob)
+        self.assertNotIn(TERM, stdout)
+        self.assertNotIn(TERM, blob)
+
     def test_untracked_private_term_and_unstaged_key_are_scanned(self):
         (self.target / 'notes.txt').write_text(TERM)
         (self.target / 'README.md').write_text('key = ' + PLANTED_VALUE)

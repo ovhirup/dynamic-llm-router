@@ -226,6 +226,28 @@ class SubmoduleCheckTests(unittest.TestCase):
         self.assertEqual(result['leak_check']['status'], 'blocked')
         self.assertNotIn(PLANTED_VALUE, stdout)
 
+    def _secret_under_submodule_dir(self, dirname, tracked):
+        directory = self.sub / dirname
+        directory.mkdir()
+        (directory / 'x.env').write_text(TERM + '\n')
+        if tracked:
+            self.commit(self.sub, f'track {dirname}')
+        result, stdout = self.check_json(1)
+        blob = json.dumps(result['leak_check']['findings'])
+        self.assertIn(f'vendor/lib/{dirname}', blob)
+        self.assertIn('private_term', blob)
+        self.assertNotIn(TERM, stdout)
+        self.assertNotIn(TERM, blob)
+
+    def test_submodule_tracked_secret_in_build_dir_blocks_check(self):
+        self._secret_under_submodule_dir('build', tracked=True)
+
+    def test_submodule_tracked_secret_in_dist_dir_blocks_check(self):
+        self._secret_under_submodule_dir('dist', tracked=True)
+
+    def test_submodule_untracked_secret_in_dist_dir_blocks_check(self):
+        self._secret_under_submodule_dir('dist', tracked=False)
+
     def test_submodule_untracked_secret_in_build_dir_blocks_check(self):
         build_dir = self.target / 'vendor' / 'lib' / 'build'
         build_dir.mkdir(parents=True)
