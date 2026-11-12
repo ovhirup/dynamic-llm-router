@@ -195,7 +195,8 @@ def _submodule_leak_findings(source, root, parent_base, terms, allow, env):
     start = _submodule_start_sha(source, root, parent_base, env) or EMPTY_TREE
     for cached in (False, True):
         scan = security.leak_check(sub, start, None, terms, allow=allow, cached=cached,
-                                   skip_dirs=(), scan_binary_untracked=True)
+                                   skip_dirs=(), scan_binary_untracked=True,
+                                   scan_large_untracked=True, scan_symlink_untracked=True)
         if scan.get('status') == 'error':
             raise jobs.Refused(f'submodule leak scan failed for {root}')
         if scan.get('status') == 'blocked':
