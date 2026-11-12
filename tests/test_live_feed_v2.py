@@ -193,6 +193,13 @@ class TimelineAndNowTests(FeedFixture):
         self.assertEqual(job['now'], 'running tests')
         self.assertEqual(job['gates']['tests']['state'], 'running')
 
+    def test_a_running_job_names_its_worker_from_live_events_before_any_log(self):
+        # Seen in the live demo: a forced worker records no allocation, and its .log lands only at exit.
+        self.running('demo-20261112-175100', '20261112-175100')
+        self.events('20261112-175100', 1, 'cursor', [('command', 'ls')])
+        job = self.find(self.feed(), 'demo-20261112-175100')
+        self.assertEqual((job['worker'], job['workers']), ('cursor', ['cursor']))
+
     def test_jobs_without_events_and_history_jobs(self):
         self.running('demo-20261112-175900')
         self.finished('demo-20261112-120000', minutes_ago=300)

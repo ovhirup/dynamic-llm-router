@@ -432,6 +432,9 @@ def build_live_jobs_feed(policy=None, now=None):
         item['events'] = job_events(out_dir, item['_stamp'], terms)
     for item in running:
         item['now'] = now_line(item['events'], item['state'])
+        if not item['workers'] and item['events']:  # worker logs land at exit; live events name it now
+            item['workers'] = list(dict.fromkeys(event['worker'] for event in item['events']))
+            item['worker'] = item['workers'][-1]
     for item in all_jobs:
         item.pop('_sort_ts', None)
         item.pop('_stamp', None)
