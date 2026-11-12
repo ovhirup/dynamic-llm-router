@@ -185,6 +185,50 @@ class CheckTests(unittest.TestCase):
         self.assertNotIn(TERM, stdout)
         self.assertNotIn(PLANTED_VALUE, stdout)
 
+    def check_empty_addition(self, state, private):
+        name = f'notes/{TERM}-empty.txt' if private else 'notes/empty.txt'
+        path = self.target / name
+        path.parent.mkdir()
+        path.touch()
+        if state == 'untracked':
+            patch = subprocess.run(['git', 'diff', '--no-index', '--', '/dev/null', str(path)],
+                                   capture_output=True, text=True).stdout
+        else:
+            self.git(self.target, 'add', name)
+            if state == 'committed':
+                self.commit(self.target)
+                patch = self.git(self.target, 'diff', 'main', 'HEAD')
+            else:
+                patch = self.git(self.target, 'diff', '--cached')
+            # Prove the committed/index snapshot is scanned even when the file is gone on disk.
+            path.unlink()
+        self.assertIn('new file mode', patch)
+        self.assertNotIn('@@', patch)
+        result, stdout = self.check_json(1 if private else 0)
+        self.assertEqual(result['leak_check']['status'], 'blocked' if private else 'clean')
+        self.assertEqual(result['leak_check']['findings'],
+                         [{'file': 'notes/Ze***l-empty.txt (path)', 'kind': 'private_term'}]
+                         if private else [])
+        self.assertNotIn(TERM, stdout)
+
+    def test_untracked_empty_private_path_is_blocked(self):
+        self.check_empty_addition('untracked', private=True)
+
+    def test_staged_empty_private_path_is_blocked(self):
+        self.check_empty_addition('staged', private=True)
+
+    def test_committed_empty_private_path_is_blocked(self):
+        self.check_empty_addition('committed', private=True)
+
+    def test_untracked_clean_empty_addition_passes(self):
+        self.check_empty_addition('untracked', private=False)
+
+    def test_staged_clean_empty_addition_passes(self):
+        self.check_empty_addition('staged', private=False)
+
+    def test_committed_clean_empty_addition_passes(self):
+        self.check_empty_addition('committed', private=False)
+
     def test_untracked_private_term_and_unstaged_key_are_scanned(self):
         (self.target / 'notes.txt').write_text(TERM)
         (self.target / 'README.md').write_text('key = ' + PLANTED_VALUE)

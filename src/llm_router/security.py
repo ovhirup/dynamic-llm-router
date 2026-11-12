@@ -336,13 +336,26 @@ def mask_private_terms(text, terms):
     return text
 
 
-def scan_diff(diff, terms, allow=()):
-    """Scan the added lines and paths of a captured Git patch using the usual leak rules."""
+def changed_paths(cwd, base, cached=False, env=None):
+    """List changed paths independently of content hunks, including empty-file additions."""
+    args = ['git', '-C', str(cwd), 'diff', '--no-ext-diff', '--no-renames', '--name-only', '-z']
+    args += ['--cached'] if cached else []
+    args += [base, '--']
+    out = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, check=True,
+                         text=True, errors='replace', timeout=60, env=env).stdout
+    return [name for name in out.split('\0') if name]
+
+
+def scan_diff(diff, terms, allow=(), paths=()):
+    """Scan added lines and independently collected paths using the usual leak rules."""
     findings = []
-    for name, lines in _parse_added_lines(diff).items():
+    added = _parse_added_lines(diff)
+    for name in dict.fromkeys((*paths, *added)):
         shown = mask_private_terms(name, terms)
         findings.extend({'file': f'{shown} (path)', 'kind': kind}
                         for _, kind, _ in scan_text(name, terms, allow))
+    for name, lines in added.items():
+        shown = mask_private_terms(name, terms)
         findings.extend({'file': f'{shown}:{number}', 'kind': kind}
                         for number, text in lines for _, kind, _ in scan_text(text, terms, allow))
     return findings
