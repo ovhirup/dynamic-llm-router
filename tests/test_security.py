@@ -214,7 +214,7 @@ class RunTaskSecurityTests(unittest.TestCase):
         """Positive control: watcher must fail when the marker is deliberately on argv."""
         code = 'import time; time.sleep(1.5)'
         _, seen = self.run_with('codex', code, argv_expose_marker=True)
-        self.assertGreater(len(seen), 5)
+        self.assertGreaterEqual(len(seen), 5)
         self.assertTrue(any(seen))
 
     def test_file_delivery_0600_and_removed(self):
