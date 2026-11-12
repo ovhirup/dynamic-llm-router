@@ -175,7 +175,7 @@ def _submodule_patches(source, root, parent_base, env):
     sub = _require_submodule(source, root)
     start = _submodule_start_sha(source, root, parent_base, env) or EMPTY_TREE
     patches = []
-    for extra in (('-U0',), ('-U0', '--cached')):
+    for extra in (('-U0', '--text'), ('-U0', '--cached', '--text')):
         try:
             patches.append(_diff(sub, start, env, *extra))
         except jobs.Refused:
@@ -194,7 +194,10 @@ def _submodule_leak_findings(source, root, parent_base, terms, allow, env):
                 for item in security.scan_diff(patch, terms, allow)}
     start = _submodule_start_sha(source, root, parent_base, env) or EMPTY_TREE
     for cached in (False, True):
-        scan = security.leak_check(sub, start, None, terms, allow=allow, cached=cached)
+        scan = security.leak_check(sub, start, None, terms, allow=allow, cached=cached,
+                                   skip_dirs=(), scan_binary_untracked=True)
+        if scan.get('status') == 'error':
+            raise jobs.Refused(f'submodule leak scan failed for {root}')
         if scan.get('status') == 'blocked':
             findings.update((f'{root}/{item["file"]}', item['kind']) for item in scan['findings'])
     return findings

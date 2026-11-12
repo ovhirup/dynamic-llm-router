@@ -355,7 +355,7 @@ def _skipped(name, skip_dirs):
 
 
 def leak_check(cwd, base, untracked, terms, max_bytes=1_000_000, cached=False, allow=(),
-               skip_dirs=DEFAULT_SKIP_DIRS):
+               skip_dirs=DEFAULT_SKIP_DIRS, scan_binary_untracked=False):
     """Scan added diff lines and untracked (non-ignored) files; never modifies anything.
 
     untracked=None lists them with git (ignored files and vendor/build dirs are skipped)."""
@@ -380,7 +380,7 @@ def leak_check(cwd, base, untracked, terms, max_bytes=1_000_000, cached=False, a
                 if file.is_symlink() or not file.is_file() or file.stat().st_size > max_bytes:
                     continue
                 data = file.read_bytes()
-                if b'\0' in data[:8192]:
+                if b'\0' in data[:8192] and not scan_binary_untracked:
                     continue
                 rel = file.relative_to(cwd)
                 for number, kind, masked in scan_text(data.decode('utf-8', 'replace'), terms, allow):
