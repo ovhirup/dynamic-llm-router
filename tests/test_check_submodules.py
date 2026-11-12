@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from helpers import TERM, load_policy
+from llm_router import check as check_mod
 from llm_router import cli, handoff, job_dispatch, security, selection, unit_review
 from test_check import PLANTED_VALUE
 from test_task_dispatch import repo
@@ -289,6 +290,78 @@ class SubmoduleCheckTests(unittest.TestCase):
         self.assertIn('symlink', result['refused'])
         self.assertIsNone(result['leak_check'])
         self.assertNotIn(TERM, stdout)
+
+    def test_populated_submodule_scan_refusal_is_before_tests(self):
+        marker = self.root / 'tests-ran'
+        self.settings['test_cmd'] = f'touch {marker}'
+        (self.target / 'DONE_CHECK.md').write_text('Every branch is checked.\n')
+        original = security.leak_check
+
+        def flaky(*args, **kwargs):
+            if Path(args[0]).resolve() == Path(self.sub).resolve():
+                return {'status': 'error', 'error': 'OSError', 'findings': []}
+            return original(*args, **kwargs)
+
+        with mock.patch.object(security, 'leak_check', side_effect=flaky):
+            result, stdout = self.check_json(2, '--review')
+        self.assertIn('submodule leak scan failed for vendor/lib', result['refused'])
+        self.assertIsNone(result['tests'])
+        self.assertIsNone(result['review'])
+        self.assertFalse(marker.exists())
+        self.assertNotIn(TERM, stdout)
+
+    def test_removed_submodule_does_not_need_initialization(self):
+        base = self.git(self.target, 'rev-parse', 'HEAD').strip()
+        self.git(self.target, 'rm', '-rf', 'vendor/lib')
+        gitmodules = self.target / '.gitmodules'
+        if gitmodules.exists():
+            gitmodules.unlink()
+        self.commit(self.target, 'remove submodule')
+        (self.target / 'notes.txt').write_text(TERM + '\n')
+        result, stdout = self.check_json(1, '--base', base)
+        self.assertNotIn('refused', result)
+        self.assertIsNotNone(result['tests'])
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertIn('notes.txt:1', [item['file'] for item in result['leak_check']['findings']])
+        self.assertNotIn('not initialized', stdout)
+        self.assertNotIn(TERM, stdout)
+
+    def test_uninitialized_head_submodule_still_refuses(self):
+        marker = self.root / 'tests-ran'
+        self.settings['test_cmd'] = f'touch {marker}'
+        shutil.rmtree(self.sub)
+        result, stdout = self.check_json(2)
+        self.assertIn('not initialized', result['refused'])
+        self.assertIn('vendor/lib', result['refused'])
+        self.assertIsNone(result['tests'])
+        self.assertIsNone(result['review'])
+        self.assertFalse(marker.exists())
+        self.assertNotIn(TERM, stdout)
+
+    def test_submodule_term_reported_once_with_prefix(self):
+        (self.sub / 'planted.txt').write_text(TERM + '\n')
+        self.git(self.sub, 'add', 'planted.txt')
+        result, stdout = self.check_json(1)
+        self.assertEqual(result['leak_check']['findings'],
+                         [{'file': 'vendor/lib/planted.txt:1', 'kind': 'private_term'}])
+        self.assertNotIn(TERM, stdout)
+        code, human = self.invoke()
+        self.assertEqual(code, 1, human)
+        planted = [line for line in human.splitlines() if 'planted.txt' in line]
+        self.assertEqual(planted, ['vendor/lib/planted.txt:1 (private_term)'])
+        self.assertNotIn(TERM, human)
+
+    def test_submodule_roots_computed_once(self):
+        calls = {'n': 0}
+        original = check_mod._submodule_roots_for_evidence
+
+        def counting(*args, **kwargs):
+            calls['n'] += 1
+            return original(*args, **kwargs)
+
+        with mock.patch.object(check_mod, '_submodule_roots_for_evidence', side_effect=counting):
+            self.check_json(0)
+        self.assertEqual(calls['n'], 1)
 
     def test_submodule_leak_check_error_refuses(self):
         original = security.leak_check

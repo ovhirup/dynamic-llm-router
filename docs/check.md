@@ -18,7 +18,10 @@ environment and use a test command that works from the copy.
 The leak gate scans added lines in the committed, staged, and current working diffs
 using the configured secret and private-term rules. Deleting a file whose name
 contains a private term still blocks the gate: the name remains in the diff and
-in published history.
+in published history. A submodule that exists only at the base commit, because
+the branch removed it, does not have to be initialized. A submodule still
+recorded at HEAD and missing from the checkout refuses the check before tests
+or review.
 
 Tests and leak scanning are the default gates. DLR makes no model or network
 calls in this mode. Configured test commands run with their own normal
