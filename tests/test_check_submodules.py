@@ -173,6 +173,29 @@ class SubmoduleCheckTests(unittest.TestCase):
     def _binary_secret_payload(self):
         return b'\x00\xff' + b'key = ' + PLANTED_VALUE.encode() + b'\n'
 
+    def test_submodule_working_binary_private_term_requires_text_diff(self):
+        base = self.git(self.target, 'rev-parse', 'HEAD').strip()
+        # Modify a tracked file so neither the index nor untracked scans see the term.
+        (self.sub / 'README.md').write_bytes(b'\x00' + TERM.encode() + b'\n')
+        result, stdout = self.check_json(1, '--base', base)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertIn({'file': 'vendor/lib/README.md:1', 'kind': 'private_term'},
+                      result['leak_check']['findings'])
+        self.assertNotIn(TERM, stdout)
+
+    def test_submodule_staged_binary_private_term_requires_text_diff(self):
+        base = self.git(self.target, 'rev-parse', 'HEAD').strip()
+        path = self.sub / 'README.md'
+        path.write_bytes(b'\x00' + TERM.encode() + b'\n')
+        self.git(self.sub, 'add', 'README.md')
+        # The submodule HEAD and worktree are clean; only its index retains the term.
+        path.write_text('hello\n')
+        result, stdout = self.check_json(1, '--base', base)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertIn({'file': 'vendor/lib/README.md:1', 'kind': 'private_term'},
+                      result['leak_check']['findings'])
+        self.assertNotIn(TERM, stdout)
+
     def test_submodule_committed_binary_nul_secret_blocks_check(self):
         path = self.target / 'vendor' / 'lib' / 'blob.bin'
         path.write_bytes(self._binary_secret_payload())
