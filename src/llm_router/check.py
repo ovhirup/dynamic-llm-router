@@ -96,9 +96,9 @@ def _diff(repo, base, env, *flags):
     return diff.stdout.decode(errors='replace')
 
 
-def _submodule_patches(scratch, root, env):
-    """Git patches for a populated submodule copied into the scratch checkout."""
-    sub = scratch / root
+def _submodule_patches(source, root, env):
+    """Git patches for a populated submodule in the source checkout."""
+    sub = source / root
     if not sub.is_dir() or not (sub / '.git').exists():
         return []
     head = jobs.resolve_base(sub, 'HEAD', env=env)
@@ -113,16 +113,16 @@ def _submodule_patches(scratch, root, env):
     return [patch for patch in patches if patch.strip()]
 
 
-def _submodule_review_diff(scratch, root, env):
-    return ''.join(f'\n# Submodule {root}\n{patch}' for patch in _submodule_patches(scratch, root, env))
+def _submodule_review_diff(source, root, env):
+    return ''.join(f'\n# Submodule {root}\n{patch}' for patch in _submodule_patches(source, root, env))
 
 
-def _submodule_leak_findings(scratch, root, terms, allow, env):
-    sub = scratch / root
+def _submodule_leak_findings(source, root, terms, allow, env):
+    sub = source / root
     if not sub.is_dir() or not (sub / '.git').exists():
         return set()
     findings = {(f'{root}/{item["file"]}', item['kind'])
-                for patch in _submodule_patches(scratch, root, env)
+                for patch in _submodule_patches(source, root, env)
                 for item in security.scan_diff(patch, terms, allow)}
     head = jobs.resolve_base(sub, 'HEAD', env=env)
     if head:
@@ -145,11 +145,11 @@ def _snapshot(repo, scratch, base, head, env, review, populated=None):
     _copy_files(repo, scratch, env, populated)
     jobs._git(scratch, 'add', '--intent-to-add', '--force', '--', '.', check=True, env=env)
     working = _diff(scratch, base, env, '--text', '-U0')
-    sub_patches = [patch for root in populated for patch in _submodule_patches(scratch, root, env)]
+    sub_patches = [patch for root in populated for patch in _submodule_patches(repo, root, env)]
     review_patch = _diff(scratch, base, env) if review else ''
     if review:
         for root in populated:
-            review_patch += _submodule_review_diff(scratch, root, env)
+            review_patch += _submodule_review_diff(repo, root, env)
     return (committed, staged, working, *sub_patches), review_patch
 
 
@@ -252,7 +252,7 @@ def check(policy, repo, base=None, review=False):
             findings = {(finding['file'], finding['kind'])
                         for patch in patches for finding in security.scan_diff(patch, terms, allow)}
             for root in populated:
-                findings.update(_submodule_leak_findings(scratch, root, terms, allow, env))
+                findings.update(_submodule_leak_findings(repo, root, terms, allow, env))
             findings.update((f'{DONE_CHECK}:{line}', kind)
                             for line, kind, _ in security.scan_text(done_check, terms, allow))
             result['leak_check'] = {'status': 'blocked' if findings else 'clean',

@@ -79,6 +79,15 @@ class SubmoduleCheckTests(unittest.TestCase):
         self.assertEqual(result['ok'], expected == 0)
         return result, stdout
 
+    def test_planted_secret_after_committed_gitlink_blocks_with_empty_parent_diff(self):
+        """Gitlink is already committed; parent diff vs HEAD is empty but submodule worktree is not."""
+        base = self.git(self.target, 'rev-parse', 'HEAD').strip()
+        (self.target / 'vendor' / 'lib' / 'planted.txt').write_text(TERM + '\n')
+        result, stdout = self.check_json(1, '--base', base)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertIn('vendor/lib', json.dumps(result['leak_check']['findings']))
+        self.assertNotIn(TERM, stdout)
+
     def test_secret_in_modified_submodule_file_blocks_check(self):
         path = self.target / 'vendor' / 'lib' / 'tracked.txt'
         path.write_text('key = ' + PLANTED_VALUE + '\n')
