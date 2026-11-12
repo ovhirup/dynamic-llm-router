@@ -186,6 +186,66 @@ class RedactionTests(Base):
         self.assertEqual([e['kind'] for e in events], ['message', 'command', 'raw', 'done'])
         self.assertTrue(all(len(e['text']) <= we.TEXT_LIMIT for e in events))
 
+    def test_no_cut_before_redaction_in_raw_lines(self):
+        # Redaction shrinks the many full secrets, so whatever sat past an early cut point would become visible.
+        path = self.base / 'events.jsonl'
+        log = we.EventLog(path, 'codex')
+        # A 400-char pre-cut would land 13 chars into the 11th secret: 'sk-' + 10 chars, too short to match the
+        # token pattern, and it would sit inside the 200 shown chars once the first 10 secrets are redacted.
+        log.feed('stderr', 'p' * 25 + ' ' + (SECRET + ' ') * 12 + '\n')
+        log.close()
+        self.assertNotIn('sk-qqqq', path.read_text())
+
+    def test_secret_split_across_a_long_streamed_run_is_redacted_whole(self):
+        path = self.base / 'events.jsonl'
+        log = we.EventLog(path, 'grok-build')
+        half = len(SECRET) // 2
+        log.feed('stdout', json.dumps({'type': 'text', 'data': 'x ' * 1995 + SECRET[:half]}) + '\n')
+        log.feed('stdout', json.dumps({'type': 'text', 'data': SECRET[half:] + ' tail'}) + '\n')
+        log.feed('stdout', json.dumps({'type': 'end', 'stopReason': 'end_turn'}) + '\n')
+        log.close()
+        body = path.read_text()
+        self.assertNotIn(SECRET[half:], body)
+        self.assertEqual([json.loads(line)['kind'] for line in body.splitlines()], ['message', 'done'])
+
+    def test_long_quoted_credential_in_a_raw_line_is_redacted(self):
+        # From review: clipping first would drop the closing quote that QUOTED_SECRET needs.
+        value = 'v' * 500
+        path = self.base / 'events.jsonl'
+        log = we.EventLog(path, 'codex')
+        log.feed('stderr', f'password: "{value}"\n')
+        log.close()
+        self.assertNotIn('vvvv', path.read_text())
+
+    def test_stderr_between_stdout_chunks_does_not_split_the_redaction(self):
+        # From review: a stderr line must not flush a half-finished stdout run.
+        half = len(SECRET) // 2
+        path = self.base / 'events.jsonl'
+        log = we.EventLog(path, 'grok-build', private_terms=[TERM])
+        log.feed('stdout', json.dumps({'type': 'text', 'data': f'key {SECRET[:half]}'}) + '\n')
+        log.feed('stderr', 'warning: retrying\n')
+        log.feed('stdout', json.dumps({'type': 'text', 'data': f'{SECRET[half:]} for {TERM[:3]}'}) + '\n')
+        log.feed('stderr', 'warning: retrying again\n')
+        log.feed('stdout', json.dumps({'type': 'text', 'data': f'{TERM[3:]} ok'}) + '\n')
+        log.feed('stdout', json.dumps({'type': 'end', 'stopReason': 'end_turn'}) + '\n')
+        log.close()
+        body = path.read_text()
+        self.assertNotIn(SECRET[:half], body)
+        self.assertNotIn(SECRET[half:], body)
+        self.assertNotIn(TERM[:3] + '"', body)
+        self.assertNotIn(TERM[3:], body)
+        events = [json.loads(line) for line in body.splitlines()]
+        self.assertEqual([(e['stream'], e['kind']) for e in events],
+                         [('stderr', 'raw'), ('stderr', 'raw'), ('stdout', 'message'), ('stdout', 'done')])
+        self.assertEqual(events[2]['text'], 'key [REDACTED] for [REDACTED] ok')
+
+    def test_a_write_error_during_close_never_raises(self):
+        log = we.EventLog(self.base / 'events.jsonl', 'grok-build')
+        log.feed('stdout', json.dumps({'type': 'text', 'data': 'pending text'}) + '\n')
+        log._handle.close()  # the final flush in close() now hits a closed file
+        log.close()
+        log.feed('stdout', 'after close\n')  # and the log stays disabled, silently
+
     def test_existing_file_is_tightened_to_0600(self):
         path = self.base / 'events.jsonl'
         path.write_text('')

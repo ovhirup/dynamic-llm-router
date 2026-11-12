@@ -4,6 +4,7 @@
 `{worker, stream, kind, text}`. kind is one of KINDS. Lines that are not JSON, malformed JSON and unknown
 event types become `raw`. Reasoning ("thinking") output and session bookkeeping are dropped, never shown.
 Streamed text chunks are marked `partial` so `EventLog` can merge them into one message.
+Nothing is cut before redaction: events are redacted whole, then capped at TEXT_LIMIT when written.
 
 `EventLog` appends events, with a timestamp, to a 0600 JSONL file as the worker runs. Every event is
 redacted (secrets and the policy's private terms) before it is written. Parsing never raises.
@@ -19,7 +20,9 @@ from . import security
 
 KINDS = ('message', 'command', 'edit', 'test', 'error', 'done', 'raw')
 TEXT_LIMIT = 200
-_PARTIAL_LIMIT = 4000  # merged streaming text is flushed once it gets this long
+# A streamed text run is merged whole and redacted in one pass, so a secret split across chunks is matched as one
+# string. Past this cap the rest of the run is dropped, never split: only the first TEXT_LIMIT chars are shown.
+_PARTIAL_CAP = 256 * 1024
 _TEST_RE = re.compile(
     r'(?i)(\bpytest\b|\bunittest\b|\btox\b|\bnox\b|\b(npm|pnpm|yarn|bun)( run)? test\b|\bgo test\b|'
     r'\bcargo test\b|\bmake (check|test)\b|\bjest\b|\bvitest\b|\brspec\b|\bmvn test\b|\bgradle test\b|'
@@ -234,7 +237,8 @@ def _clip(text, limit=TEXT_LIMIT):
 
 
 def _raw(worker, stream, text):
-    return _event(worker, stream, 'raw', _clip(text, 2 * TEXT_LIMIT))
+    # Not clipped here: redaction must see the whole text before EventLog cuts it to TEXT_LIMIT.
+    return _event(worker, stream, 'raw', text)
 
 
 def parse(worker, line, stream='stdout', cwd=None):
@@ -259,7 +263,7 @@ def parse(worker, line, stream='stdout', cwd=None):
             return [_raw(worker, stream, label or stripped)]
         return [item for item in events if item['kind'] in KINDS]
     except Exception:  # never let a strange line break a worker run
-        return [_raw(worker, stream, str(line)[:2 * TEXT_LIMIT])]
+        return [_raw(worker, stream, str(line))]
 
 
 def redact_text(text, private_terms=()):
@@ -297,7 +301,9 @@ class EventLog:
 
     `feed(stream, line)` is called for every output line as it arrives (from both stdout and stderr
     reader threads). Consecutive `partial` messages on one stream are merged into a single message.
-    Any write error disables the log silently: live capture must never fail a worker run."""
+    Pending text is kept per stream: output on the other stream never splits a run, so a secret that
+    straddles chunks is always redacted as one string. Any write error disables the log silently: live
+    capture must never fail a worker run."""
 
     def __init__(self, path, worker, cwd=None, private_terms=(), clock=None):
         self.path = Path(path)
@@ -305,7 +311,7 @@ class EventLog:
         self.private_terms = tuple(term for term in private_terms or () if term)
         self._clock = clock or (lambda: datetime.now(timezone.utc).isoformat(timespec='milliseconds'))
         self._lock = threading.Lock()
-        self._pending = None
+        self._pending = {}  # stream -> merged partial message
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         os.fchmod(fd, 0o600)
@@ -317,42 +323,44 @@ class EventLog:
                 return
             for event in parse(self.worker, line, stream, self.cwd):
                 if event.pop('partial', False):
-                    if self._pending is not None and self._pending['stream'] != stream:
-                        self._flush()
-                    if self._pending is None:
-                        self._pending = event
-                    else:
-                        self._pending['text'] += event['text']
-                    if len(self._pending['text']) >= _PARTIAL_LIMIT:
-                        self._flush()
+                    pending = self._pending.get(stream)
+                    if pending is None:
+                        self._pending[stream] = event
+                    elif len(pending['text']) < _PARTIAL_CAP:
+                        pending['text'] = (pending['text'] + event['text'])[:_PARTIAL_CAP]
                     continue
-                self._flush()
+                self._flush(stream)
                 self._write(event)
 
     def close(self):
         with self._lock:
             if self._handle is None:
                 return
-            self._flush()
-            try:
-                self._handle.close()
-            except OSError:
-                pass
-            self._handle = None
+            for stream in list(self._pending):
+                self._flush(stream)
+            handle, self._handle = self._handle, None  # a failed final write may already have closed it
+            if handle is not None:
+                try:
+                    handle.close()
+                except (OSError, ValueError):
+                    pass
 
-    def _flush(self):
-        pending, self._pending = self._pending, None
-        if pending is not None and pending['text'].strip():
+    def _flush(self, stream):
+        pending = self._pending.pop(stream, None)
+        if pending is not None and pending['text'].strip() and self._handle is not None:
             self._write(pending)
 
     def _write(self, event):
+        handle = self._handle
+        if handle is None:
+            return
         record = {'ts': self._clock(), **event, 'text': redact_text(event['text'], self.private_terms)}
         try:
-            self._handle.write(json.dumps(record, ensure_ascii=False) + '\n')
-            self._handle.flush()
+            handle.write(json.dumps(record, ensure_ascii=False) + '\n')
+            handle.flush()
         except (OSError, ValueError):
             try:
-                self._handle.close()
+                handle.close()
             except (OSError, ValueError):
                 pass
             self._handle = None
