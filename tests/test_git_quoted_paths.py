@@ -57,6 +57,20 @@ class ScanDiffTests(unittest.TestCase):
         self.assertIn('private_term', kinds)
         self.assertIn('openai_key', kinds)
 
+    def test_real_top_level_a_directory_not_stripped_from_b_prefix(self):
+        term = 'a/customer'
+        for header in ('b/a/customer.txt', '"b/a/customer.txt"'):
+            with self.subTest(header=header):
+                findings = security.scan_diff(self._patch(header, 'clean'), [term])
+                self.assertIn('private_term', {f['kind'] for f in findings})
+
+    def test_real_top_level_b_directory_not_stripped_twice(self):
+        term = 'b/vendor'
+        for header in ('b/b/vendor.txt', '"b/b/vendor.txt"'):
+            with self.subTest(header=header):
+                findings = security.scan_diff(self._patch(header, 'clean'), [term])
+                self.assertIn('private_term', {f['kind'] for f in findings})
+
 
 class CheckQuotedPathIntegration(unittest.TestCase):
     def test_quoted_tab_filename_private_term_blocks_check_json(self):

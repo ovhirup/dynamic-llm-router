@@ -276,7 +276,7 @@ def decode_git_path(raw):
 
 def _diff_path_name(header):
     name = decode_git_path(header)
-    return None if name == '/dev/null' else name.removeprefix('b/').removeprefix('a/')
+    return None if name == '/dev/null' else name.removeprefix('b/')
 
 
 def _added_lines(cwd, base, cached=False):
