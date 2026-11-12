@@ -521,10 +521,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
         detected_orch = orch_module.resolve(orchestrator, orchestrator_decision)
     out_dir = td._router_path(policy, 'output_dir', 'logs/task-output')
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Worker logs and live events are named by this stamp; jobs started in the same second (any repo) must
-    # never share it, or they would write into each other's files and show in each other's live lane.
-    stamp = reserve_output_stamp(out_dir, stamp, job_id)
-    summary = {'job_id': job_id, 'output_stamp': stamp, 'repo': str(repo), 'task': task_path.name, 'base': base_ref,
+    summary = {'job_id': job_id, 'output_stamp': None, 'repo': str(repo), 'task': task_path.name, 'base': base_ref,
                'base_sha': base_sha, 'branch': branch, 'worktree': str(worktree), 'size': size,
                'orchestrator': detected_orch['orchestrator'], 'orchestrator_reason': detected_orch['reason'],
                'started_at': started.isoformat(timespec='seconds'), 'finished_at': None,
@@ -544,7 +541,19 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
     with RepoLock(_path(policy, 'lock_dir', 'logs/locks'), repo), _NoSleep(policy, popen):
         before = main_state(repo)
         worktree.parent.mkdir(parents=True, exist_ok=True)
-        _git(repo, 'worktree', 'add', '-q', '-b', branch, str(worktree), base_sha, check=True)
+        # Worker logs and live events are named by this stamp; jobs started in the same second (any repo) must
+        # never share it, or they would write into each other's files and show in each other's live lane.
+        # Claimed only once the repo lock is held, and released if the job cannot start, so a refused start
+        # never leaves a claim naming a job it does not belong to.
+        stamp = summary['output_stamp'] = reserve_output_stamp(out_dir, stamp, job_id)
+        try:
+            _git(repo, 'worktree', 'add', '-q', '-b', branch, str(worktree), base_sha, check=True)
+        except BaseException:
+            try:
+                (out_dir / f'{stamp}-job.json').unlink()
+            except OSError:
+                pass
+            raise
         try:
             if not test_cmd:  # detected at base, so the worker cannot choose the command that judges it
                 test_cmd = detect_test_cmd(worktree, repo)

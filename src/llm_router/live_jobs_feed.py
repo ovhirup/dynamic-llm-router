@@ -12,8 +12,10 @@ JSON yet), and `<state_dir>/logs/task-output/*.log` to build a redacted, lightwe
 """
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import re
+import stat
 
 from . import allocation_dispatch, config, security, task_dispatch as td, worker_events
 
@@ -22,6 +24,58 @@ STALE_IN_FLIGHT_SECONDS = 6 * 3600
 TESTS_SETTLED_SECONDS = 15
 PREVIEW_LINES = 3
 TAIL_BYTES = 8192
+CLAIM_BYTES = 4096
+
+# Worker output is untrusted. Terminal escape sequences (ANSI, OSC such as clipboard or title writes) and
+# control characters are removed from every feed string BEFORE the final redaction pass: removing them
+# afterwards could join the two halves of a secret or private term that an escape had split.
+_ESCAPES = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]?')
+_CONTROLS = re.compile(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]')
+
+
+def strip_controls(text):
+    """`text` without terminal escape sequences or control characters (tab and newline stay)."""
+    return _CONTROLS.sub('', _ESCAPES.sub('', str(text)))
+
+
+def _strip_obj(value):
+    if isinstance(value, str):
+        return strip_controls(value)
+    if isinstance(value, list):
+        return [_strip_obj(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _strip_obj(item) for key, item in value.items()}
+    return value
+
+
+def read_bounded(path, limit=TAIL_BYTES):
+    """`(last <= limit bytes, truncated)` of a regular file, or None.
+
+    Never follows a symlink and never blocks: a FIFO, device, directory or link at `path` gives None. At most
+    `limit` bytes are read even if the file grows while it is being read."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        truncated = info.st_size > limit
+        if truncated:
+            os.lseek(fd, info.st_size - limit, os.SEEK_SET)
+        chunks, remaining = [], limit
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b''.join(chunks), truncated
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
 
 # An output stamp is the job's start second, plus `-N` when another job claimed that second first (#288).
 _STAMP = r'\d{8}-\d{6}(?:-\d+)?'
@@ -68,19 +122,11 @@ def tail_preview(log_path, lines_count=PREVIEW_LINES, private_terms=None):
     """Read and redact the last `lines_count` non-empty lines from `log_path` (at most final 8 KB)."""
     if not log_path:
         return []
-    path = Path(log_path)
-    if not path.is_file():
+    got = read_bounded(Path(log_path))
+    if got is None:
         return []
-    try:
-        size = path.stat().st_size
-        with path.open('rb') as handle:
-            if size > TAIL_BYTES:
-                handle.seek(size - TAIL_BYTES)
-            raw = handle.read().decode('utf-8', 'replace')
-    except OSError:
-        return []
-    raw_lines = raw.splitlines()
-    if size > TAIL_BYTES and raw_lines:
+    raw_lines = got[0].decode('utf-8', 'replace').splitlines()
+    if got[1] and raw_lines:
         raw_lines = raw_lines[1:]
     cleaned = []
     for line in raw_lines:
@@ -108,9 +154,12 @@ def latest_events_file(out_dir, stamp):
         if not match or match.group('stamp') != stamp:
             continue
         try:
-            key = (int(match.group('attempt')), path.stat().st_mtime)
+            info = path.lstat()
         except OSError:
             continue
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        key = (int(match.group('attempt')), info.st_mtime)
         if best is None or key > best[0]:
             best = (key, path)
     return best[1] if best else None
@@ -119,7 +168,10 @@ def latest_events_file(out_dir, stamp):
 def live_preview(out_dir, stamp, private_terms=None, lines_count=PREVIEW_LINES):
     """`"<kind>: <text>"` lines from a running job's newest events file, or [] when it has none."""
     path = latest_events_file(out_dir, stamp)
-    return worker_events.read_tail(path, lines_count, private_terms or ()) if path else []
+    if not path:
+        return []
+    shown = [f'{record["kind"]}: {record["text"]}' for record in _event_records(path, private_terms or ())]
+    return shown[-max(1, int(lines_count)):]
 
 
 TIMELINE_EVENTS = 20
@@ -131,32 +183,43 @@ _NOW_VERBS = {'command': 'running ', 'test': 'testing ', 'edit': 'editing ', 'me
 def job_output_stamps(out_dir):
     """`{job_id: output stamp}` from the `<stamp>-job.json` claims `run_job` makes (#288)."""
     stamps = {}
-    if not Path(out_dir).is_dir():
+    out_dir = Path(out_dir)
+    if not out_dir.is_dir():
         return stamps
-    for path in Path(out_dir).glob('*-job.json'):
+    claims = []
+    for path in out_dir.glob('*-job.json'):
         match = _JOB_STAMP_RE.match(path.name)
-        if not match:
+        if match:
+            stamp = match.group('stamp')
+            claims.append(((stamp[:15], int(stamp[16:] or 1)), stamp, path))
+    for _, stamp, path in sorted(claims):
+        got = read_bounded(path, CLAIM_BYTES)
+        if got is None or got[1]:
             continue
         try:
-            job_id = json.loads(path.read_text()).get('job_id')
-        except (OSError, ValueError, AttributeError):
+            job_id = json.loads(got[0].decode('utf-8', 'replace')).get('job_id')
+        except (ValueError, AttributeError):
             continue
-        if isinstance(job_id, str) and job_id:
-            stamps[job_id] = match.group('stamp')
+        if not isinstance(job_id, str) or not job_id:
+            continue
+        # A job id should have one claim. If a start that never ran left a second one, the claim whose stamp
+        # has worker output is the job's; with no output yet, the earliest claim stands.
+        if job_id not in stamps or (not _has_output(out_dir, stamps[job_id]) and _has_output(out_dir, stamp)):
+            stamps[job_id] = stamp
     return stamps
+
+
+def _has_output(out_dir, stamp):
+    return any(_LOG_RE.match(p.name) or _EVENTS_RE.match(p.name) for p in out_dir.glob(f'{stamp}-a*'))
 
 
 def _event_records(path, private_terms=(), tail_bytes=TAIL_BYTES):
     """Events from the last `tail_bytes` of one events file, re-redacted."""
-    try:
-        size = path.stat().st_size
-        with path.open('rb') as handle:
-            if size > tail_bytes:
-                handle.seek(size - tail_bytes)
-            lines = handle.read().decode('utf-8', 'replace').splitlines()
-    except OSError:
+    got = read_bounded(path, tail_bytes)
+    if got is None:
         return []
-    if size > tail_bytes and lines:
+    lines = got[0].decode('utf-8', 'replace').splitlines()
+    if got[1] and lines:
         lines = lines[1:]
     records = []
     for line in lines:
@@ -166,7 +229,8 @@ def _event_records(path, private_terms=(), tail_bytes=TAIL_BYTES):
             continue
         if isinstance(event, dict) and event.get('kind') in worker_events.KINDS:
             records.append({'ts': str(event.get('ts') or ''), 'kind': event['kind'],
-                            'text': worker_events.redact_text(event.get('text', ''), private_terms)})
+                            'text': worker_events.redact_text(strip_controls(event.get('text', '')),
+                                                              private_terms)})
     return records
 
 
@@ -432,19 +496,27 @@ def build_live_jobs_feed(policy=None, now=None):
         item['events'] = job_events(out_dir, item['_stamp'], terms)
     for item in running:
         item['now'] = now_line(item['events'], item['state'])
-        if not item['workers'] and item['events']:  # worker logs land at exit; live events name it now
-            item['workers'] = list(dict.fromkeys(event['worker'] for event in item['events']))
-            item['worker'] = item['workers'][-1]
+        # Worker logs land only when a worker exits, so live events name the current worker first: before
+        # any log exists, and after a failover whose new worker has not finished yet.
+        prev = item['workers'][-1] if item['workers'] else None
+        for event in item['events']:
+            if event['worker'] != prev and event['worker'] not in item['workers']:
+                if prev:
+                    item['hops'] = list(item['hops']) + [{'from': prev, 'to': event['worker'],
+                                                          'attempt': event['attempt']}]
+                item['workers'] = list(item['workers']) + [event['worker']]
+                item['worker'] = prev = event['worker']
+                item['attempt'] = max(item['attempt'], event['attempt'])
     for item in all_jobs:
         item.pop('_sort_ts', None)
         item.pop('_stamp', None)
 
-    return _redact_terms(security.redact_obj({
+    return _redact_terms(security.redact_obj(_strip_obj({
         'updated_at': now_dt.isoformat(timespec='seconds'),
         'running': running,
         'recent': recent,
         'history': history,
-    }), terms)
+    })), terms)
 
 
 def _redact_terms(value, terms):

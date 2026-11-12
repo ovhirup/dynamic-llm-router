@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -463,6 +464,138 @@ class WatchTests(FeedFixture):
         self.assertIn('1 running', done.stdout)
         self.assertIn('demo-20261112-175000'.split('-')[0], done.stdout)
         self.assertEqual(done.stderr, '')
+
+
+def build_within(case, seconds=5):
+    """The feed, built in a thread so a blocking read fails the test instead of hanging the suite."""
+    box = {}
+    thread = threading.Thread(target=lambda: box.update(feed=case.feed()), daemon=True)
+    thread.start()
+    thread.join(seconds)
+    case.assertFalse(thread.is_alive(), f'building the feed blocked for more than {seconds}s')
+    return box['feed']
+
+
+class RefusedStartTests(unittest.TestCase):
+    """Review of #292, item 1: a start that is refused must not leave a claim for the running job's id."""
+
+    def setUp(self):
+        tjd.JobTests.setUp(self)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    select = tjd.JobTests.select
+    worker = tjd.JobTests.worker
+
+    def test_a_start_refused_by_the_repo_lock_leaves_no_claim(self):
+        self.worker("open('out.txt','w').write('x\\n')")
+        out = self.base / 'out'
+        top = Path(jd._git(self.repo, 'rev-parse', '--show-toplevel').stdout.strip())  # as run_job names it
+        with jd.RepoLock(Path(self.policy['run_job']['lock_dir']), top):
+            with self.assertRaises(jd.Refused):
+                jd.run_job(self.repo, self.task, policy=self.policy, select=self.select, test_cmd='true')
+        self.assertEqual(list(out.glob('*-job.json')) if out.is_dir() else [], [])
+
+    def test_a_failed_worktree_add_releases_its_claim(self):
+        self.worker("open('out.txt','w').write('x\\n')")
+        real = jd._git
+
+        def failing(cwd, *args, **kw):
+            if args[:2] == ('worktree', 'add'):
+                raise subprocess.CalledProcessError(1, 'git worktree add')
+            return real(cwd, *args, **kw)
+
+        with mock.patch.object(jd, '_git', failing), self.assertRaises(subprocess.CalledProcessError):
+            jd.run_job(self.repo, self.task, policy=self.policy, select=self.select, test_cmd='true')
+        self.assertEqual(list((self.base / 'out').glob('*-job.json')), [])
+
+
+class ReviewRound2Tests(FeedFixture):
+    """Review of #292, items 1-4."""
+
+    JOB, STAMP = 'demo-20261112-175000', '20261112-175000'
+
+    def test_a_second_claim_for_the_same_job_never_hides_its_events(self):
+        self.running(self.JOB, self.STAMP)
+        self.events(self.STAMP, 1, 'codex', [('command', 'ls')])
+        (self.out / f'{self.STAMP}-2-job.json').write_text(json.dumps({'job_id': self.JOB}))  # stale, no output
+        job = self.find(self.feed(), self.JOB)
+        self.assertEqual([event['text'] for event in job['events']], ['ls'])
+        self.assertEqual(job['now'], 'running ls')
+
+    def test_a_claim_with_output_wins_over_an_earlier_empty_one(self):
+        self.running(self.JOB, self.STAMP)  # empty claim left by a start that never ran
+        (self.out / f'{self.STAMP}-2-job.json').write_text(json.dumps({'job_id': self.JOB}))
+        self.events(f'{self.STAMP}-2', 1, 'codex', [('command', 'pwd')])
+        self.assertEqual(self.find(self.feed(), self.JOB)['now'], 'running pwd')
+
+    def test_escapes_that_split_a_secret_or_term_cannot_rejoin_it(self):
+        split = lambda text: text[:5] + '\x1b[0m' + text[5:8] + '\x1b]0;t\x07' + text[8:]
+        self.running(self.JOB, self.STAMP)
+        self.events(self.STAMP, 1, 'codex', [('message', f'a {split(SECRET)} b {split(TERM)} c'),
+                                              ('command', f'echo {split(SECRET)}')])
+        self.finished('demo-20261112-174000', task=f'{split(TERM)}-task.md', review_required=True,
+                      review={'status': 'error', 'reviewer': 'grok-bot', 'reason': split(SECRET)})
+        body = json.dumps(self.feed())
+        self.assertNotIn('\\u001b', body)
+        outputs = [body.replace('\\u001b', '')]
+        for as_json in (False, True):
+            stream = io.StringIO()
+            watch.run(policy=self.policy, once=True, as_json=as_json, stream=stream, width=160,
+                      build=lambda policy: live_jobs_feed.build_live_jobs_feed(policy=policy, now=NOW))
+            outputs.append(stream.getvalue())
+        for text in outputs:
+            self.assertNotIn(SECRET, text)
+            self.assertNotIn(TERM.lower(), text.lower())
+
+    def test_render_redacts_a_secret_rejoined_by_escape_stripping(self):
+        feed = demo_feed()
+        feed['running'][0]['now'] = 'says ' + SECRET[:6] + '\x1b[0m' + SECRET[6:]
+        self.assertNotIn(SECRET, watch.render(feed, 160))
+
+    def test_reads_are_bounded_even_when_the_file_is_larger_than_reported(self):
+        path = self.out / 'big.jsonl'
+        path.write_bytes(b'x' * 50_000)
+        data, truncated = live_jobs_feed.read_bounded(path, 8192)
+        self.assertEqual((len(data), truncated), (8192, True))
+        # A file that grows after its size was taken still yields at most the limit.
+        real = os.fstat
+        with mock.patch.object(live_jobs_feed.os, 'fstat', lambda fd: os.stat_result(
+                tuple(real(fd))[:6] + (10,) + tuple(real(fd))[7:])):
+            self.assertEqual(len(live_jobs_feed.read_bounded(path, 8192)[0]), 8192)
+        huge = self.out / f'{self.STAMP}-a1-codex.events.jsonl'
+        self.running(self.JOB, self.STAMP)
+        huge.write_text(event_line('message', 'm' * 300_000, '2026-11-12T17:51:00.000+00:00') +
+                        event_line('command', 'ls', '2026-11-12T17:51:01.000+00:00'))
+        self.assertEqual(self.find(build_within(self), self.JOB)['now'], 'running ls')
+
+    def test_fifos_and_links_never_stall_the_feed(self):
+        self.running(self.JOB)
+        os.mkfifo(self.out / f'{self.STAMP}-a1-codex.events.jsonl')           # events file is a FIFO
+        os.mkfifo(self.out / '20261112-175500-job.json')                      # claim is a FIFO
+        os.mkfifo(self.base / 'pipe')
+        os.symlink(self.base / 'pipe', self.out / f'{self.STAMP}-a2-codex.events.jsonl')  # link to a FIFO
+        os.symlink(self.base / 'pipe', self.out / '20261112-175600-job.json')
+        os.symlink(self.base / 'pipe', self.out / f'{self.STAMP}-a1-codex.log')
+        secret_file = self.base / 'outside.jsonl'
+        secret_file.write_text(event_line('message', 'outside-the-output-dir', '2026-11-12T17:51:00.000+00:00'))
+        os.symlink(secret_file, self.out / f'{self.STAMP}-a3-codex.events.jsonl')  # link out of the dir
+        job = self.find(build_within(self), self.JOB)
+        self.assertEqual(job['events'], [])
+        self.assertNotIn('outside-the-output-dir', json.dumps(job))
+
+    def test_live_events_name_the_new_worker_after_a_failover(self):
+        self.running(self.JOB, self.STAMP)
+        (self.out / f'{self.STAMP}-a1-claude.log').write_text('--- stdout\nquota\n$ exit=1\n')
+        self.events(self.STAMP, 1, 'claude', [('error', 'quota')])
+        self.events(self.STAMP, 2, 'codex', [('command', 'ls')])
+        job = self.find(self.feed(), self.JOB)
+        self.assertEqual((job['worker'], job['workers']), ('codex', ['claude', 'codex']))
+        self.assertEqual(job['hops'], [{'from': 'claude', 'to': 'codex', 'attempt': 2}])
+        self.assertEqual(job['attempt'], 2)
+        frame = watch.render({'running': [job], 'recent': [], 'history': [], 'updated_at': ''}, 120)
+        self.assertIn('codex', frame.splitlines()[2])
 
 
 if __name__ == '__main__':

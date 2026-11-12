@@ -5,12 +5,11 @@ Read-only: it renders `live_jobs_feed.build_live_jobs_feed()` and never starts, 
 Plain ANSI only, and none at all when stdout is not a terminal.
 """
 import json
-import re
 import shutil
 import sys
 import time
 
-from . import live_jobs_feed
+from . import live_jobs_feed, security
 
 WIDE = 100          # below this many columns, lanes stack vertically
 LANE_MIN = 34       # narrowest side-by-side lane
@@ -22,15 +21,12 @@ COLORS = {'passed': '32', 'failed': '31', 'blocked': '31', 'running': '33', 'wai
 GATES = (('tests', 'tests'), ('leak_check', 'leak'), ('review', 'review'), ('approval', 'approval'))
 
 
-_ESCAPES = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]?')
-_CONTROLS = re.compile(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]')
-
-
 def _clean(text):
-    """One safe line. Worker output is untrusted: terminal escape sequences (ANSI, OSC such as clipboard
-    or title writes) and control characters are removed, then whitespace runs become single spaces."""
-    text = _CONTROLS.sub('', _ESCAPES.sub('', str(text or '')))
-    return ' '.join(text.split())
+    """One safe line. Worker output is untrusted: terminal escape sequences and control characters are removed
+    first, then secrets are redacted again (removing an escape can join the halves of a split secret), then
+    whitespace runs become single spaces. The feed has already done both, private terms included; this covers
+    a feed from any other source."""
+    return ' '.join(security.redact(live_jobs_feed.strip_controls(text or '')).split())
 
 
 def _fit(text, width):
