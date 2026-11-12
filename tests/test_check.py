@@ -178,6 +178,39 @@ class CheckTests(unittest.TestCase):
         self.assertIn('carriage.txt', stdout)
         self.assertNotIn(PLANTED_VALUE, stdout)
 
+    def test_committed_binary_private_term_requires_text_diff(self):
+        path = self.target / 'README.md'
+        path.write_bytes(b'\x00' + TERM.encode() + b'\n')
+        self.commit(self.target)
+        # Only HEAD retains the term; the index and worktree match the base.
+        self.git(self.target, 'restore', '--source=main', '--staged', '--worktree', 'README.md')
+        result, stdout = self.check_json(1, '--base', 'main')
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertIn({'file': 'README.md:1', 'kind': 'private_term'},
+                      result['leak_check']['findings'])
+        self.assertNotIn(TERM, stdout)
+
+    def test_staged_binary_private_term_requires_text_diff(self):
+        path = self.target / 'README.md'
+        path.write_bytes(b'\x00' + TERM.encode() + b'\n')
+        self.git(self.target, 'add', 'README.md')
+        # Only the index retains the term; HEAD and the worktree are clean.
+        path.write_text('hello\n')
+        result, stdout = self.check_json(1, '--base', 'main')
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertIn({'file': 'README.md:1', 'kind': 'private_term'},
+                      result['leak_check']['findings'])
+        self.assertNotIn(TERM, stdout)
+
+    def test_working_binary_private_term_requires_text_diff(self):
+        # A tracked file keeps the term out of any untracked-file scan.
+        (self.target / 'README.md').write_bytes(b'\x00' + TERM.encode() + b'\n')
+        result, stdout = self.check_json(1, '--base', 'main')
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertIn({'file': 'README.md:1', 'kind': 'private_term'},
+                      result['leak_check']['findings'])
+        self.assertNotIn(TERM, stdout)
+
     def test_path_diagnostic_masks_private_term(self):
         (self.target / f'{TERM}.txt').write_text('key = ' + PLANTED_VALUE + '\n')
         result, stdout = self.check_json(1)
