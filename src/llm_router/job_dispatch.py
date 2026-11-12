@@ -420,6 +420,27 @@ def hops(summary):
     return out
 
 
+def reserve_output_stamp(out_dir, stamp, job_id):
+    """Claim a unique output stamp (`stamp`, `stamp-2`, ...) for one job in `out_dir`; return it.
+
+    The claim is an exclusively created `<stamp>-job.json` naming the job, so concurrent jobs (threads or
+    processes, any repo) never get the same stamp. A stamp that older output files already use is skipped."""
+    out_dir = Path(out_dir)
+    n = 1
+    while True:
+        name = stamp if n == 1 else f'{stamp}-{n}'
+        n += 1
+        if any(out_dir.glob(f'{name}-a*')):
+            continue
+        try:
+            fd = os.open(out_dir / f'{name}-job.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, 'w') as handle:
+            json.dump({'job_id': job_id}, handle)
+        return name
+
+
 def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full', worker=None,
             keep=None, policy=None, run_task=td.run_task, select=None, now=None, test_runner=td.run_bounded,
             popen=subprocess.Popen, notifier=None, meter=None, task_class=None,
@@ -500,7 +521,10 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
         detected_orch = orch_module.resolve(orchestrator, orchestrator_decision)
     out_dir = td._router_path(policy, 'output_dir', 'logs/task-output')
     out_dir.mkdir(parents=True, exist_ok=True)
-    summary = {'job_id': job_id, 'repo': str(repo), 'task': task_path.name, 'base': base_ref,
+    # Worker logs and live events are named by this stamp; jobs started in the same second (any repo) must
+    # never share it, or they would write into each other's files and show in each other's live lane.
+    stamp = reserve_output_stamp(out_dir, stamp, job_id)
+    summary = {'job_id': job_id, 'output_stamp': stamp, 'repo': str(repo), 'task': task_path.name, 'base': base_ref,
                'base_sha': base_sha, 'branch': branch, 'worktree': str(worktree), 'size': size,
                'orchestrator': detected_orch['orchestrator'], 'orchestrator_reason': detected_orch['reason'],
                'started_at': started.isoformat(timespec='seconds'), 'finished_at': None,

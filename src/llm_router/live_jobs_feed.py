@@ -23,8 +23,11 @@ TESTS_SETTLED_SECONDS = 15
 PREVIEW_LINES = 3
 TAIL_BYTES = 8192
 
+# An output stamp is the job's start second, plus `-N` when another job claimed that second first (#288).
+_STAMP = r'\d{8}-\d{6}(?:-\d+)?'
 _ID_RE = re.compile(r'^(?P<repo>.+)-(?P<stamp>\d{8}-\d{6})(?:-\d+)?$')
-_LOG_RE = re.compile(r'^(?P<stamp>\d{8}-\d{6})-a(?P<attempt>\d+)-(?P<tail>.+)\.log$')
+_LOG_RE = re.compile(r'^(?P<stamp>' + _STAMP + r')-a(?P<attempt>\d+)-(?P<tail>.+)\.log$')
+_JOB_STAMP_RE = re.compile(r'^(?P<stamp>' + _STAMP + r')-job\.json$')
 
 
 def _parse_ts(value):
@@ -41,13 +44,13 @@ def _parse_ts(value):
 
 def _stamp_to_dt(stamp, zone=timezone.utc):
     try:
-        return datetime.strptime(stamp, '%Y%m%d-%H%M%S').replace(tzinfo=zone)
+        return datetime.strptime(str(stamp)[:15], '%Y%m%d-%H%M%S').replace(tzinfo=zone)
     except ValueError:
         return None
 
 
 def parse_output_log_name(filename):
-    """Parse `<YYYYMMDD-HHMMSS>-a<N>-<worker>.log` or `...-tests.log`."""
+    """Parse `<YYYYMMDD-HHMMSS>[-N]-a<N>-<worker>.log` or `...-tests.log`."""
     match = _LOG_RE.match(str(filename or ''))
     if not match:
         return None
@@ -92,7 +95,7 @@ def tail_preview(log_path, lines_count=PREVIEW_LINES, private_terms=None):
     return cleaned[-max(1, int(lines_count)):]
 
 
-_EVENTS_RE = re.compile(r'^(?P<stamp>\d{8}-\d{6})-a(?P<attempt>\d+)-(?P<worker>.+)\.events\.jsonl$')
+_EVENTS_RE = re.compile(r'^(?P<stamp>' + _STAMP + r')-a(?P<attempt>\d+)-(?P<worker>.+)\.events\.jsonl$')
 
 
 def latest_events_file(out_dir, stamp):
@@ -117,6 +120,149 @@ def live_preview(out_dir, stamp, private_terms=None, lines_count=PREVIEW_LINES):
     """`"<kind>: <text>"` lines from a running job's newest events file, or [] when it has none."""
     path = latest_events_file(out_dir, stamp)
     return worker_events.read_tail(path, lines_count, private_terms or ()) if path else []
+
+
+TIMELINE_EVENTS = 20
+NOW_LIMIT = 120
+_NOW_VERBS = {'command': 'running ', 'test': 'testing ', 'edit': 'editing ', 'message': 'says ',
+              'error': 'error: ', 'raw': 'output: '}
+
+
+def job_output_stamps(out_dir):
+    """`{job_id: output stamp}` from the `<stamp>-job.json` claims `run_job` makes (#288)."""
+    stamps = {}
+    if not Path(out_dir).is_dir():
+        return stamps
+    for path in Path(out_dir).glob('*-job.json'):
+        match = _JOB_STAMP_RE.match(path.name)
+        if not match:
+            continue
+        try:
+            job_id = json.loads(path.read_text()).get('job_id')
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(job_id, str) and job_id:
+            stamps[job_id] = match.group('stamp')
+    return stamps
+
+
+def _event_records(path, private_terms=(), tail_bytes=TAIL_BYTES):
+    """Events from the last `tail_bytes` of one events file, re-redacted."""
+    try:
+        size = path.stat().st_size
+        with path.open('rb') as handle:
+            if size > tail_bytes:
+                handle.seek(size - tail_bytes)
+            lines = handle.read().decode('utf-8', 'replace').splitlines()
+    except OSError:
+        return []
+    if size > tail_bytes and lines:
+        lines = lines[1:]
+    records = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get('kind') in worker_events.KINDS:
+            records.append({'ts': str(event.get('ts') or ''), 'kind': event['kind'],
+                            'text': worker_events.redact_text(event.get('text', ''), private_terms)})
+    return records
+
+
+def job_events(out_dir, stamp, private_terms=(), limit=TIMELINE_EVENTS):
+    """A job's last `limit` live events, oldest first, across every attempt and failover worker."""
+    if not stamp or not Path(out_dir).is_dir():
+        return []
+    collected = []
+    for order, path in enumerate(sorted(Path(out_dir).glob(f'{stamp}-a*.events.jsonl'))):
+        match = _EVENTS_RE.match(path.name)
+        if not match or match.group('stamp') != stamp:
+            continue
+        attempt, worker = int(match.group('attempt')), match.group('worker')
+        for index, record in enumerate(_event_records(path, private_terms)):
+            collected.append(((attempt, record['ts'], order, index),
+                              {'ts': record['ts'], 'worker': worker, 'attempt': attempt,
+                               'kind': record['kind'], 'text': record['text']}))
+    collected.sort(key=lambda item: item[0])
+    return [event for _, event in collected][-max(1, int(limit)):]
+
+
+def now_line(events, state):
+    """One line on what a running job is doing now, from its newest event, or None."""
+    if state == 'testing':
+        return 'running tests'
+    if not events:
+        return None
+    last = events[-1]
+    text = 'finished' if last['kind'] == 'done' else _NOW_VERBS.get(last['kind'], 'output: ') + last['text']
+    return text if len(text) <= NOW_LIMIT else text[:NOW_LIMIT - 1] + '…'
+
+
+def _gate(state, detail='', **extra):
+    return {'state': state, 'detail': detail, **extra}
+
+
+def running_gates(state):
+    """Gates of a job still in flight. Only tests are visible live; the rest land with the job's result."""
+    later = 'when the job ends'
+    if state == 'testing':
+        tests = _gate('running', 'tests running')
+    elif state == 'committing':
+        tests = _gate('pending', 'tests finished; result ' + later)
+    else:
+        tests = _gate('pending', 'after the worker finishes')
+    return {'tests': tests, 'leak_check': _gate('pending', later), 'review': _gate('pending', later),
+            'approval': _gate('pending', later)}
+
+
+def finished_gates(data, policy, approvals, now=None):
+    """Gates of a finished job, read-only from its job JSON and the existing pr_gate state."""
+    from . import pr_gate
+    tests_status = data.get('tests_status')
+    tests = {'passed': _gate('passed', 'tests passed'), 'failed': _gate('failed', 'tests failed'),
+             'timeout': _gate('failed', 'tests timed out'), 'no_tests': _gate('n/a', 'no tests')
+             }.get(tests_status, _gate('n/a', 'not run'))
+    leak = data.get('leak_check') if isinstance(data.get('leak_check'), dict) else {}
+    if data.get('blocked_by_leak_check') or (leak.get('status') and leak.get('status') != 'clean'):
+        leak_gate = _gate('blocked', f'leak check: {leak.get("status") or "blocked"}')
+    elif leak.get('status') == 'clean':
+        leak_gate = _gate('passed', 'leak check clean')
+    else:
+        leak_gate = _gate('n/a', 'not run')
+    review = data.get('review') if isinstance(data.get('review'), dict) else {}
+    reviewer = review.get('reviewer') or 'reviewer'
+    if data.get('review_required') is not True:
+        review_gate = _gate('n/a', 'not required')
+    elif review.get('verdict') == 'approve':
+        review_gate = _gate('passed', f'approved by {reviewer}')
+    elif review.get('verdict') == 'reject':
+        review_gate = _gate('failed', f'rejected by {reviewer}')
+    elif review.get('status') == 'error':
+        review_gate = _gate('failed', f'review error: {review.get("reason") or "unknown"}')
+    else:
+        review_gate = _gate('waiting', review.get('next') or f'waiting for {reviewer}')
+    commit = data.get('commit')
+    if not commit or not (data.get('ok') or data.get('status') == 'committed'):
+        approval = _gate('n/a', 'no commit')
+    elif data.get('review_required') is True and review.get('verdict') != 'approve':
+        approval = _gate('blocked', 'stronger-model review must approve first')
+    else:
+        job_id = str(data.get('job_id'))
+        gate = pr_gate.load_gate(policy, job_id)
+        sha = (gate.get('review') or {}).get('sha') or commit
+        if (gate.get('merged') or {}).get('sha') == sha:
+            approval = _gate('passed', f'merged {sha}', sha=sha)
+        else:
+            action = 'merge' if (gate.get('pr') or {}).get('pushed_sha') == sha else 'push'
+            status = pr_gate.approval_status(policy, job_id, action, sha, now=now, records=approvals)
+            if status['ok']:
+                approval = _gate('passed', f'{action} approved for {sha}', sha=sha, action=action)
+            else:
+                approval = _gate('waiting', f'{action} approval needed for {sha}', sha=sha, action=action,
+                                 reason=status['why'],
+                                 command=f'llm-router approve {job_id} --action {action} --sha {sha}')
+    return {'tests': tests, 'leak_check': leak_gate, 'review': review_gate, 'approval': approval}
 
 
 def _scan_output_logs(out_dir):
@@ -167,6 +313,9 @@ def build_live_jobs_feed(policy=None, now=None):
     wt_root = config.policy_path(policy, 'run_job', 'worktree_root', 'worktrees')
     terms = td.private_terms(policy)
     logs_by_stamp = _scan_output_logs(out_dir)
+    claimed = job_output_stamps(out_dir)
+    from . import pr_gate
+    approvals = pr_gate.approval_records(policy)  # read once per build, not once per job
 
     all_jobs = []
     seen_ids = set()
@@ -181,7 +330,7 @@ def build_live_jobs_feed(policy=None, now=None):
         jid = str(data.get('job_id') or path.stem)
         seen_ids.add(jid)
         match = _ID_RE.match(jid)
-        stamp = match.group('stamp') if match else ''
+        stamp = str(data.get('output_stamp') or claimed.get(jid) or (match.group('stamp') if match else ''))
         info = _worker_info_from_logs(logs_by_stamp.get(stamp, ()))
         workers = list(data.get('workers') or info['workers'])
         worker = workers[-1] if workers else info['worker']
@@ -215,6 +364,9 @@ def build_live_jobs_feed(policy=None, now=None):
             'commit': (data.get('commit') or '')[:7] or None,
             'log_path': log_path,
             'preview': tail_preview(info['latest_log'], private_terms=terms),
+            'now': None,
+            'gates': finished_gates({**data, 'job_id': jid}, policy, approvals, now=now_dt),
+            '_stamp': stamp,
             '_sort_ts': (finished_dt or started_dt or datetime.min.replace(tzinfo=timezone.utc)).timestamp(),
         })
 
@@ -224,7 +376,7 @@ def build_live_jobs_feed(policy=None, now=None):
         match = _ID_RE.match(wt.name)
         if not match:
             continue
-        repo_name, stamp = match.group('repo'), match.group('stamp')
+        repo_name, stamp = match.group('repo'), claimed.get(wt.name) or match.group('stamp')
         info = _worker_info_from_logs(logs_by_stamp.get(stamp, ()))
         started_dt = _stamp_to_dt(stamp, zone)
         state = 'running'
@@ -262,6 +414,8 @@ def build_live_jobs_feed(policy=None, now=None):
             'log_path': info['latest_log'],
             'preview': (live_preview(out_dir, stamp, private_terms=terms) or
                         tail_preview(info['latest_log'], private_terms=terms)),
+            'gates': running_gates(state),
+            '_stamp': stamp,
             '_sort_ts': (started_dt or now_dt).timestamp(),
         })
 
@@ -274,12 +428,31 @@ def build_live_jobs_feed(policy=None, now=None):
     recent = [j for j in finished if (now_ts - j['_sort_ts']) <= RECENT_WINDOW_SECONDS]
     history = [j for j in finished if (now_ts - j['_sort_ts']) > RECENT_WINDOW_SECONDS]
 
+    for item in running + recent:  # history stays small: no timeline
+        item['events'] = job_events(out_dir, item['_stamp'], terms)
+    for item in running:
+        item['now'] = now_line(item['events'], item['state'])
     for item in all_jobs:
         item.pop('_sort_ts', None)
+        item.pop('_stamp', None)
 
-    return security.redact_obj({
+    return _redact_terms(security.redact_obj({
         'updated_at': now_dt.isoformat(timespec='seconds'),
         'running': running,
         'recent': recent,
         'history': history,
-    })
+    }), terms)
+
+
+def _redact_terms(value, terms):
+    """Private terms removed from every string in the feed (secrets were already redacted)."""
+    if isinstance(value, str):
+        for term in terms or ():
+            if term:
+                value = re.sub(re.escape(str(term)), security.REDACTED, value, flags=re.I)
+        return value
+    if isinstance(value, list):
+        return [_redact_terms(item, terms) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_terms(item, terms) for key, item in value.items()}
+    return value
