@@ -1,0 +1,9 @@
+{
+  "worker": "codex",
+  "cli_version": "codex-cli 0.165.0",
+  "captured": "2026-11-12",
+  "origin": "real CLI run on a throwaway git repo (README.md only), stdout recorded verbatim, then scrubbed",
+  "prompt": "Create a file hello.txt containing the word hi, then run ls to show it exists. Keep it short.",
+  "scrubbed": "local paths -> /tmp/fixture-repo and /home/user; username -> user; UUIDs and msg/toolu/call ids replaced. item_0 (a local plugin-config warning) kept as a real error item with its path scrubbed; the first command read a local skill file, its aggregated_output is replaced with a placeholder.",
+  "events": 13
+}

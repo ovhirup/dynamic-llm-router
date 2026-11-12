@@ -4,6 +4,7 @@ Never commits or pushes in the target repo. Workers come from run_task.commands 
 cursor, optional claude) plus the optional `developer` HTTP draft worker. Workers listed in `never`
 are refused and shadowed on PATH by a refusing shim.
 """
+import contextvars
 import csv
 import fcntl
 import fnmatch
@@ -20,8 +21,11 @@ import threading
 import time
 import urllib.request
 
-from . import claude_handoff, config, cooldown, security, stackwich
+from . import claude_handoff, config, cooldown, security, stackwich, worker_events
 
+# Set by run_task around a worker invocation: run_bounded passes every output line to it as it arrives
+# (#288 live events). A context variable, so injected runners keep their signatures.
+LINE_SINK: contextvars.ContextVar = contextvars.ContextVar('llm_router_line_sink', default=None)
 MAX_WORKERS = 3  # distinct workers one job may hop across before it stops and reports
 LAST_RESORT = 'grok-bot'  # out-of-band last resort (ROUTING_STRATEGY.md section 3): never a failover hop
 # A worker that cannot sign in is unavailable (cooled down), not a task failure; the job fails over.
@@ -40,16 +44,18 @@ def failure_reason(stderr, stdout='', limit=300):
         if not lines:
             continue
         errors = [line for line in lines if re.match(r'^[A-Za-z_.]*(Error|Exception)\b', line) or line.lower().startswith('error')]
-        line = security.redact(errors[-1] if errors else lines[-1])
+        line = security.redact_lines(errors[-1] if errors else lines[-1])
         return line if len(line) <= limit else line[:limit - 1] + '\u2026'
     return None
 
 
 def stderr_tail(stderr, stdout='', limit=2000):
-    """Redacted last `limit` chars of a failed worker's stderr (stdout tail when stderr is empty), or None."""
+    """Redacted last `limit` chars of a failed worker's stderr (stdout tail when stderr is empty), or None.
+
+    Redacts the whole text before taking the tail, so the cut never halves a secret."""
     for text in (stderr or '', stdout or ''):
         if text.strip():
-            return security.redact(text.rstrip()[-limit:])
+            return security.redact_lines(text.rstrip())[-limit:]
     return None
 
 
@@ -128,12 +134,18 @@ def run_bounded(argv, cwd, timeout, grace=5, popen=subprocess.Popen, input_text=
                     env=env)
     chunks = {'stdout': [], 'stderr': []}
     last = [time.monotonic()]
+    sink = LINE_SINK.get()  # read here: the reader threads below do not inherit context variables
 
     def pump(name, stream):
         try:
             for line in iter(stream.readline, ''):
                 chunks[name].append(line)
                 last[0] = time.monotonic()
+                if sink is not None:
+                    try:
+                        sink(name, line)
+                    except Exception:  # live capture must never break the run
+                        pass
         except (ValueError, OSError):
             pass
 
@@ -674,6 +686,15 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
             before_tree = tree_fingerprint(cwd)
             if mode == 'arg':
                 summary['warnings'].append('prompt passed in argv: visible to other local users in the process list')
+            events = None
+            if out_dir.resolve().is_relative_to(cwd.resolve()):
+                summary['warnings'].append(f'{name}: live events off (output_dir is inside the checkout)')
+            else:
+                try:
+                    events = worker_events.EventLog(out_dir / f'{stamp}-{name}.events.jsonl', name, cwd=run_cwd,
+                                                    private_terms=private_terms(policy))
+                except OSError:
+                    summary['warnings'].append(f'{name}: live events unavailable (events file not writable)')
             try:
                 timeout = policy['run_task']['timeouts_seconds'][name]
                 elapsed = 0
@@ -683,12 +704,16 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                     check_prompt_size(policy, invocation_prompt)
                     if mode in ('file', 'pointer'):
                         prompt_file = write_prompt_file(cwd, stamp, name, invocation_prompt)
-                    result = runner(build_argv(policy, name, run_cwd, prompt_file,
-                                    prompt=invocation_prompt, repo=cwd, env=env, size=size), run_cwd,
-                                    max(0, timeout - elapsed),
-                                    policy['run_task']['kill_grace_seconds'],
-                                    input_text=invocation_prompt if mode == 'stdin' else None, env=env,
-                                    stall_seconds=policy['run_task'].get('stall_seconds', {}).get(name))
+                    sink_token = LINE_SINK.set(events.feed if events is not None else None)
+                    try:
+                        result = runner(build_argv(policy, name, run_cwd, prompt_file,
+                                        prompt=invocation_prompt, repo=cwd, env=env, size=size), run_cwd,
+                                        max(0, timeout - elapsed),
+                                        policy['run_task']['kill_grace_seconds'],
+                                        input_text=invocation_prompt if mode == 'stdin' else None, env=env,
+                                        stall_seconds=policy['run_task'].get('stall_seconds', {}).get(name))
+                    finally:
+                        LINE_SINK.reset(sink_token)
                     logs.append(result.copy())
                     elapsed += result['elapsed_seconds']
                     if name != 'claude':
@@ -715,6 +740,8 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                 if extracted_tokens is not None:
                     record['tokens'] = extracted_tokens
             finally:
+                if events is not None:
+                    events.close()
                 if prompt_file is not None:
                     prompt_file.unlink(missing_ok=True)
                 if snapshots:
@@ -722,7 +749,7 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                     summary['handoff_cleanup'] = (actions[0] if len(actions) == 1 else
                                                   {snap['name']: act for snap, act in zip(snapshots, actions)})
             record['prompt_delivery'] = mode
-            path.write_text(security.redact('\n'.join(
+            path.write_text(security.redact_lines('\n'.join(
                 '$ exit=%s timed_out=%s elapsed=%ss\n--- stdout\n%s\n--- stderr\n%s\n' % (
                     item['returncode'], item['timed_out'], item['elapsed_seconds'],
                     item['stdout'], item['stderr']) for item in logs)))
@@ -739,7 +766,10 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                           quota_error=quota, elapsed_seconds=result['elapsed_seconds'],
                           stalled=result.get('stalled', False))
             if not record['ok']:
-                reason = failure_reason(result.get('stderr', ''), result.get('stdout', ''))
+                # codex --json reports errors as JSONL events on stdout, not as stderr lines.
+                reason = ((worker_events.last_error(name, result.get('stdout', ''), private_terms(policy))
+                           if name == 'codex' else None) or
+                          failure_reason(result.get('stderr', ''), result.get('stdout', '')))
                 if reason:
                     record['failure_reason'] = reason
                 tail = stderr_tail(result.get('stderr', ''), result.get('stdout', ''))

@@ -74,7 +74,7 @@ class TaskDispatchTests(unittest.TestCase):
         self.assertTrue(result['ok'])
         self.assertEqual(result['worker'], 'codex')
         self.assertIn('README.md', result['diff_stat'])
-        self.assertEqual(calls[0][1:4], ['exec', '-C', str(self.repo.resolve())])
+        self.assertEqual(calls[0][1:5], ['exec', '--json', '-C', str(self.repo.resolve())])
         self.assertIn('features.multi_agent=false', calls[0])
         log = subprocess.run(['git', '-C', str(self.repo), 'log', '--oneline'], capture_output=True, text=True).stdout
         self.assertEqual(len(log.splitlines()), 1)

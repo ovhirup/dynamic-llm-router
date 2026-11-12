@@ -1,0 +1,9 @@
+{
+  "worker": "claude",
+  "cli_version": "Claude Code 2.1.316",
+  "captured": "2026-11-12",
+  "origin": "real CLI run on a throwaway git repo (README.md only), stdout recorded verbatim, then scrubbed",
+  "prompt": "Create a file hello.txt containing the word hi, then run ls to show it exists. Keep it short.",
+  "scrubbed": "local paths -> /tmp/fixture-repo and /home/user; username -> user; UUIDs and msg/toolu/call ids replaced. hook_started/hook_response/ui_invalidate events from local user hooks removed; init tools, mcp_servers, plugins, skills, slash_commands and agents lists emptied; session-local memory_paths, scratchpad_path, messaging_socket_path and startup_timing removed.",
+  "events": 12
+}

@@ -3,6 +3,7 @@
 Pure functions plus small filesystem helpers. Nothing here reads credentials; patterns
 only recognise secret *shapes* so they can be masked or flagged.
 """
+import json
 import os
 from pathlib import Path
 import re
@@ -109,6 +110,29 @@ def redact(text):
     for start, end in reversed(merged):
         text = text[:start] + REDACTED + text[end:]
     return text
+
+
+def redact_lines(text):
+    """`redact`, plus the decoded strings of each JSON line (worker JSONL streams).
+
+    Inside a JSON string a quote is escaped (\\"), so the quoted-secret rules cannot see `"password": "..."`
+    in the raw line. A JSON line whose decoded values change under redaction is re-encoded; every other line
+    is kept byte-for-byte."""
+    if not isinstance(text, str) or not text:
+        return text
+    lines = text.split('\n')
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith(('{', '[')):
+            continue
+        try:
+            value = json.loads(stripped)
+        except ValueError:
+            continue
+        cleaned = redact_obj(value)
+        if cleaned != value:
+            lines[index] = json.dumps(cleaned, ensure_ascii=False)
+    return redact('\n'.join(lines))
 
 
 def redact_obj(value):

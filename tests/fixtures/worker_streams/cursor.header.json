@@ -1,0 +1,9 @@
+{
+  "worker": "cursor",
+  "cli_version": "cursor-agent 2026.11.11-b912975",
+  "captured": "2026-11-12",
+  "origin": "real CLI run on a throwaway git repo (README.md only), stdout recorded verbatim, then scrubbed",
+  "prompt": "Create a file hello.txt containing the word hi, then run ls to show it exists. Keep it short.",
+  "scrubbed": "local paths -> /tmp/fixture-repo and /home/user; username -> user; UUIDs and msg/toolu/call ids replaced. thinking deltas kept (they are dropped by the parser); username scrubbed across each run of deltas with a same-length placeholder.",
+  "events": 52
+}
