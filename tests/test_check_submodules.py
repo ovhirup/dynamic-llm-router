@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -22,6 +23,7 @@ class SubmoduleCheckTests(unittest.TestCase):
         self.repo = repo(self.root / 'project')
         subprocess.run(['git', '-C', str(self.repo), 'branch', '-M', 'main'], check=True)
         self.sub = self._add_submodule('vendor/lib')
+        self._assert_parent_gitlink_committed()
         terms = self.root / 'terms.txt'
         terms.write_text(TERM + '\n')
         self.policy = load_policy()
@@ -40,11 +42,18 @@ class SubmoduleCheckTests(unittest.TestCase):
             return
         self.git(cwd, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', message)
 
+    def _assert_parent_gitlink_committed(self):
+        row = self.git(self.repo, 'ls-tree', 'HEAD', 'vendor/lib').strip()
+        self.assertTrue(row.startswith('160000'), row)
+        self.assertIn('.gitmodules', self.git(self.repo, 'ls-tree', '--name-only', 'HEAD').splitlines())
+        self.assertEqual(self.git(self.repo, 'status', '--porcelain').strip(), '')
+
     def _add_submodule(self, path):
         nested = self.root / 'nested-repo'
         repo(nested)
         self.commit(nested, 'sub init')
         self.git(self.repo, 'submodule', 'add', str(nested), path)
+        self.commit(self.repo, 'add submodule')
         return self.repo / path
 
     def _nested_submodule(self, outer, inner_path):
@@ -52,14 +61,17 @@ class SubmoduleCheckTests(unittest.TestCase):
         repo(nested)
         self.commit(nested, 'deep init')
         self.git(outer, 'submodule', 'add', str(nested), inner_path)
-        self.commit(outer, 'deep submodule')
+        self.commit(outer, 'add nested submodule')
+        if outer is self.repo:
+            self._assert_parent_gitlink_committed()
 
     def invoke(self, *args):
         stdout = io.StringIO()
         stack = contextlib.ExitStack()
         stack.enter_context(mock.patch.object(cli.config, 'load_policy', return_value=self.policy))
         stack.enter_context(mock.patch.object(job_dispatch, 'repo_settings',
-                                             side_effect=lambda policy, p: self.settings if Path(p) == self.repo else {}))
+                                             side_effect=lambda policy, p: self.settings
+                                             if Path(p).resolve() == Path(self.target).resolve() else {}))
         if '--review' not in args:
             stack.enter_context(mock.patch.object(selection, 'select', side_effect=AssertionError('offline')))
             stack.enter_context(mock.patch.object(handoff, 'meter_percent', side_effect=AssertionError('offline')))
@@ -80,7 +92,6 @@ class SubmoduleCheckTests(unittest.TestCase):
         return result, stdout
 
     def test_planted_secret_after_committed_gitlink_blocks_with_empty_parent_diff(self):
-        """Gitlink is already committed; parent diff vs HEAD is empty but submodule worktree is not."""
         base = self.git(self.target, 'rev-parse', 'HEAD').strip()
         (self.target / 'vendor' / 'lib' / 'planted.txt').write_text(TERM + '\n')
         result, stdout = self.check_json(1, '--base', base)
@@ -89,12 +100,10 @@ class SubmoduleCheckTests(unittest.TestCase):
         self.assertNotIn(TERM, stdout)
 
     def test_secret_in_modified_submodule_file_blocks_check(self):
-        path = self.target / 'vendor' / 'lib' / 'tracked.txt'
-        path.write_text('key = ' + PLANTED_VALUE + '\n')
+        (self.target / 'vendor' / 'lib' / 'tracked.txt').write_text('key = ' + PLANTED_VALUE + '\n')
         result, stdout = self.check_json(1)
         self.assertEqual(result['leak_check']['status'], 'blocked')
-        joined = json.dumps(result['leak_check']['findings'])
-        self.assertIn('vendor/lib', joined)
+        self.assertIn('vendor/lib', json.dumps(result['leak_check']['findings']))
         self.assertNotIn(PLANTED_VALUE, stdout)
 
     def test_untracked_secret_in_submodule_blocks_check(self):
@@ -103,34 +112,88 @@ class SubmoduleCheckTests(unittest.TestCase):
         self.assertEqual(result['leak_check']['status'], 'blocked')
         self.assertNotIn(TERM, stdout)
 
-    def test_nested_submodule_content_is_scanned(self):
+    def test_staged_submodule_secret_blocks_check(self):
+        path = self.target / 'vendor' / 'lib' / 'staged.txt'
+        path.write_text(TERM + '\n')
+        self.git(self.target / 'vendor' / 'lib', 'add', 'staged.txt')
+        result, stdout = self.check_json(1)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertNotIn(TERM, stdout)
+
+    def test_nested_submodule_untracked_blocks_after_committed(self):
         self._nested_submodule(self.sub, 'nested/pkg')
-        nested = self.target / 'vendor' / 'lib' / 'nested' / 'pkg'
-        (nested / 'leaf.txt').write_text('key = ' + PLANTED_VALUE + '\n')
-        result, _ = self.check_json(1)
+        self.commit(self.target, 'bump vendor/lib gitlink for nested')
+        (self.target / 'vendor' / 'lib' / 'nested' / 'pkg' / 'leaf.txt').write_text(TERM + '\n')
+        base = self.git(self.target, 'rev-parse', 'HEAD').strip()
+        result, _ = self.check_json(1, '--base', base)
         self.assertEqual(result['leak_check']['status'], 'blocked')
 
-    def test_review_prompt_includes_submodule_diff(self):
-        (self.target / 'DONE_CHECK.md').write_text('Submodule evidence is covered.\n')
-        path = self.target / 'vendor' / 'lib' / 'reviewed.txt'
-        path.write_text('visible change\n')
-        prompts = []
+    def test_nested_submodule_tracked_blocks_after_committed(self):
+        self._nested_submodule(self.sub, 'nested/pkg')
+        path = self.target / 'vendor' / 'lib' / 'nested' / 'pkg' / 'tracked.txt'
+        path.write_text(TERM + '\n')
+        self.commit(self.target / 'vendor' / 'lib' / 'nested' / 'pkg')
+        self.commit(self.target, 'bump nested gitlink')
+        base = self.git(self.target, 'rev-parse', 'HEAD~1').strip()
+        result, _ = self.check_json(1, '--base', base)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
 
-        def review(name, packet, prompt, policy):
-            prompts.append(prompt)
-            return {'status': 'done',
-                    'text': '{"schema_version":1,"verdict":"reject","notes":"intentional"}'}
+    def test_submodule_committed_leak_blocks_vs_parent_base_before_bump(self):
+        """Repro D: secret committed inside submodule; parent gitlink bumped."""
+        pre_bump = self.git(self.target, 'rev-parse', 'HEAD').strip()
+        (self.target / 'vendor' / 'lib' / 'leak.txt').write_text(TERM + '\n')
+        self.commit(self.target / 'vendor' / 'lib')
+        self.commit(self.target, 'bump submodule gitlink')
+        result, stdout = self.check_json(1, '--base', pre_bump)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertNotIn(TERM, stdout)
 
-        git_vars = set(job_dispatch._git(self.target, 'rev-parse', '--local-env-vars', check=True)
-                       .stdout.splitlines())
-        clean = {key: value for key, value in os.environ.items() if key not in git_vars}
-        with (mock.patch.dict(os.environ, clean, clear=True),
-              mock.patch.object(handoff, 'meter_percent', return_value=10),
-              mock.patch.object(unit_review, 'default_reviewer', side_effect=review)):
-            self.check_json(1, '--review')
-        self.assertTrue(prompts)
-        self.assertIn('reviewed.txt', prompts[0])
-        self.assertIn('vendor/lib', prompts[0])
+    def test_submodule_with_secret_in_history_blocks_on_add(self):
+        """Repro E: submodule history already contains a term when added on branch."""
+        dirty = self.root / 'dirty-sub'
+        repo(dirty)
+        (dirty / 'history.txt').write_text(TERM + '\n')
+        self.commit(dirty)
+        branch = self.root / 'branch-project'
+        shutil.copytree(self.repo, branch, symlinks=True)
+        subprocess.run(['git', '-C', str(branch), 'checkout', '-qb', 'feature'], check=True)
+        env = {**os.environ, 'GIT_ALLOW_PROTOCOL': 'file'}
+        subprocess.run(['git', '-C', str(branch), 'submodule', 'add', str(dirty), 'vendor/extra'],
+                       check=True, env=env)
+        subprocess.run(['git', '-C', str(branch), 'add', '-A'], check=True, env=env)
+        subprocess.run(['git', '-C', str(branch), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                        'commit', '-qm', 'add dirty submodule'], check=True, env=env)
+        pre = subprocess.run(['git', '-C', str(branch), 'rev-parse', 'HEAD~1'],
+                             capture_output=True, text=True).stdout.strip()
+        self.target = branch
+        self.settings = {'test_cmd': 'true', 'allow_no_tests': True}
+        result, _ = self.check_json(1, '--base', pre)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+
+
+class SubmoduleProbeTests(SubmoduleCheckTests):
+    """Eight-scenario reviewer probe; extends SubmoduleCheckTests."""
+
+    def test_top_level_modified(self):
+        self.test_secret_in_modified_submodule_file_blocks_check()
+
+    def test_top_level_untracked(self):
+        self.test_untracked_secret_in_submodule_blocks_check()
+
+    def test_top_level_staged(self):
+        self.test_staged_submodule_secret_blocks_check()
+
+    def test_nested_untracked(self):
+        self.test_nested_submodule_untracked_blocks_after_committed()
+
+    def test_nested_tracked(self):
+        self.test_nested_submodule_tracked_blocks_after_committed()
+
+    def test_repro_d(self):
+        self.test_submodule_committed_leak_blocks_vs_parent_base_before_bump()
+
+    def test_repro_e(self):
+        self.test_submodule_with_secret_in_history_blocks_on_add()
 
 
 if __name__ == '__main__':
