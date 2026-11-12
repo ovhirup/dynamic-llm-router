@@ -1,0 +1,79 @@
+{"type": "available_commands", "tools": [], "commands": []}
+{"type": "available_commands", "tools": [], "commands": []}
+{"type": "thought", "data": "Creating hello.txt with"}
+{"type": "thought", "data": " the word \"hi\" and running"}
+{"type": "thought", "data": " ls to verify it exists."}
+{"type": "text", "data": "I'll"}
+{"type": "text", "data": " create"}
+{"type": "text", "data": " `"}
+{"type": "text", "data": "hello"}
+{"type": "text", "data": ".txt"}
+{"type": "text", "data": "`"}
+{"type": "text", "data": " with"}
+{"type": "text", "data": " `"}
+{"type": "text", "data": "hi"}
+{"type": "text", "data": "`,"}
+{"type": "text", "data": " then"}
+{"type": "text", "data": " list"}
+{"type": "text", "data": " it"}
+{"type": "text", "data": "."}
+{"type": "available_commands", "tools": [], "commands": []}
+{"type": "usage", "usage": {"input_tokens": 28079, "output_tokens": 739, "cache_read_input_tokens": 6784, "cache_creation_input_tokens": 0, "reasoning_tokens": 627}, "signature": "scrubbed"}
+{"type": "tool_call", "toolCallId": "call-00000000-0000-0000-0000-000000000000-0", "title": "write", "kind": "write", "status": "pending", "toolName": "write", "rawInput": {"file_path": "/tmp/fixture-repo/hello.txt", "content": "hi\n"}, "content": [], "locations": []}
+{"type": "tool_call_update", "toolCallId": "call-00000000-0000-0000-0000-000000000000-0", "status": null, "content": [{"type": "diff", "path": "/tmp/fixture-repo/hello.txt", "oldText": "", "newText": "hi\n"}], "rawOutput": null, "locations": [{"path": "/tmp/fixture-repo/hello.txt"}]}
+{"type": "tool_call_update", "toolCallId": "call-00000000-0000-0000-0000-000000000000-0", "status": "completed", "content": [{"type": "diff", "path": "/tmp/fixture-repo/hello.txt", "oldText": "", "newText": "hi\n", "_meta": {"details": [{"old_string": "", "old_line": 1, "new_string": "hi\n", "new_line": 1, "context_before": "", "context_after": "", "line_prefix": ""}]}}], "rawOutput": {"type": "SearchReplace", "EditsApplied": {"old_string": "", "new_string": "hi\n", "tool_output_for_prompt": "The file /tmp/fixture-repo/hello.txt has been created.", "tool_output_for_prompt_concise": "The file /tmp/fixture-repo/hello.txt has been created.", "absolute_path": "/tmp/fixture-repo/hello.txt", "edits": {"details": [{"old_string": "", "old_line": 1, "new_string": "hi\n", "new_line": 1, "context_before": "", "context_after": "", "line_prefix": ""}]}}}, "locations": []}
+{"type": "available_commands", "tools": [], "commands": []}
+{"type": "usage", "usage": {"input_tokens": 886, "output_tokens": 39, "cache_read_input_tokens": 34816, "cache_creation_input_tokens": 0, "reasoning_tokens": 8}, "signature": "scrubbed"}
+{"type": "tool_call", "toolCallId": "call-00000000-0000-0000-0000-000000000000-1", "title": "run_terminal_command", "kind": "execute", "status": "pending", "toolName": "run_terminal_command", "rawInput": {"command": "ls -l hello.txt && cat hello.txt", "description": "List hello.txt and show its contents"}, "content": [], "locations": []}
+{"type": "tool_call_update", "toolCallId": "call-00000000-0000-0000-0000-000000000000-1", "status": null, "content": [{"type": "content", "content": {"type": "text", "text": "List hello.txt and show its contents"}}], "rawOutput": null, "locations": []}
+{"type": "tool_call_update", "toolCallId": "call-00000000-0000-0000-0000-000000000000-1", "status": "in_progress", "content": [{"type": "content", "content": {"type": "text", "text": ""}}], "rawOutput": {"type": "Bash", "output": [], "output_for_prompt": "", "exit_code": 0, "command": "ls -l hello.txt && cat hello.txt", "truncated": false, "signal": null, "timed_out": false, "description": null, "current_dir": "/tmp/fixture-repo", "output_file": "", "total_bytes": 0}, "locations": []}
+{"type": "tool_call_update", "toolCallId": "call-00000000-0000-0000-0000-000000000000-1", "status": "in_progress", "content": [{"type": "content", "content": {"type": "text", "text": "-rw-r--r--@ 1 user  wheel  3 Nov 12 20:54 hello.txt\nhi\n"}}], "rawOutput": {"type": "Bash", "output": [45, 114, 119, 45, 114, 45, 45, 114, 45, 45, 64, 32, 49, 32, 117, 115, 101, 114, 32, 32, 119, 104, 101, 101, 108, 32, 32, 51, 32, 78, 111, 118, 32, 49, 50, 32, 50, 48, 58, 53, 52, 32, 104, 101, 108, 108, 111, 46, 116, 120, 116, 10, 104, 105, 10], "output_for_prompt": "-rw-r--r--@ 1 user  wheel  3 Nov 12 20:54 hello.txt\nhi\n", "exit_code": 0, "command": "ls -l hello.txt && cat hello.txt", "truncated": false, "signal": null, "timed_out": false, "description": null, "current_dir": "/tmp/fixture-repo", "output_file": "", "total_bytes": 66}, "locations": []}
+{"type": "tool_call_update", "toolCallId": "call-00000000-0000-0000-0000-000000000000-1", "status": "completed", "content": [{"type": "content", "content": {"type": "text", "text": "-rw-r--r--@ 1 user  wheel  3 Nov 12 20:54 hello.txt\nhi\n"}}], "rawOutput": {"type": "Bash", "output": [45, 114, 119, 45, 114, 45, 45, 114, 45, 45, 64, 32, 49, 32, 117, 115, 101, 114, 32, 32, 119, 104, 101, 101, 108, 32, 32, 51, 32, 78, 111, 118, 32, 49, 50, 32, 50, 48, 58, 53, 52, 32, 104, 101, 108, 108, 111, 46, 116, 120, 116, 10, 104, 105, 10], "output_for_prompt": "exit: 0\n-rw-r--r--@ 1 user  wheel  3 Nov 12 20:54 hello.txt\nhi\n", "exit_code": 0, "command": "ls -l hello.txt && cat hello.txt", "truncated": false, "signal": null, "timed_out": false, "description": "List hello.txt and show its contents", "current_dir": "/tmp/fixture-repo", "output_file": "/home/user/.grok/sessions/scrubbed", "total_bytes": 66}, "locations": []}
+{"type": "text", "data": "`"}
+{"type": "text", "data": "hello"}
+{"type": "text", "data": ".txt"}
+{"type": "text", "data": "`"}
+{"type": "text", "data": " is"}
+{"type": "text", "data": " there"}
+{"type": "text", "data": " and"}
+{"type": "text", "data": " contains"}
+{"type": "text", "data": " `"}
+{"type": "text", "data": "hi"}
+{"type": "text", "data": "`."}
+{"type": "text", "data": "\n\n"}
+{"type": "text", "data": "```"}
+{"type": "text", "data": "\n"}
+{"type": "text", "data": "-"}
+{"type": "text", "data": "rw"}
+{"type": "text", "data": "-"}
+{"type": "text", "data": "r"}
+{"type": "text", "data": "--"}
+{"type": "text", "data": "r"}
+{"type": "text", "data": "--"}
+{"type": "text", "data": "@"}
+{"type": "text", "data": " "}
+{"type": "text", "data": "1"}
+{"type": "text", "data": " us"}
+{"type": "text", "data": "eru"}
+{"type": "text", "data": "se"}
+{"type": "text", "data": "rus"}
+{"type": "text", "data": "eruse"}
+{"type": "text", "data": " "}
+{"type": "text", "data": " wheel"}
+{"type": "text", "data": " "}
+{"type": "text", "data": " "}
+{"type": "text", "data": "3"}
+{"type": "text", "data": " Nov"}
+{"type": "text", "data": " "}
+{"type": "text", "data": "12"}
+{"type": "text", "data": " "}
+{"type": "text", "data": "20"}
+{"type": "text", "data": ":"}
+{"type": "text", "data": "54"}
+{"type": "text", "data": " hello"}
+{"type": "text", "data": ".txt"}
+{"type": "text", "data": "\n"}
+{"type": "text", "data": "```"}
+{"type": "available_commands", "tools": [], "commands": []}
+{"type": "usage", "usage": {"input_tokens": 202, "output_tokens": 68, "cache_read_input_tokens": 35584, "cache_creation_input_tokens": 0, "reasoning_tokens": 23}, "signature": "scrubbed"}
+{"type": "end", "stopReason": "end_turn", "sessionId": "00000000-0000-0000-0000-000000000000", "requestId": "00000000-0000-0000-0000-000000000000", "usage": {"input_tokens": 29167, "cache_read_input_tokens": 77184, "cache_creation_input_tokens": 0, "output_tokens": 846, "reasoning_tokens": 658, "total_tokens": 107197}, "num_turns": 3, "total_cost_usd": 0.03468068, "total_cost_usd_ticks": 346806800, "modelUsage": {"grok-4.7-build": {"inputTokens": 29167, "outputTokens": 846, "cacheReadInputTokens": 77184, "cacheCreationInputTokens": 0, "modelCalls": 3, "costUSD": 0.03468068}}}

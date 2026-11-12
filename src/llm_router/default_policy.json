@@ -104,6 +104,7 @@
       "codex": [
         "{codex}",
         "exec",
+        "--json",
         "-C",
         "{cwd}",
         "-s",

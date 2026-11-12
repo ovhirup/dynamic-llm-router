@@ -1,0 +1,9 @@
+{
+  "worker": "grok",
+  "cli_version": "grok 1.0.50 (c58f321264ba) [alpha]",
+  "captured": "2026-11-12",
+  "origin": "real CLI run on a throwaway git repo (README.md only), stdout recorded verbatim, then scrubbed",
+  "prompt": "Create a file hello.txt containing the word hi, then run ls to show it exists. Keep it short.",
+  "scrubbed": "local paths -> /tmp/fixture-repo and /home/user; username -> user; UUIDs and msg/toolu/call ids replaced. usage signature replaced; available_commands tool and command lists emptied; the username, which was split across streamed text chunks, replaced with a same-length placeholder inside each chunk run.",
+  "events": 79
+}

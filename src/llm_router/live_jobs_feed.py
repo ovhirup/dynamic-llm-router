@@ -7,13 +7,15 @@ JSON yet), and `<state_dir>/logs/task-output/*.log` to build a redacted, lightwe
     `failed` / `done`), `branch`, `commit`, `log_path`, and `preview` (last 3 redacted output lines).
   - Splits jobs into `running`, `recent` (finished within 30 minutes), and `history`.
   - Never includes secrets or private terms in `preview` or metadata (`security.redact_obj`).
+  - A running job's `preview` comes from its newest `<stamp>-a<N>-<worker>.events.jsonl` live events file
+    (#288) when one exists, as `"<kind>: <text>"` lines; otherwise from the output log as before.
 """
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
 
-from . import allocation_dispatch, config, security, task_dispatch as td
+from . import allocation_dispatch, config, security, task_dispatch as td, worker_events
 
 RECENT_WINDOW_SECONDS = 30 * 60
 STALE_IN_FLIGHT_SECONDS = 6 * 3600
@@ -88,6 +90,33 @@ def tail_preview(log_path, lines_count=PREVIEW_LINES, private_terms=None):
                 redacted = re.sub(re.escape(str(term)), security.REDACTED, redacted, flags=re.I)
         cleaned.append(redacted[:200])
     return cleaned[-max(1, int(lines_count)):]
+
+
+_EVENTS_RE = re.compile(r'^(?P<stamp>\d{8}-\d{6})-a(?P<attempt>\d+)-(?P<worker>.+)\.events\.jsonl$')
+
+
+def latest_events_file(out_dir, stamp):
+    """Newest `<stamp>-a<N>-<worker>.events.jsonl` (#288 live events) for a job stamp, or None."""
+    best = None
+    if not stamp or not Path(out_dir).is_dir():
+        return None
+    for path in Path(out_dir).glob(f'{stamp}-a*.events.jsonl'):
+        match = _EVENTS_RE.match(path.name)
+        if not match or match.group('stamp') != stamp:
+            continue
+        try:
+            key = (int(match.group('attempt')), path.stat().st_mtime)
+        except OSError:
+            continue
+        if best is None or key > best[0]:
+            best = (key, path)
+    return best[1] if best else None
+
+
+def live_preview(out_dir, stamp, private_terms=None, lines_count=PREVIEW_LINES):
+    """`"<kind>: <text>"` lines from a running job's newest events file, or [] when it has none."""
+    path = latest_events_file(out_dir, stamp)
+    return worker_events.read_tail(path, lines_count, private_terms or ()) if path else []
 
 
 def _scan_output_logs(out_dir):
@@ -231,7 +260,8 @@ def build_live_jobs_feed(policy=None, now=None):
             'branch': None,
             'commit': None,
             'log_path': info['latest_log'],
-            'preview': tail_preview(info['latest_log'], private_terms=terms),
+            'preview': (live_preview(out_dir, stamp, private_terms=terms) or
+                        tail_preview(info['latest_log'], private_terms=terms)),
             '_sort_ts': (started_dt or now_dt).timestamp(),
         })
 
