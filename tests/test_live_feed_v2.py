@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta, timezone
 import io
 import json
+import re
 import os
 from pathlib import Path
 import subprocess
@@ -395,6 +396,25 @@ class WatchTests(FeedFixture):
             self.assertIn('demo', stream.getvalue())
             self.assertNotIn(SECRET, stream.getvalue())
             self.assertNotIn(TERM.lower(), stream.getvalue().lower())
+
+    def test_terminal_escapes_from_worker_output_never_reach_the_terminal(self):
+        # From the security review: worker output is untrusted. OSC 52 would write the clipboard, OSC 0 the
+        # window title; CSI sequences could hide or rewrite lines.
+        nasty = ('\x1b]52;c;ZWNobyBwd25lZA==\x07 clip \x1b]0;owned\x1b\\ title \x1b[2J\x1b[31mred\x1b[0m '
+                 '\x9b31m c1 \x08\x07 bell')
+        feed = demo_feed()
+        job = feed['running'][0]
+        job['events'] = job['events'] + [{'ts': '', 'worker': 'codex', 'attempt': 1, 'kind': 'message', 'text': nasty}]
+        job.update(now=nasty, repo=nasty)
+        feed['recent'][0]['task'] = nasty
+        feed['recent'][0]['gates']['approval']['detail'] = nasty
+        for width in (80, 160):
+            frame = watch.render(feed, width)
+            self.assertNotIn('\x1b', frame)
+            self.assertFalse([ch for ch in frame if ord(ch) < 32 and ch != '\n' or 0x7f <= ord(ch) <= 0x9f], frame)
+            self.assertIn('clip', frame)
+        colored = watch.render(feed, 160, color=True)
+        self.assertEqual(set(re.findall(r'\x1b\[[0-9;]*m', colored)), {'\x1b[32m', '\x1b[33m', '\x1b[0m'})
 
     def test_json_and_job_filter(self):
         self.running('demo-20261112-175000')

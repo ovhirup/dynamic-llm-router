@@ -5,6 +5,7 @@ Read-only: it renders `live_jobs_feed.build_live_jobs_feed()` and never starts, 
 Plain ANSI only, and none at all when stdout is not a terminal.
 """
 import json
+import re
 import shutil
 import sys
 import time
@@ -21,9 +22,15 @@ COLORS = {'passed': '32', 'failed': '31', 'blocked': '31', 'running': '33', 'wai
 GATES = (('tests', 'tests'), ('leak_check', 'leak'), ('review', 'review'), ('approval', 'approval'))
 
 
+_ESCAPES = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]?')
+_CONTROLS = re.compile(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]')
+
+
 def _clean(text):
-    """One line: newlines, tabs and runs of spaces in a value become single spaces."""
-    return ' '.join(str(text or '').split())
+    """One safe line. Worker output is untrusted: terminal escape sequences (ANSI, OSC such as clipboard
+    or title writes) and control characters are removed, then whitespace runs become single spaces."""
+    text = _CONTROLS.sub('', _ESCAPES.sub('', str(text or '')))
+    return ' '.join(text.split())
 
 
 def _fit(text, width):
@@ -69,7 +76,7 @@ def lane(job, width):
     events = (job.get('events') or [])[-LANE_EVENTS:]
     rows = [f'{_clean(job.get("repo")) or "?"} · {_workers(job)} · {_elapsed(job.get("elapsed_seconds"))}',
             f'▶ {_clean(job.get("now") or job.get("state") or "starting")}']
-    rows += [f'  {event["kind"]:<7} {_clean(event["text"])}' for event in events]
+    rows += [f'  {_clean(event["kind"]):<7} {_clean(event["text"])}' for event in events]
     rows += [''] * (LANE_EVENTS - len(events))
     rows.append(gate_strip(job.get('gates')))
     return [_pad(row, width) for row in rows]
@@ -100,7 +107,7 @@ def render(feed, width=WIDE, color=False):
     """One frame of the watch view as a string. Pure: same feed and width, same text."""
     width = max(40, int(width))
     running, recent = feed.get('running') or [], feed.get('recent') or []
-    out = [_fit(f'DLR watch · {feed.get("updated_at") or ""} · {len(running)} running', width), '']
+    out = [_fit(f'DLR watch · {_clean(feed.get("updated_at"))} · {len(running)} running', width), '']
     lanes = [(job, job.get('gates')) for job in running]
     if not lanes:
         out.append('No running jobs.')
