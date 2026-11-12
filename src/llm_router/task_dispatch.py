@@ -44,16 +44,18 @@ def failure_reason(stderr, stdout='', limit=300):
         if not lines:
             continue
         errors = [line for line in lines if re.match(r'^[A-Za-z_.]*(Error|Exception)\b', line) or line.lower().startswith('error')]
-        line = security.redact(errors[-1] if errors else lines[-1])
+        line = security.redact_lines(errors[-1] if errors else lines[-1])
         return line if len(line) <= limit else line[:limit - 1] + '\u2026'
     return None
 
 
 def stderr_tail(stderr, stdout='', limit=2000):
-    """Redacted last `limit` chars of a failed worker's stderr (stdout tail when stderr is empty), or None."""
+    """Redacted last `limit` chars of a failed worker's stderr (stdout tail when stderr is empty), or None.
+
+    Redacts the whole text before taking the tail, so the cut never halves a secret."""
     for text in (stderr or '', stdout or ''):
         if text.strip():
-            return security.redact(text.rstrip()[-limit:])
+            return security.redact_lines(text.rstrip())[-limit:]
     return None
 
 
@@ -684,12 +686,15 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
             before_tree = tree_fingerprint(cwd)
             if mode == 'arg':
                 summary['warnings'].append('prompt passed in argv: visible to other local users in the process list')
-            try:
-                events = worker_events.EventLog(out_dir / f'{stamp}-{name}.events.jsonl', name, cwd=run_cwd,
-                                                private_terms=private_terms(policy))
-            except OSError:
-                events = None
-                summary['warnings'].append(f'{name}: live events unavailable (events file not writable)')
+            events = None
+            if out_dir.resolve().is_relative_to(cwd.resolve()):
+                summary['warnings'].append(f'{name}: live events off (output_dir is inside the checkout)')
+            else:
+                try:
+                    events = worker_events.EventLog(out_dir / f'{stamp}-{name}.events.jsonl', name, cwd=run_cwd,
+                                                    private_terms=private_terms(policy))
+                except OSError:
+                    summary['warnings'].append(f'{name}: live events unavailable (events file not writable)')
             try:
                 timeout = policy['run_task']['timeouts_seconds'][name]
                 elapsed = 0
@@ -744,7 +749,7 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                     summary['handoff_cleanup'] = (actions[0] if len(actions) == 1 else
                                                   {snap['name']: act for snap, act in zip(snapshots, actions)})
             record['prompt_delivery'] = mode
-            path.write_text(security.redact('\n'.join(
+            path.write_text(security.redact_lines('\n'.join(
                 '$ exit=%s timed_out=%s elapsed=%ss\n--- stdout\n%s\n--- stderr\n%s\n' % (
                     item['returncode'], item['timed_out'], item['elapsed_seconds'],
                     item['stdout'], item['stderr']) for item in logs)))

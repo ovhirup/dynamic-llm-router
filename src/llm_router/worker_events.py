@@ -23,6 +23,7 @@ TEXT_LIMIT = 200
 # A streamed text run is merged whole and redacted in one pass, so a secret split across chunks is matched as one
 # string. Past this cap the rest of the run is dropped, never split: only the first TEXT_LIMIT chars are shown.
 _PARTIAL_CAP = 256 * 1024
+_OVERFLOW_TEXT = '(message over 256 KB, not shown)'
 _TEST_RE = re.compile(
     r'(?i)(\bpytest\b|\bunittest\b|\btox\b|\bnox\b|\b(npm|pnpm|yarn|bun)( run)? test\b|\bgo test\b|'
     r'\bcargo test\b|\bmake (check|test)\b|\bjest\b|\bvitest\b|\brspec\b|\bmvn test\b|\bgradle test\b|'
@@ -326,8 +327,13 @@ class EventLog:
                     pending = self._pending.get(stream)
                     if pending is None:
                         self._pending[stream] = event
-                    elif len(pending['text']) < _PARTIAL_CAP:
-                        pending['text'] = (pending['text'] + event['text'])[:_PARTIAL_CAP]
+                    elif pending.get('overflow'):
+                        pass
+                    elif len(pending['text']) + len(event['text']) > _PARTIAL_CAP:
+                        # Never cut the run: a cut can halve a secret so neither half matches. Drop it instead.
+                        pending.update(text=_OVERFLOW_TEXT, overflow=True)
+                    else:
+                        pending['text'] += event['text']
                     continue
                 self._flush(stream)
                 self._write(event)
@@ -347,8 +353,10 @@ class EventLog:
 
     def _flush(self, stream):
         pending = self._pending.pop(stream, None)
-        if pending is not None and pending['text'].strip() and self._handle is not None:
-            self._write(pending)
+        if pending is not None:
+            pending.pop('overflow', None)
+            if pending['text'].strip() and self._handle is not None:
+                self._write(pending)
 
     def _write(self, event):
         handle = self._handle

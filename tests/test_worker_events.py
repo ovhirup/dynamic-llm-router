@@ -239,6 +239,22 @@ class RedactionTests(Base):
                          [('stderr', 'raw'), ('stderr', 'raw'), ('stdout', 'message'), ('stdout', 'done')])
         self.assertEqual(events[2]['text'], 'key [REDACTED] for [REDACTED] ok')
 
+    def test_an_overflowing_streamed_run_never_shows_a_cut_secret(self):
+        # From review (REVISE 1.1): cutting the run at the cap left 'sk-' + 7 chars, too short to match the
+        # token pattern; whitespace collapse and the shrinking password then pulled it into the shown text.
+        prefix = 'password: "' + 'v' * 64 + '" '
+        path = self.base / 'events.jsonl'
+        log = we.EventLog(path, 'grok-build')
+        log.feed('stdout', json.dumps({'type': 'text', 'data': ' ' * (we._PARTIAL_CAP - len(prefix) - 10)}) + '\n')
+        log.feed('stdout', json.dumps({'type': 'text', 'data': prefix + SECRET + ' more'}) + '\n')
+        log.feed('stdout', json.dumps({'type': 'text', 'data': ' and ' + SECRET}) + '\n')
+        log.feed('stdout', json.dumps({'type': 'end', 'stopReason': 'end_turn'}) + '\n')
+        log.close()
+        body = path.read_text()
+        self.assertNotIn('sk-q', body)
+        self.assertNotIn('vvvv', body)
+        self.assertEqual([json.loads(line)['kind'] for line in body.splitlines()], ['message', 'done'])
+
     def test_a_write_error_during_close_never_raises(self):
         log = we.EventLog(self.base / 'events.jsonl', 'grok-build')
         log.feed('stdout', json.dumps({'type': 'text', 'data': 'pending text'}) + '\n')
@@ -297,6 +313,45 @@ class RunTaskTests(Base):
         self.assertIn('message', kinds)
         self.assertEqual(kinds[-1], 'done')
         self.assertIsNone(td.LINE_SINK.get())
+
+    def test_no_events_file_when_the_output_dir_is_inside_the_checkout(self):
+        # From review (REVISE 1.2): a configured output dir inside the checkout must not receive events,
+        # including when it is reached through a symlink.
+        for via_link in (False, True):
+            self.repo = git_repo(self.base / f'target-{via_link}')
+            root = self.repo / 'logs'
+            if via_link:
+                link = self.base / 'outlink'
+                link.symlink_to(self.repo)
+                root = link / 'logs'
+            with self.subTest(root=str(root)):
+                self.out = root
+                result = self.run_codex(fixture_lines('codex'))
+                self.assertTrue(result['ok'])
+                self.assertEqual(list(root.glob('*.events.jsonl')), [])
+                self.assertTrue(any('live events off' in w for w in result['warnings']), result['warnings'])
+
+    def test_quoted_secret_inside_codex_json_is_redacted_in_log_and_tail(self):
+        # From review (REVISE 1.3): JSON escapes the quotes (\"...\"), so the plain quoted-secret rule missed it.
+        value = 'v' * 64
+        lines = [json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message',
+                                                                'text': f'password: "{value}"'}}),
+                 json.dumps({'type': 'item.completed', 'item': {'type': 'command_execution',
+                                                                'command': 'env', 'exit_code': 0,
+                                                                'aggregated_output': f'DB_PASSWORD="{value}"\n'}}),
+                 json.dumps({'type': 'turn.failed', 'error': {'message': 'stopped'}})]
+        result = self.run_codex(lines, returncode=1, edit=False)
+        attempt = result['attempts'][0]
+        self.assertFalse(attempt['ok'])
+        self.assertNotIn('vvvv', (self.out / f'{self.STAMP}-codex.log').read_text())
+        self.assertIn('[REDACTED]', attempt['stderr_tail'])
+        self.assertNotIn('vvvv', json.dumps(result))
+
+    def test_json_lines_without_secrets_stay_byte_identical_in_the_log(self):
+        lines = fixture_lines('codex')
+        self.run_codex(lines)
+        log = (self.out / f'{self.STAMP}-codex.log').read_text()
+        self.assertIn('\n'.join(lines), log)
 
     def test_final_log_format_is_unchanged(self):
         self.run_codex(['plain line'])
