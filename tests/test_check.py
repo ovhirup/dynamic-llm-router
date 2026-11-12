@@ -185,6 +185,27 @@ class CheckTests(unittest.TestCase):
         self.assertNotIn(TERM, stdout)
         self.assertNotIn(PLANTED_VALUE, stdout)
 
+    def test_term_named_file_in_parent_masks_location(self):
+        name = f'notes/{TERM}.txt'
+        (self.target / 'notes').mkdir()
+        (self.target / name).write_text(TERM + '\n')
+        masked = f'notes/{security.mask(TERM)}.txt'
+        expected = [
+            {'file': f'{masked} (path)', 'kind': 'private_term'},
+            {'file': f'{masked}:1', 'kind': 'private_term'},
+        ]
+        result, stdout = self.check_json(1)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertEqual(len(result['leak_check']['findings']), len(expected))
+        self.assertEqual(result['leak_check']['findings'], expected)
+        self.assertNotIn(TERM.lower(), stdout.lower())
+        code, human, human_err = self.invoke()
+        self.assertEqual(code, 1, human)
+        combined = f'{human}\n{human_err}'.lower()
+        self.assertNotIn(TERM.lower(), combined)
+        printed = [line for line in human.splitlines() if line.endswith('(private_term)')]
+        self.assertEqual(len(printed), len(expected))
+
     def check_empty_addition(self, state, private):
         name = f'notes/{TERM}-empty.txt' if private else 'notes/empty.txt'
         path = self.target / name

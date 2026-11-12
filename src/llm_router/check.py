@@ -203,10 +203,19 @@ def _submodule_path_names(sub, start, env):
 def _submodule_leak_findings(source, root, parent_base, terms, allow, env):
     sub = _require_submodule(source, root)
     start = _submodule_start_sha(source, root, parent_base, env) or EMPTY_TREE
-    findings = {(f'{root}/{item["file"]}', item['kind'])
+    # A re-added submodule can reuse the path with unrelated history. Diffing
+    # against a missing base commit used to surface as a git error; refuse it.
+    if (start != EMPTY_TREE and jobs._git(
+            sub, 'cat-file', '-e', f'{start}^{{commit}}', env=env).returncode != 0):
+        raise jobs.Refused(f'submodule base commit unavailable for {root}')
+
+    def located(item):
+        return security.mask_private_terms(f'{root}/{item["file"]}', terms), item['kind']
+
+    findings = {located(item)
                 for patch in _submodule_patches(source, root, parent_base, env)
                 for item in security.scan_diff(patch, terms, allow)}
-    findings.update((f'{root}/{item["file"]}', item['kind'])
+    findings.update(located(item)
                     for item in security.scan_diff('', terms, allow,
                                                    paths=_submodule_path_names(sub, start, env)))
     for cached in (False, True):
@@ -216,7 +225,7 @@ def _submodule_leak_findings(source, root, parent_base, terms, allow, env):
         if scan.get('status') == 'error':
             raise jobs.Refused(f'submodule leak scan failed for {root}')
         if scan.get('status') == 'blocked':
-            findings.update((f'{root}/{item["file"]}', item['kind']) for item in scan['findings'])
+            findings.update(located(item) for item in scan['findings'])
     return findings
 
 

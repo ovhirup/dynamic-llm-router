@@ -385,6 +385,85 @@ class SubmoduleCheckTests(unittest.TestCase):
             self.check_json(0)
         self.assertEqual(calls['n'], 1)
 
+    def test_unrelated_submodule_readded_at_same_path_refuses(self):
+        base = self.git(self.target, 'rev-parse', 'HEAD').strip()
+        self.git(self.target, 'rm', '-r', 'vendor/lib')
+        modules = self.target / '.git' / 'modules'
+        if modules.exists():
+            shutil.rmtree(modules)
+        other = self.root / 'unrelated'
+        other.mkdir()
+        self.git(other, 'init', '-q', '-b', 'main')
+        (other / 'readme.md').write_text(TERM + '\n')
+        self.commit(other, 'unrelated')
+        self.git(self.target, 'submodule', 'add', '--force', str(other), 'vendor/lib')
+        self.commit(self.target, 're-add submodule')
+        result, stdout = self.check_json(2, '--base', base)
+        self.assertIn('submodule base commit unavailable for vendor/lib', result['refused'])
+        self.assertIsNone(result['tests'])
+        self.assertNotIn(TERM, stdout)
+
+    def test_submodule_change_reaches_review_packet(self):
+        (self.target / 'DONE_CHECK.md').write_text('Every branch is checked.\n')
+        (self.sub / 'README.md').write_text('sub change\n')
+        self.git(self.sub, 'add', 'README.md')
+        stored = {}
+
+        def review(name, packet, prompt, policy):
+            stored['prompt'] = prompt
+            return {'status': 'done', 'text': '{"schema_version":1,"verdict":"approve","notes":"ok"}'}
+
+        with (mock.patch.object(handoff, 'meter_percent', return_value=10),
+              mock.patch.object(unit_review, 'default_reviewer', side_effect=review)):
+            self.check_json(0, '--review')
+        self.assertIn('# Submodule vendor/lib', stored['prompt'])
+        self.assertIn('+sub change', stored['prompt'])
+
+    def _streams(self, *args):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code, stdout = self.invoke(*args)
+        return code, stdout, stderr.getvalue()
+
+    def _assert_term_absent(self, *chunks):
+        combined = '\n'.join(chunks).lower()
+        self.assertNotIn(TERM.lower(), combined)
+
+    def _assert_masked_block(self, expected):
+        code, stdout, stderr = self._streams('--json')
+        self.assertEqual(code, 1, stdout)
+        result = json.loads(stdout)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertEqual(len(result['leak_check']['findings']), len(expected))
+        self.assertEqual(result['leak_check']['findings'], expected)
+        self._assert_term_absent(stdout, stderr)
+        code, human, human_err = self._streams()
+        self.assertEqual(code, 1, human)
+        self._assert_term_absent(human, human_err)
+        printed = [line for line in human.splitlines() if line.endswith('(private_term)')]
+        self.assertEqual(len(printed), len(expected))
+
+    def test_term_named_file_in_submodule_masks_location(self):
+        name = f'notes/{TERM}.txt'
+        (self.sub / 'notes').mkdir()
+        (self.sub / name).write_text(TERM + '\n')
+        masked = f'vendor/lib/notes/{security.mask(TERM)}.txt'
+        self._assert_masked_block([
+            {'file': f'{masked} (path)', 'kind': 'private_term'},
+            {'file': f'{masked}:1', 'kind': 'private_term'},
+        ])
+
+    def test_submodule_mounted_at_term_path_masks_location(self):
+        path = f'vendor/{TERM}'
+        nested = self.root / 'mounted-repo'
+        repo(nested)
+        self.git(self.repo, 'submodule', 'add', str(nested), path)
+        self.commit(self.repo, 'add mounted submodule')
+        (self.repo / path / 'k.txt').write_text(TERM + '\n')
+        self._assert_masked_block([
+            {'file': f'vendor/{security.mask(TERM)}/k.txt:1', 'kind': 'private_term'},
+        ])
+
     def test_submodule_leak_check_error_refuses(self):
         original = security.leak_check
 

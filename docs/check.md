@@ -21,7 +21,9 @@ contains a private term still blocks the gate: the name remains in the diff and
 in published history. A submodule that exists only at the base commit, because
 the branch removed it, does not have to be initialized. A submodule still
 recorded at HEAD and missing from the checkout refuses the check before tests
-or review.
+or review. A populated submodule whose commit recorded at the base is not in
+that repository refuses the same way. Reported finding locations mask private
+terms, including a submodule path and a file name inside it.
 
 Tests and leak scanning are the default gates. DLR makes no model or network
 calls in this mode. Configured test commands run with their own normal
