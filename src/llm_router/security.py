@@ -341,11 +341,28 @@ def _skipped(name, skip_dirs):
     return bool(set(Path(name).parts[:-1]) & set(skip_dirs or ()))
 
 
+def _untracked_symlink_findings(path, cwd, terms, allow):
+    """Scan a symlink's own path and its link text. Never open or follow the link."""
+    rel = path.relative_to(cwd).as_posix()
+    shown = mask_private_terms(rel, terms)
+    findings = [{'file': f'{shown} (path)', 'kind': kind, 'match': masked}
+                for _, kind, masked in scan_text(rel, terms, allow)]
+    target = os.readlink(path)
+    if isinstance(target, bytes):
+        target = os.fsdecode(target)
+    findings.extend({'file': f'{shown}:{number}', 'kind': kind, 'match': masked}
+                    for number, kind, masked in scan_text(target, terms, allow))
+    return findings
+
+
 def leak_check(cwd, base, untracked, terms, max_bytes=1_000_000, cached=False, allow=(),
-               skip_dirs=DEFAULT_SKIP_DIRS, scan_binary_untracked=False):
+               skip_dirs=DEFAULT_SKIP_DIRS, scan_binary_untracked=False,
+               scan_large_untracked=False, scan_symlink_untracked=False):
     """Scan added diff lines and untracked (non-ignored) files; never modifies anything.
 
-    untracked=None lists them with git (ignored files and vendor/build dirs are skipped)."""
+    untracked=None lists them with git (ignored files and vendor/build dirs are skipped).
+    Files over max_bytes and symlinks are skipped unless the matching scan_* flag is set.
+    Symlink scans use os.readlink and never read through the link."""
     findings = []
     try:
         if untracked is None:
@@ -358,13 +375,22 @@ def leak_check(cwd, base, untracked, terms, max_bytes=1_000_000, cached=False, a
             if _skipped(name, skip_dirs) or Path(name).name in (skip_dirs or ()):
                 continue
             path = Path(cwd) / name
-            if path.is_dir():
+            # A symlink to a directory is a directory. Opt-in scans must not follow it.
+            if scan_symlink_untracked and path.is_symlink():
+                files = [path]
+            elif path.is_dir():
                 files = [p for p in path.rglob('*') if p.is_file()
                          and not _skipped(str(p.relative_to(cwd)), skip_dirs)]
             else:
                 files = [path]
             for file in files:
-                if file.is_symlink() or not file.is_file() or file.stat().st_size > max_bytes:
+                if file.is_symlink():
+                    if scan_symlink_untracked:
+                        findings.extend(_untracked_symlink_findings(file, cwd, terms, allow))
+                    continue
+                if not file.is_file():
+                    continue
+                if not scan_large_untracked and file.stat().st_size > max_bytes:
                     continue
                 data = file.read_bytes()
                 if b'\0' in data[:8192] and not scan_binary_untracked:

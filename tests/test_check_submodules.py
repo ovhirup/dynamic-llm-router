@@ -207,6 +207,62 @@ class SubmoduleCheckTests(unittest.TestCase):
         self.assertIn('vendor/lib/build', json.dumps(result['leak_check']['findings']))
         self.assertNotIn(TERM, stdout)
 
+    def test_submodule_untracked_over_max_bytes_blocks_only_with_term(self):
+        path = self.sub / 'oversized.txt'
+        path.write_bytes(b'x' * 1_000_001 + b'\nplain\n')
+        self.assertGreater(path.stat().st_size, 1_000_000)
+        result, stdout = self.check_json(0)
+        self.assertEqual(result['leak_check']['status'], 'clean')
+        self.assertNotIn(TERM, stdout)
+        path.write_bytes(b'x' * 1_000_001 + b'\n' + TERM.encode() + b'\n')
+        result, stdout = self.check_json(1)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        blob = json.dumps(result['leak_check']['findings'])
+        self.assertIn('vendor/lib/oversized.txt', blob)
+        self.assertIn('private_term', blob)
+        self.assertNotIn(TERM, stdout)
+
+    def test_submodule_untracked_symlink_target_term_blocks(self):
+        (self.sub / 'alias.txt').symlink_to(f'nested/{TERM}.txt')
+        result, stdout = self.check_json(1)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        blob = json.dumps(result['leak_check']['findings'])
+        self.assertIn('vendor/lib/alias.txt', blob)
+        self.assertIn('private_term', blob)
+        self.assertNotIn(TERM, stdout)
+
+    def test_submodule_untracked_symlink_path_term_blocks_masked(self):
+        (self.sub / f'{TERM}.txt').symlink_to('notes.txt')
+        result, stdout = self.check_json(1)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        blob = json.dumps(result['leak_check']['findings'])
+        self.assertIn('vendor/lib/', blob)
+        self.assertIn('(path)', blob)
+        self.assertIn(security.mask(TERM), blob)
+        self.assertNotIn(TERM, stdout)
+        self.assertTrue(any(item['kind'] == 'private_term' for item in result['leak_check']['findings']))
+
+    def test_submodule_untracked_symlink_is_not_read_through(self):
+        (self.sub / '.gitignore').write_text('ignored-payload.txt\nsecret-tree/\n')
+        (self.sub / 'ignored-payload.txt').write_text(TERM + '\n')
+        (self.sub / 'alias.txt').symlink_to('ignored-payload.txt')
+        tree = self.sub / 'secret-tree'
+        tree.mkdir()
+        (tree / 'payload.txt').write_text(TERM + '\n')
+        (self.sub / 'linked-tree').symlink_to('secret-tree', target_is_directory=True)
+        result, stdout = self.check_json(0)
+        self.assertEqual(result['leak_check']['status'], 'clean')
+        self.assertNotIn(TERM, stdout)
+
+    def test_submodule_symlink_outside_checkout_is_not_followed(self):
+        outside = self.root / 'outside-secret.txt'
+        outside.write_text(TERM + '\n')
+        (self.sub / 'escape.txt').symlink_to(outside)
+        result, stdout = self.check_json(2)
+        self.assertIn('symlink', result['refused'])
+        self.assertIsNone(result['leak_check'])
+        self.assertNotIn(TERM, stdout)
+
     def test_submodule_leak_check_error_refuses(self):
         original = security.leak_check
 
