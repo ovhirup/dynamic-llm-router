@@ -240,6 +240,45 @@ def scan_text(text, terms, allow=()):
     return findings
 
 
+def decode_git_path(raw):
+    """Unquote a path from a Git diff header (plain or C-style quoted)."""
+    if not raw or raw == '/dev/null' or raw[0] != '"':
+        return raw
+    if raw[-1] != '"':
+        return raw
+    body, out, index = raw[1:-1], bytearray(), 0
+    while index < len(body):
+        char = body[index]
+        if char != '\\':
+            out.extend(char.encode('utf-8'))
+            index += 1
+            continue
+        index += 1
+        if index >= len(body):
+            break
+        escaped = body[index]
+        if '0' <= escaped <= '7':
+            digits = escaped
+            index += 1
+            for _ in range(2):
+                if index < len(body) and '0' <= body[index] <= '7':
+                    digits += body[index]
+                    index += 1
+                else:
+                    break
+            out.append(int(digits, 8))
+            continue
+        out.extend({'\\': b'\\', '"': b'"', 'n': b'\n', 't': b'\t', 'r': b'\r', 'b': b'\b', 'f': b'\f', 'a': b'\a'}
+                   .get(escaped, escaped.encode('utf-8')))
+        index += 1
+    return out.decode('utf-8', 'surrogateescape')
+
+
+def _diff_path_name(header):
+    name = decode_git_path(header)
+    return None if name == '/dev/null' else name.removeprefix('b/')
+
+
 def _added_lines(cwd, base, cached=False):
     """Map file -> [(new_line_number, text)] for lines added relative to base (or empty tree)."""
     args = ['git', '-C', str(cwd), 'diff', '--no-color', '--no-ext-diff', '-U0'] + (['--cached'] if cached else [])
@@ -254,8 +293,7 @@ def _parse_added_lines(diff):
         if line.startswith('diff --git '):
             current, in_hunk = None, False
         elif not in_hunk and line.startswith('+++ '):
-            name = line[4:].removesuffix('\t')
-            current = None if name == '/dev/null' else name.removeprefix('b/')
+            current = _diff_path_name(line[4:].removesuffix('\t'))
         elif line.startswith('@@ '):
             match = re.search(r'\+(\d+)', line)
             number = int(match.group(1)) if match else 0
