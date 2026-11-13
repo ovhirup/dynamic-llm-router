@@ -16,7 +16,9 @@ the test command from the comparison base when none is configured and respects
 working files. Install the dependencies the test command needs in the calling
 environment and use a test command that works from the copy.
 The leak gate scans added lines in the committed, staged, and current working diffs
-using the configured secret and private-term rules. Deleting a file whose name
+using the configured secret and private-term rules. Those diffs are generated with
+`--no-textconv`, so a textconv driver cannot replace the stored bytes, and with
+`--no-ext-diff`, so an external diff program cannot either. Deleting a file whose name
 contains a private term still blocks the gate: the name remains in the diff and
 in published history. A submodule that exists only at the base commit, because
 the branch removed it, does not have to be initialized. A submodule still
