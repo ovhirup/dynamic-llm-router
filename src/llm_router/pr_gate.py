@@ -325,9 +325,14 @@ def _append_approval(policy, record):
     return record
 
 
-def approval_status(policy, job_id, action, sha, now=None):
-    """Latest record for (job, action, exact sha) decides: approval (unexpired) / denial / undone / used."""
-    relevant = [r for r in approval_records(policy) if r.get('job') == job_id and r.get('action') == action]
+def approval_status(policy, job_id, action, sha, now=None, records=None):
+    """Latest record for (job, action, exact sha) decides: approval (unexpired) / denial / undone / used.
+
+    `records` is an already-read `approval_records(policy)` list, so a caller checking many jobs reads the
+    approvals file once; it never changes the decision."""
+    if records is None:
+        records = approval_records(policy)
+    relevant = [r for r in records if r.get('job') == job_id and r.get('action') == action]
     latest = None
     for record in relevant:
         if record.get('sha') == sha:

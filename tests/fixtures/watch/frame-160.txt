@@ -1,0 +1,16 @@
+DLR watch · 2026-11-12T18:00:00+00:00 · 3 running
+
+demo · codex · 1m05s                                │ demo · cursor · 1m45s                               │ demo · claude · 2m25s
+▶ says Created `hello.txt` containing `hi`. `ls` c… │ ▶ says `hello.txt` is in the repo and contains `hi… │ ▶ says I created `hello.txt` with the word `hi` in…
+  message Using the required skill guidance for th… │   command pwd && ls -la hello.txt                   │   edit    hello.txt
+  command printf 'hi\\n' > hello.txt python3 - <<'… │   error   rejected: pwd && ls -la hello.txt         │   message Writing hello.txt
+  command python3 - <<'PY' from pathlib import Pat… │   command ls -la /tmp/fixture-repo/hello.txt        │   command ls
+  message Created `hello.txt` containing `hi`. `ls… │   message `hello.txt` is in the repo and contains … │   message I created `hello.txt` with the word `hi`…
+tests ·  leak ·  review ·  approval ·               │ tests ·  leak ·  review ·  approval ·               │ tests ·  leak ·  review ·  approval ·
+
+Recent
+✓ demo add-hello.md · codex · committed · tests ✓  leak ✓  review -  approval ?
+  push approval needed for 5659e86f2fdbe4dcb82ee716be3c1ad909f0a552
+  llm-router approve demo-20261112-174000 --action push --sha 5659e86f2fdbe4dcb82ee716be3c1ad909f0a552
+
+Ctrl-C to quit. Read-only: watch never starts, stops or approves anything.

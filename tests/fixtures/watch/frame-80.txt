@@ -1,0 +1,32 @@
+DLR watch · 2026-11-12T18:00:00+00:00 · 3 running
+
+demo · codex · 1m05s
+▶ says Created `hello.txt` containing `hi`. `ls` confirmed: `hello.txt`.
+  message Using the required skill guidance for this simple file change.
+  command printf 'hi\\n' > hello.txt python3 - <<'PY' from pathlib import Path …
+  command python3 - <<'PY' from pathlib import Path p = Path('HANDOFF.md') s = …
+  message Created `hello.txt` containing `hi`. `ls` confirmed: `hello.txt`.
+tests ·  leak ·  review ·  approval ·
+
+demo · cursor · 1m45s
+▶ says `hello.txt` is in the repo and contains `hi`. ``` -rw-r--r--@ 1 user whe…
+  command pwd && ls -la hello.txt
+  error   rejected: pwd && ls -la hello.txt
+  command ls -la /tmp/fixture-repo/hello.txt
+  message `hello.txt` is in the repo and contains `hi`. ``` -rw-r--r--@ 1 user …
+tests ·  leak ·  review ·  approval ·
+
+demo · claude · 2m25s
+▶ says I created `hello.txt` with the word `hi` in it, and `ls` lists it next t…
+  edit    hello.txt
+  message Writing hello.txt
+  command ls
+  message I created `hello.txt` with the word `hi` in it, and `ls` lists it nex…
+tests ·  leak ·  review ·  approval ·
+
+Recent
+✓ demo add-hello.md · codex · committed · tests ✓  leak ✓  review -  approval ?
+  push approval needed for 5659e86f2fdbe4dcb82ee716be3c1ad909f0a552
+  llm-router approve demo-20261112-174000 --action push --sha 5659e86f2fdbe4dcb82ee716be3c1ad909f0a552
+
+Ctrl-C to quit. Read-only: watch never starts, stops or approves anything.
