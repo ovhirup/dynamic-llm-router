@@ -279,6 +279,8 @@ llm-router jobs; llm-router cleanup --older-than 7d --dry-run
 `run-task` exit codes: `0` ok, `1` worker/tests failed or leak-blocked, `3` refused before anything ran.
 All commands print JSON.
 
+Draft until a real run is recorded: [docs/demo.md](docs/demo.md).
+
 ## Quota pacing
 
 - Each meter has a `usage_threshold_percent` (default 85): at or above it the worker is not selected.
