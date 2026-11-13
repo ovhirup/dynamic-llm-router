@@ -503,22 +503,27 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             raise Refused(f'branch {branch} already exists')
     root = _path(policy, 'worktree_root', 'worktrees')
     prefix = policy['run_job'].get('branch_prefix', 'router/')
-    # A job id is never reused while any output claim names it: a start that crashed, or one that has pruned
-    # its worktree and not yet saved its result, still owns its id (#288).
     from . import live_jobs_feed
-    claimed_ids = {owner for _, owner in live_jobs_feed.read_claims(
-        td._router_path(policy, 'output_dir', 'logs/task-output'))}
-    n = 1
-    while True:  # two jobs started in the same second get a -N suffix
-        suffix = '' if n == 1 else f'-{n}'
-        worktree = root / f'{slugify(repo.name)}-{stamp}{suffix}'
-        candidate = branch or f'{prefix}{slug}-{stamp}{suffix}'
-        if not (worktree.exists() or worktree.name in claimed_ids
-                or (_path(policy, 'jobs_dir', 'logs/jobs') / f'{worktree.name}.json').exists()
-                or (branch is None and exists(candidate))):
-            break
-        n += 1
-    branch = candidate
+    requested_branch = branch
+
+    def pick_names():
+        """`(worktree, branch)` for the first free job id. A job id is never reused while any output claim
+        names it: a start that crashed, or one that has pruned its worktree and not yet saved its result,
+        still owns its id (#288)."""
+        claimed_ids = {owner for _, owner in live_jobs_feed.read_claims(
+            td._router_path(policy, 'output_dir', 'logs/task-output'))}
+        n = 1
+        while True:  # two jobs started in the same second get a -N suffix
+            suffix = '' if n == 1 else f'-{n}'
+            path = root / f'{slugify(repo.name)}-{stamp}{suffix}'
+            candidate = requested_branch or f'{prefix}{slug}-{stamp}{suffix}'
+            if not (path.exists() or path.name in claimed_ids
+                    or (_path(policy, 'jobs_dir', 'logs/jobs') / f'{path.name}.json').exists()
+                    or (requested_branch is None and exists(candidate))):
+                return path, candidate
+            n += 1
+
+    worktree, branch = pick_names()
     if _git(repo, 'check-ref-format', '--branch', branch).returncode != 0:
         raise Refused(f'invalid branch name {branch!r}')
     job_id = worktree.name
@@ -546,6 +551,14 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
         summary['orchestrator_decision'] = orch_module.decision_summary(orchestrator_decision)
     with RepoLock(_path(policy, 'lock_dir', 'logs/locks'), repo), _NoSleep(policy, popen):
         before = main_state(repo)
+        # The names were picked before the lock was held. Another start in this repository may have used
+        # them and finished in between, so pick again now that no other start here can interleave.
+        worktree, branch = pick_names()
+        if worktree.name != job_id:
+            if requested_branch is not None and exists(requested_branch):
+                raise Refused(f'branch {requested_branch} already exists')
+            job_id = worktree.name
+            summary.update(job_id=job_id, branch=branch, worktree=str(worktree))
         worktree.parent.mkdir(parents=True, exist_ok=True)
         # Worker logs and live events are named by this stamp; jobs started in the same second (any repo) must
         # never share it, or they would write into each other's files and show in each other's live lane.

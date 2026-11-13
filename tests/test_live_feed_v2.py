@@ -554,6 +554,54 @@ class RefusedStartTests(unittest.TestCase):
         self.assertEqual(json.loads((out / '20261112-175000-9-job.json').read_text()), {'job_id': 'other-job'})
 
 
+    def test_a_start_that_waited_for_the_lock_never_reuses_a_finished_jobs_id(self):
+        # Narrow recheck of #292: names were picked before the repo lock. Start B picks its id, pauses before
+        # taking the lock, start A runs to the end in the same second, then B resumes.
+        fixed = datetime(2026, 11, 12, 17, 50, tzinfo=timezone.utc)
+        picked, a_done, seen, errors = threading.Event(), threading.Event(), [], []
+        real_enter = jd.RepoLock.__enter__
+
+        def enter(lock):
+            if threading.current_thread().name == 'start-B':
+                picked.set()
+                self.assertTrue(a_done.wait(20))
+            return real_enter(lock)
+
+        def body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd, test_timeout, stamp,
+                 out_dir, *args, **kwargs):
+            who = threading.current_thread().name
+            (out_dir / f'{stamp}-a1-codex.events.jsonl').write_text(
+                json.dumps({'kind': 'message', 'text': f'job-{who}', 'ts': fixed.isoformat()}) + '\n')
+            summary['status'] = 'failed'
+            seen.append((who, summary['job_id'], Path(worktree).name, stamp))
+
+        def start():
+            try:
+                jd.run_job(self.repo, self.task, policy=self.policy, select=self.select, test_cmd='true', now=fixed)
+            except BaseException as error:  # reported through `errors`; a thread must not swallow it
+                errors.append(repr(error))
+
+        with mock.patch.object(jd.RepoLock, '__enter__', enter), mock.patch.object(jd, '_job_body', body):
+            thread = threading.Thread(target=start, name='start-B')
+            thread.start()
+            self.assertTrue(picked.wait(20))
+            try:
+                start()
+            finally:
+                a_done.set()
+            thread.join(20)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        ids = {who: job_id for who, job_id, _, _ in seen}
+        self.assertEqual(len(ids), 2, seen)
+        self.assertEqual(ids['start-B'], ids['MainThread'] + '-2')
+        for who, job_id, worktree_name, _ in seen:
+            self.assertEqual(job_id, worktree_name)
+        claims = dict((owner, stamp) for stamp, owner in live_jobs_feed.read_claims(self.base / 'out'))
+        self.assertEqual(set(claims), set(ids.values()))
+        self.assertEqual(len(set(claims.values())), 2)
+
+
 class ReviewRound2Tests(FeedFixture):
     """Review of #292, items 1-4."""
 
