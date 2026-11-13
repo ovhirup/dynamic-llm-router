@@ -90,12 +90,18 @@ def _submodule_start_sha(parent, root, parent_ref, env):
 
 
 def _submodule_roots_for_evidence(parent, base, head, env):
+    """Initialized submodule checkouts recorded at head.
+
+    `base` is part of the caller pair used for diffs. A gitlink that exists only
+    there was removed on the branch and does not have to be checked out.
+    """
+    del base
     roots = []
     missing = []
 
-    def walk(worktree, prefix, tree_bases, tree_heads):
+    def walk(worktree, prefix, tree_heads):
         names = set()
-        for ref in tree_bases + tree_heads:
+        for ref in tree_heads:
             if ref:
                 names.update(_gitlinks_at(worktree, ref, env))
         for name in sorted(names):
@@ -105,13 +111,10 @@ def _submodule_roots_for_evidence(parent, base, head, env):
                 missing.append(full)
                 continue
             roots.append(full)
-            base_sha = _submodule_start_sha(parent, full, base, env)
             head_sha = _submodule_start_sha(parent, full, head, env)
-            walk(path, full,
-                  [base_sha] if base_sha else [EMPTY_TREE],
-                  [head_sha] if head_sha else [])
+            walk(path, full, [head_sha] if head_sha else [])
 
-    walk(parent, '', [base], [head])
+    walk(parent, '', [head])
     if missing:
         raise jobs.Refused('submodule paths are not initialized in the checkout: ' + ', '.join(missing))
     return roots
@@ -125,9 +128,10 @@ def _note_submodule_path(name, roots, populated):
             return
 
 
-def _copy_files(repo, scratch, env, populated=None, prefix=''):
-    submodule_roots = (_submodule_roots_for_evidence(repo, 'HEAD', 'HEAD', env)
-                       if populated is not None and not prefix else [])
+def _copy_files(repo, scratch, env, populated=None, prefix='', submodule_roots=None):
+    if submodule_roots is None:
+        submodule_roots = (_submodule_roots_for_evidence(repo, 'HEAD', 'HEAD', env)
+                           if populated is not None and not prefix else [])
     listed = jobs._git(repo, 'ls-files', '-z', '--cached', '--others', '--exclude-standard',
                        check=True, env=env).stdout
     for name in dict.fromkeys(filter(None, listed.split('\0'))):
@@ -153,7 +157,7 @@ def _copy_files(repo, scratch, env, populated=None, prefix=''):
             # A populated submodule has its own tracked and non-ignored files.
             if populated is not None and full_name not in populated:
                 populated.append(full_name)
-            _copy_files(src, dest, env, populated, full_name)
+            _copy_files(src, dest, env, populated, full_name, submodule_roots)
 
 
 def _diff(repo, base, env, *flags):
@@ -187,12 +191,33 @@ def _submodule_review_diff(source, root, parent_base, env):
     return ''.join(f'\n# Submodule {root}\n{patch}' for patch in _submodule_patches(source, root, parent_base, env))
 
 
+def _submodule_path_names(sub, start, env):
+    """Changed and untracked paths in a submodule. Empty files have no added lines."""
+    names = []
+    for cached in (False, True):
+        names.extend(security.changed_paths(sub, start, cached=cached, env=env))
+    names.extend(security.untracked_files(sub, skip_dirs=()))
+    return tuple(dict.fromkeys(names))
+
+
 def _submodule_leak_findings(source, root, parent_base, terms, allow, env):
     sub = _require_submodule(source, root)
-    findings = {(f'{root}/{item["file"]}', item['kind'])
+    start = _submodule_start_sha(source, root, parent_base, env) or EMPTY_TREE
+    # A re-added submodule can reuse the path with unrelated history. Diffing
+    # against a missing base commit used to surface as a git error; refuse it.
+    if (start != EMPTY_TREE and jobs._git(
+            sub, 'cat-file', '-e', f'{start}^{{commit}}', env=env).returncode != 0):
+        raise jobs.Refused(f'submodule base commit unavailable for {root}')
+
+    def located(item):
+        return security.mask_private_terms(f'{root}/{item["file"]}', terms), item['kind']
+
+    findings = {located(item)
                 for patch in _submodule_patches(source, root, parent_base, env)
                 for item in security.scan_diff(patch, terms, allow)}
-    start = _submodule_start_sha(source, root, parent_base, env) or EMPTY_TREE
+    findings.update(located(item)
+                    for item in security.scan_diff('', terms, allow,
+                                                   paths=_submodule_path_names(sub, start, env)))
     for cached in (False, True):
         scan = security.leak_check(sub, start, None, terms, allow=allow, cached=cached,
                                    skip_dirs=(), scan_binary_untracked=True,
@@ -200,12 +225,14 @@ def _submodule_leak_findings(source, root, parent_base, terms, allow, env):
         if scan.get('status') == 'error':
             raise jobs.Refused(f'submodule leak scan failed for {root}')
         if scan.get('status') == 'blocked':
-            findings.update((f'{root}/{item["file"]}', item['kind']) for item in scan['findings'])
+            findings.update(located(item) for item in scan['findings'])
     return findings
 
 
-def _snapshot(repo, scratch, base, head, env, review, populated=None):
+def _snapshot(repo, scratch, base, head, env, review, populated=None, sub_roots=None):
     populated = [] if populated is None else populated
+    if sub_roots is None:
+        sub_roots = _submodule_roots_for_evidence(repo, base, head, env)
     jobs._git(repo, '-c', 'core.hooksPath=/dev/null', 'clone', '--local', '--no-hardlinks',
               '--no-checkout', '--template=', '-c', 'core.hooksPath=/dev/null',
               '--', str(repo), str(scratch), check=True, env=env)
@@ -216,18 +243,17 @@ def _snapshot(repo, scratch, base, head, env, review, populated=None):
     committed_paths = security.changed_paths(scratch, base, cached=True, env=env)
     staged = _diff(repo, base, env, '--cached', '--text', '-U0')
     staged_paths = security.changed_paths(repo, base, cached=True, env=env)
-    _copy_files(repo, scratch, env, populated)
+    _copy_files(repo, scratch, env, populated, submodule_roots=sub_roots)
     jobs._git(scratch, 'add', '--intent-to-add', '--force', '--', '.', check=True, env=env)
     working = _diff(scratch, base, env, '--text', '-U0')
     working_paths = security.changed_paths(scratch, base, env=env)
-    sub_roots = _submodule_roots_for_evidence(repo, base, head, env)
-    sub_patches = [(patch, ()) for root in sub_roots for patch in _submodule_patches(repo, root, base, env)]
     review_patch = _diff(scratch, base, env) if review else ''
     if review:
         for root in sub_roots:
             review_patch += _submodule_review_diff(repo, root, base, env)
-    return ((committed, committed_paths), (staged, staged_paths), (working, working_paths),
-            *sub_patches), review_patch
+    # Submodule patch text is scanned in _submodule_leak_findings with the
+    # submodule prefix. Scanning it again here would report the same leak twice.
+    return ((committed, committed_paths), (staged, staged_paths), (working, working_paths)), review_patch
 
 
 def _test_settings(policy, repo, env):
@@ -300,11 +326,17 @@ def check(policy, repo, base=None, review=False):
             result['tests'] = {'status': 'no_tests'}
             raise jobs.Refused(jobs.NO_TESTS_REASON)
         timeout = settings.get('test_timeout_seconds', policy['run_job']['test_timeout_seconds'])
+        # Refuse on submodule evidence before tests or review. Roots are computed once.
+        sub_roots = _submodule_roots_for_evidence(repo, base_sha, head, env)
+        terms, allow = tasks.private_terms(policy), tasks.leak_options(policy)['allow']
+        sub_findings = set()
+        for root in sub_roots:
+            sub_findings.update(_submodule_leak_findings(repo, root, base_sha, terms, allow, env))
         with tempfile.TemporaryDirectory(prefix='llm-router-check-', dir=_temp_root(repo)) as directory:
             temp = Path(directory).resolve()
             scratch = temp / 'checkout'
             populated = []
-            patches, review_patch = _snapshot(repo, scratch, base_sha, head, env, review, populated)
+            patches, review_patch = _snapshot(repo, scratch, base_sha, head, env, review, populated, sub_roots)
             done_check_path = scratch / DONE_CHECK
             done_check = (done_check_path.read_text() if review and done_check_path.is_file() else '')
             local_policy = deepcopy(policy)
@@ -325,12 +357,10 @@ def check(policy, repo, base=None, review=False):
             tests = jobs.run_tests(local_policy, test_checkout, command, timeout, temp / 'tests.log',
                                    runner=run_test, temp_dir=temp)
             result['tests'] = {key: tests[key] for key in ('status', 'returncode', 'elapsed_seconds') if key in tests}
-            terms, allow = tasks.private_terms(policy), tasks.leak_options(policy)['allow']
             findings = {(finding['file'], finding['kind'])
                         for patch, paths in patches
                         for finding in security.scan_diff(patch, terms, allow, paths=paths)}
-            for root in _submodule_roots_for_evidence(repo, base_sha, head, env):
-                findings.update(_submodule_leak_findings(repo, root, base_sha, terms, allow, env))
+            findings.update(sub_findings)
             findings.update((f'{DONE_CHECK}:{line}', kind)
                             for line, kind, _ in security.scan_text(done_check, terms, allow))
             result['leak_check'] = {'status': 'blocked' if findings else 'clean',

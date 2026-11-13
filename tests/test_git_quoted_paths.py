@@ -73,6 +73,42 @@ class ScanDiffTests(unittest.TestCase):
 
 
 class CheckQuotedPathIntegration(unittest.TestCase):
+    def test_unicode_private_term_blocks_check_json(self):
+        case = test_check.CheckTests('test_path_diagnostic_masks_private_term')
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        term = CAFE
+        terms = case.root / 'unicode-terms.txt'
+        terms.write_text(term + '\n')
+        case.policy['run_task']['private_terms_file'] = str(terms)
+        (case.target / f'notes-{term}.txt').write_text('clean\n')
+        result, stdout = case.check_json(1)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        blob = json.dumps(result['leak_check']['findings'], ensure_ascii=False)
+        self.assertNotIn(term, stdout)
+        self.assertNotIn(term, blob)
+        self.assertIn(security.mask(term), blob)
+        self.assertIn('private_term', blob)
+
+    def test_quote_newline_and_backslash_names_block_check_json(self):
+        names = (
+            f'{TERM}"x.txt',
+            f'{TERM}\nx.txt',
+            f'{TERM}\\x.txt',
+        )
+        for name in names:
+            with self.subTest(name=name):
+                case = test_check.CheckTests('test_path_diagnostic_masks_private_term')
+                case.setUp()
+                self.addCleanup(case.doCleanups)
+                (case.target / name).write_text('clean\n')
+                result, stdout = case.check_json(1)
+                self.assertEqual(result['leak_check']['status'], 'blocked')
+                blob = json.dumps(result['leak_check']['findings'], ensure_ascii=False)
+                self.assertNotIn(TERM, stdout)
+                self.assertNotIn(TERM, blob)
+                self.assertIn('private_term', blob)
+
     def test_quoted_tab_filename_private_term_blocks_check_json(self):
         # Git quotes paths containing TAB; private term must still block check --json.
         case = test_check.CheckTests('test_path_diagnostic_masks_private_term')

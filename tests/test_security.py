@@ -110,6 +110,13 @@ class LeakCheckTests(unittest.TestCase):
             self.assertIn('note', result)
             self.assertEqual(security.load_terms(Path(tmp) / 'none.txt'), None)
 
+    def test_scan_diff_paths_on_empty_diff(self):
+        findings = security.scan_diff('', [TERM], paths=(f'notes/{TERM}-empty.txt',))
+        self.assertEqual(findings, [{'file': f'notes/{security.mask(TERM)}-empty.txt (path)',
+                                     'kind': 'private_term'}])
+        self.assertNotIn(TERM, json.dumps(findings))
+        self.assertEqual(security.scan_diff('', [TERM], paths=('notes/empty.txt',)), [])
+
 
 class RunTaskSecurityTests(unittest.TestCase):
     def setUp(self):
