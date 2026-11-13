@@ -12,12 +12,16 @@ import subprocess
 import tempfile
 import unittest
 import uuid
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from helpers import TERM, load_policy
 from llm_router import check as check_mod
-from llm_router import cli, job_dispatch, security
+from llm_router import cli, job_dispatch, pr_gate, security, unit_review
+
+GATE_NOW = datetime(2026, 10, 17, 18, 0, tzinfo=ZoneInfo('Asia/Kolkata'))
 
 
 class AmbientDriverTests(unittest.TestCase):
@@ -465,3 +469,120 @@ class AmbientDriverTests(unittest.TestCase):
         self.assertNotIn(TERM, stdout)
         self.assertNotIn(TERM, json.dumps(result))
         self.assertFalse(self.marker.exists())
+
+    def _head(self):
+        return self.git(self.repo, 'rev-parse', 'HEAD').strip()
+
+    def _isolate_gate(self):
+        run_job = self.policy['run_job']
+        run_job['jobs_dir'] = str(self.root / 'jobs')
+        run_job['repo_config'] = str(self.root / 'repos.json')
+        run_job['vault_dir'] = str(self.root / 'vault')
+        run_job['merge_queue_dir'] = str(self.root / 'mq')
+        run_job['units_dir'] = str(self.root / 'units')
+        self.policy.setdefault('pr_gate', {}).update({
+            'approvals_file': str(self.root / 'approvals.jsonl'),
+            'gate_dir': str(self.root / 'gate'),
+            'reviews_dir': str(self.root / 'reviews'),
+            'approval_ttl_hours': 24,
+        })
+        self.policy['alerts'] = {'file': str(self.root / 'alerts.jsonl'), 'macos_notification': False}
+        (self.root / 'repos.json').write_text(json.dumps({
+            self.repo.name: {'remote': 'origin', 'base': 'main', 'visibility': 'private'},
+        }))
+
+    def _write_job(self, head, branch, job_id='probe-job'):
+        jobs = self.root / 'jobs'
+        jobs.mkdir(exist_ok=True)
+        (jobs / f'{job_id}.json').write_text(json.dumps({
+            'job_id': job_id, 'repo': str(self.repo), 'branch': branch, 'base_sha': self.base,
+            'commit': head, 'status': 'committed', 'ok': True, 'workers': ['claude'],
+        }))
+        return job_id
+
+    def _expect_raw_packet(self, diff):
+        self.assertIn(TERM, diff)
+        self.assertNotIn('harmless', diff)
+        self.assertFalse(self.marker.exists())
+
+    def test_textconv_range_leak_check_blocks_committed_line(self):
+        self._plant_textconv('committed')
+        result = pr_gate.range_leak_check(self.policy, self.repo, self.base, self._head())
+        self.assertEqual(result['status'], 'blocked', result)
+        self.assertIn({'file': 'secret.txt:1', 'kind': 'private_term', 'match': security.mask(TERM)},
+                      result['findings'])
+        self.assertNotIn(TERM, json.dumps(result))
+        self.assertFalse(self.marker.exists())
+
+    def test_textconv_push_refuses_hidden_line(self):
+        self._plant_textconv('committed')
+        head = self._head()
+        self.git(self.repo, 'branch', 'router/feature')
+        self._isolate_gate()
+        job_id = self._write_job(head, 'router/feature')
+        pr_gate.save_gate(self.policy, job_id, {
+            'review': {'sha': head, 'leak_check': 'clean', 'dir': 'x'},
+        })
+        pr_gate.approve(job_id, 'push', policy=self.policy, now=GATE_NOW)
+        with self.assertRaises(pr_gate.Refused) as caught:
+            pr_gate.push(job_id, policy=self.policy, now=GATE_NOW)
+        self.assertIn('leak check', str(caught.exception))
+        self.assertNotIn(TERM, str(caught.exception))
+        self.assertFalse(self.marker.exists())
+
+    def test_textconv_review_patch_keeps_raw_line(self):
+        self._plant_textconv('committed')
+        head = self._head()
+        self._isolate_gate()
+        job_id = self._write_job(head, 'main')
+        summary = pr_gate.review(job_id, policy=self.policy, now=GATE_NOW)
+        self._expect_raw_packet((Path(summary['bundle']) / 'diff.patch').read_text())
+
+    def test_textconv_unit_review_packet_keeps_raw_line(self):
+        self._plant_textconv('committed')
+        head = self._head()
+        self._isolate_gate()
+        batch, unit = 'b1', 'api'
+        units = Path(self.policy['run_job']['units_dir'])
+        units.mkdir(parents=True)
+        (units / f'{batch}.json').write_text(json.dumps({'batch_id': batch, 'repo': str(self.repo)}))
+        queue = Path(self.policy['run_job']['merge_queue_dir'])
+        queue.mkdir(parents=True)
+        (queue / f'{batch}.json').write_text(json.dumps({
+            'batch_id': batch,
+            'entries': {unit: {
+                'status': 'needs_review', 'base_sha': self.base, 'head': head, 'scope': ['secret.txt'],
+                'worker': 'codex', 'branch': 'main', 'worktree': str(self.repo),
+                'diff_scope': {'changed': ['secret.txt']},
+                'tests': {'status': 'passed', 'command': 'true', 'returncode': 0, 'tail': 'ok'},
+            }},
+        }))
+        packet = unit_review.build_packet(batch, unit, policy=self.policy)
+        self._expect_raw_packet(packet['diff'])
+
+    def test_textconv_job_review_packet_keeps_raw_line(self):
+        self._plant_textconv('committed')
+        packet = job_dispatch._job_review_packet({
+            'base_sha': self.base, 'commit': self._head(), 'job_id': 'probe-job', 'branch': 'main',
+            'allowed_paths': ['secret.txt'], 'workers': ['codex'],
+            'attempts': [{'worker': 'codex'}],
+            'tests': [{'command': 'true', 'status': 'passed', 'returncode': 0, 'tail': ''}],
+        }, self.repo, ['secret.txt'])
+        self._expect_raw_packet(packet['diff'])
+
+    def test_clean_filter_range_leak_check_reads_stored_blob(self):
+        """A commit-to-commit range never runs a clean filter. The stored blob is what the gate sees."""
+        (self.repo / 'secret.txt').write_text(TERM + '\n')
+        self._commit(self.repo)
+        self._install_clean()
+        (self.repo / '.gitattributes').write_text('*.txt filter=hide\n')
+        self.git(self.repo, 'add', '--', '.gitattributes')
+        self.git(self.repo, 'commit', '-qm', 'attrs')
+        self._clear_marker()
+        result = pr_gate.range_leak_check(self.policy, self.repo, self.base, self._head())
+        self.assertEqual(result['status'], 'blocked', result)
+        self.assertIn({'file': 'secret.txt:1', 'kind': 'private_term', 'match': security.mask(TERM)},
+                      result['findings'])
+        self.assertNotIn(TERM, json.dumps(result))
+        self.assertFalse(self.marker.exists())
+        self.assertIn(TERM, self.git(self.repo, 'cat-file', 'blob', 'HEAD:secret.txt'))
