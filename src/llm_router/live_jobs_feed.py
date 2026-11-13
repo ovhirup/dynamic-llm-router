@@ -72,16 +72,27 @@ def clean_text(text, terms=()):
     return mask_text(normalize_text(text), terms)
 
 
-def clean_obj(value, terms=()):
-    """`clean_text` on every string in `value`, inside lists, dict values and dict keys (a sidecar's keys are
-    untrusted too); other values are unchanged."""
+# Dicts whose KEYS come from a sidecar (worker names) rather than from the feed's own schema.
+_UNTRUSTED_KEYS = ('excluded', 'scores', 'reasons')
+_MAX_DEPTH = 32
+
+
+def clean_obj(value, terms=(), _keys=False, _depth=0):
+    """`clean_text` on every string in `value`, inside lists and dict values; other values are unchanged.
+
+    The feed's own keys are never rewritten (a private term equal to a field name must not break readers).
+    Keys are cleaned only in the dicts directly under `excluded`, `scores` and `reasons`, whose keys come
+    from a sidecar. Anything nested deeper than any real feed is replaced, so a crafted file cannot exhaust
+    the stack."""
+    if _depth > _MAX_DEPTH:
+        return security.REDACTED
     if isinstance(value, str):
         return clean_text(value, terms)
     if isinstance(value, list):
-        return [clean_obj(item, terms) for item in value]
+        return [clean_obj(item, terms, False, _depth + 1) for item in value]
     if isinstance(value, dict):
-        return {(clean_text(key, terms) if isinstance(key, str) else key): clean_obj(item, terms)
-                for key, item in value.items()}
+        return {(clean_text(key, terms) if _keys and isinstance(key, str) else key):
+                clean_obj(item, terms, key in _UNTRUSTED_KEYS, _depth + 1) for key, item in value.items()}
     return value
 
 
@@ -126,7 +137,7 @@ _ID_RE = re.compile(r'^(?P<repo>.+)-(?P<stamp>\d{8}-\d{6})(?:-\d+)?$')
 _LOG_RE = re.compile(r'^(?P<stamp>' + _STAMP + r')-a(?P<attempt>\d+)-(?P<tail>.+)\.log$')
 _JOB_STAMP_RE = re.compile(r'^(?P<stamp>' + _STAMP + r')-job\.json$')
 _WORKER = r'[a-z][a-z0-9_-]{0,31}'
-_WORKER_RE = re.compile('^' + _WORKER + '$')
+_WORKER_RE = re.compile(_WORKER)
 
 
 def _parse_ts(value):
@@ -250,7 +261,7 @@ def read_claims(out_dir):
             try:
                 data = json.loads(got[0].decode('utf-8', 'replace'))
                 job_id = data.get('job_id') if isinstance(data, dict) else None
-            except ValueError:
+            except (ValueError, RecursionError):
                 job_id = None
         claims.append((stamp, job_id if isinstance(job_id, str) and job_id else None))
     return claims
@@ -296,7 +307,7 @@ def _event_records(path, private_terms=(), tail_bytes=TAIL_BYTES):
     for line in lines:
         try:
             event = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if isinstance(event, dict) and event.get('kind') in worker_events.KINDS:
             text = _clip(clean_text(event.get('text', ''), private_terms), worker_events.TEXT_LIMIT)
@@ -412,7 +423,7 @@ def _scan_output_logs(out_dir):
 
 
 def _valid_worker(name):
-    return name if isinstance(name, str) and _WORKER_RE.match(name) else None
+    return name if isinstance(name, str) and _WORKER_RE.fullmatch(name) else None
 
 
 def worker_chain(observations):
@@ -425,7 +436,7 @@ def worker_chain(observations):
     for attempt, worker, has_log, mtime in observations:
         if worker is None:
             continue
-        logged, newest = pairs.get((attempt, worker), (False, 0.0))
+        logged, newest = pairs.get((attempt, worker), (False, mtime))
         pairs[(attempt, worker)] = (logged or has_log, max(newest, mtime))
     ordered = sorted(pairs.items(), key=lambda item: (item[0][0], not item[1][0], item[1][1], item[0][1]))
     workers, hops, prev = [], [], None
@@ -496,7 +507,7 @@ def _read_sidecar(out_dir, stamp):
         return absent
     try:
         fields = allocation_dispatch.allocation_fields(json.loads(got[0].decode('utf-8', 'replace')))
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):  # deeply nested junk must not stop the feed
         return absent
     return (fields, attempt, mtime) if fields else absent
 
@@ -525,7 +536,7 @@ def build_live_jobs_feed(policy=None, now=None):
             continue
         try:
             data = json.loads(got[0].decode('utf-8', 'replace'))
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if not isinstance(data, dict):
             continue

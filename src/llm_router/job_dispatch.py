@@ -441,22 +441,6 @@ def reserve_output_stamp(out_dir, stamp, job_id):
         return name
 
 
-def supersede_claims(out_dir, stamp, job_id):
-    """Remove every other claim that names `job_id`, once its worktree add has succeeded (#288).
-
-    Only the start holding the repo lock can add a worktree for `job_id`, and git refuses a worktree at an
-    existing path, so no live job holds that id: a second claim for it is a leftover from a start that
-    crashed after claiming. Claims of other jobs are never touched."""
-    from . import live_jobs_feed
-    out_dir = Path(out_dir)
-    for other, owner in live_jobs_feed.read_claims(out_dir):
-        if owner == job_id and other != stamp:
-            try:
-                (out_dir / f'{other}-job.json').unlink()
-            except OSError:
-                pass
-
-
 def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full', worker=None,
             keep=None, policy=None, run_task=td.run_task, select=None, now=None, test_runner=td.run_bounded,
             popen=subprocess.Popen, notifier=None, meter=None, task_class=None,
@@ -519,12 +503,18 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             raise Refused(f'branch {branch} already exists')
     root = _path(policy, 'worktree_root', 'worktrees')
     prefix = policy['run_job'].get('branch_prefix', 'router/')
+    # A job id is never reused while any output claim names it: a start that crashed, or one that has pruned
+    # its worktree and not yet saved its result, still owns its id (#288).
+    from . import live_jobs_feed
+    claimed_ids = {owner for _, owner in live_jobs_feed.read_claims(
+        td._router_path(policy, 'output_dir', 'logs/task-output'))}
     n = 1
     while True:  # two jobs started in the same second get a -N suffix
         suffix = '' if n == 1 else f'-{n}'
         worktree = root / f'{slugify(repo.name)}-{stamp}{suffix}'
         candidate = branch or f'{prefix}{slug}-{stamp}{suffix}'
-        if not (worktree.exists() or (_path(policy, 'jobs_dir', 'logs/jobs') / f'{worktree.name}.json').exists()
+        if not (worktree.exists() or worktree.name in claimed_ids
+                or (_path(policy, 'jobs_dir', 'logs/jobs') / f'{worktree.name}.json').exists()
                 or (branch is None and exists(candidate))):
             break
         n += 1
@@ -560,8 +550,8 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
         # Worker logs and live events are named by this stamp; jobs started in the same second (any repo) must
         # never share it, or they would write into each other's files and show in each other's live lane.
         # Claimed only once the repo lock is held, and released if the job cannot start, so a refused start
-        # never leaves a claim naming a job it does not belong to. Invariant: once the worktree add succeeds,
-        # the only claim naming this job id is this one; supersede_claims removes any leftover from a crash.
+        # never leaves a claim naming a job it does not belong to. Job ids named by a claim are never handed
+        # out again (see the id loop above), so one claim names each job id.
         stamp = summary['output_stamp'] = reserve_output_stamp(out_dir, stamp, job_id)
         try:
             _git(repo, 'worktree', 'add', '-q', '-b', branch, str(worktree), base_sha, check=True)
@@ -572,7 +562,6 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
                 pass
             raise
         try:
-            supersede_claims(out_dir, stamp, job_id)
             if not test_cmd:  # detected at base, so the worker cannot choose the command that judges it
                 test_cmd = detect_test_cmd(worktree, repo)
                 test_source = 'auto' if test_cmd else None

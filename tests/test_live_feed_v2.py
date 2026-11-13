@@ -511,7 +511,7 @@ class RefusedStartTests(unittest.TestCase):
             jd.run_job(self.repo, self.task, policy=self.policy, select=self.select, test_cmd='true')
         self.assertEqual(list((self.base / 'out').glob('*-job.json')), [])
 
-    def test_a_crashed_start_never_lends_its_output_to_a_later_same_id_job(self):
+    def test_a_crashed_start_keeps_its_job_id_and_never_lends_its_output(self):
         class Crash(BaseException):
             pass
 
@@ -544,11 +544,13 @@ class RefusedStartTests(unittest.TestCase):
                     jd.run_job(self.repo, self.task, policy=self.policy, select=self.select, test_cmd='true',
                                now=fixed)
         (first_id, first_stamp), (second_id, second_stamp) = seen
-        self.assertEqual(first_id, second_id)
+        # The crashed start pruned its worktree and never saved a result, but its claim still owns its id.
+        self.assertEqual(second_id, first_id + '-2')
         self.assertEqual(second_stamp, first_stamp + '-2')
         self.assertEqual(record['feed_now'], 'running new-live-job')
         self.assertEqual(record['mapped_stamp'], second_stamp)
-        self.assertFalse(record['first_claim_remains'])
+        self.assertTrue(record['first_claim_remains'])
+        self.assertEqual(live_jobs_feed.job_output_stamps(out)[first_id], first_stamp)
         self.assertEqual(json.loads((out / '20261112-175000-9-job.json').read_text()), {'job_id': 'other-job'})
 
 
@@ -780,6 +782,7 @@ class ReviewRound3Tests(FeedFixture):
         feed['running'][0]['now'] = 'says Zephyr\u200b\tquill ' + SECRET[:6] + '\u200b' + SECRET[6:]
         feed['recent'][0]['task'] = 'Zephyr\u2060quill'
         feed['running'][0]['workers'] = ['Zephyr\tquill']
+        feed['recent'][0]['branch'] = 'router/zephyrquill-' + SECRET  # unsplit: only run()'s clean_obj removes it
         stream = io.StringIO()
         watch.run(policy=self.policy, once=True, as_json=True, stream=stream, build=lambda policy: feed)
         frame = watch.render(feed, 160, terms=self.TERMS)
@@ -799,6 +802,55 @@ class ReviewRound3Tests(FeedFixture):
         for width in (80, 160):
             frame = watch.render(feed, width, terms=('Zephyr quill',))
             self.assertIsNone(re.search(r'zephyr\s+quill', frame.lower()))
+
+    def test_a_private_term_equal_to_a_field_name_never_rewrites_the_schema(self):
+        # Third review: cleaning every dict key turned the event key `text` into `[REDACTED]` and crashed watch.
+        (self.base / 'terms.txt').write_text('text\nworker\nevents\n')
+        self.running('demo-20261112-175000', '20261112-175000')
+        self.events('20261112-175000', 1, 'codex', [('command', 'ls')])
+        self.finished('demo-20261112-174000')
+        reference = live_jobs_feed.build_live_jobs_feed(policy=dict(self.policy, run_task=dict(
+            self.policy['run_task'], private_terms_file=str(self.base / 'none.txt'))), now=NOW)
+        feed = self.feed()
+
+        def keys(value):
+            if isinstance(value, dict):
+                return {key: keys(item) for key, item in value.items() if key not in ('excluded', 'scores', 'reasons')}
+            if isinstance(value, list):
+                return [keys(item) for item in value]
+            return None
+
+        self.assertEqual(keys(feed), keys(reference))
+        stream = io.StringIO()
+        watch.run(policy=self.policy, once=True, stream=stream, width=120,
+                  build=lambda policy: live_jobs_feed.build_live_jobs_feed(policy=policy, now=NOW))
+        self.assertIn('demo', stream.getvalue())
+
+    def test_deeply_nested_files_never_stop_the_feed(self):
+        self.running('demo-20261112-175000', '20261112-175000')
+        deep = '[' * 5000 + ']' * 5000
+        (self.out / '20261112-175000-a1-codex.events.jsonl').write_text(deep + '\n')  # before the real event
+        self.events('20261112-175000', 1, 'codex', [('command', 'ls')])
+        nested_plan = '{"allocation": {"as_of": "x", "role": null, "worker": "codex", "order": [], "excluded": {}, ' \
+                      '"scores": {}, "actions": [], "reasons": {"a": ' + '[' * 600 + '0' + ']' * 600 + '}}}'
+        (self.out / '20261112-175000-a1-allocation.json').write_text(deep)
+        (self.out / '20261112-175000-a2-allocation.json').write_text(nested_plan)
+        (self.out / '20261112-175900-job.json').write_text(deep)
+        (self.base / 'jobs' / 'deep.json').write_text(deep)
+        (self.base / 'jobs' / 'deep-dict.json').write_text('{"job_id": "deep-20261112-170000", "review": ' +
+                                                           '{"x": ' * 400 + '1' + '}' * 400 + '}')
+        feed = build_within(self)
+        self.assertEqual(self.find(feed, 'demo-20261112-175000')['now'], 'running ls')
+        json.dumps(feed)
+        stream = io.StringIO()
+        watch.run(policy=self.policy, once=True, as_json=True, stream=stream, build=lambda policy: feed)
+
+    def test_worker_order_and_names_at_the_edges(self):
+        chain = live_jobs_feed.worker_chain([(1, 'codex', True, -20.0), (1, 'claude', True, -10.0)])
+        self.assertEqual((chain['workers'], chain['worker']), (['codex', 'claude'], 'claude'))
+        for name in ('codex\n', 'codex ', 'Codex', '', None, 'a' * 33):
+            self.assertIsNone(live_jobs_feed._valid_worker(name), repr(name))
+        self.assertEqual(live_jobs_feed._valid_worker('grok-build'), 'grok-build')
 
     def test_untrusted_dict_keys_are_cleaned(self):
         (self.base / 'terms.txt').write_text('Zephyr quill\n')
