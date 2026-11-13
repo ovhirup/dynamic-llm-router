@@ -99,7 +99,7 @@ TO RECORD: run-job JSON with status committed, tests passed, leak check clean, a
 
 ### 4. Cross-model review
 
-This branch does the stronger-model review inside `run-job` (`job_dispatch.review_required` and `_stronger_review`, the single-job review from #263 and #267). It is not a merge-queue unit batch. Codex, Cursor, and local output require it. Claude reviews first. If Claude records `approve`, the job JSON has `review.reviewer` set to `claude` and `review.verdict` set to `approve`, and no second command is required for the verdict.
+This branch does the stronger-model review inside `run-job` (`job_dispatch.review_required` and `_stronger_review`, the single-job review from #263 and #267). It is not a merge-queue unit batch. Codex, Cursor, and local output require it. Claude's own output does not get this review, so if step 2 names Claude, the walk-through cannot show a cross-model review: run it when `select` names another worker, or state in this write-up that the worker was chosen by hand and why. Claude reviews first. If Claude records `approve`, the job JSON has `review.reviewer` set to `claude` and `review.verdict` set to `approve`, and no second command is required for the verdict.
 
 If Claude is unavailable, `run-job` leaves `review.status` as `pending` and `review.reviewer` as `grok-bot`, and writes a prompt file. The stronger model reviews that packet out of band. Record the verdict with a second command. Expected exit when the review was pending: 0.
 
