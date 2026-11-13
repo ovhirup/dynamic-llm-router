@@ -39,6 +39,7 @@ _IGNORABLE = frozenset(chr(code) for start, end in (
     for code in range(start, end + 1))
 _DEFAULT_CAPS = {'file_bytes': 16 * 1024 * 1024, 'total_bytes': 256 * 1024 * 1024,
                  'depth': 128, 'entries': 100_000}
+_CLONE_ATTEMPTS = 3
 _BLOB_MODES = (b'100644', b'100755', b'120000', b'160000')
 _TIMEOUT = 300
 # `git hash-object -t tree --stdin` of an empty tree, sha1 then sha256.
@@ -349,8 +350,19 @@ class JobGit:
             directory.mkdir(mode=0o700)
             created = True
             os.chmod(directory, 0o700)
-            instance._git('clone', '--bare', '--local', '--no-hardlinks', '--template=',
-                          '--', str(Path(source_repo).absolute()), str(directory))
+            # Background maintenance in the source can pack loose objects away while
+            # the copy runs; the clone then fails with a missing file. Start again.
+            for attempt in range(_CLONE_ATTEMPTS):
+                try:
+                    instance._git('clone', '--bare', '--local', '--no-hardlinks', '--template=',
+                                  '--', str(Path(source_repo).absolute()), str(directory))
+                    break
+                except JobGitRefused:
+                    if attempt + 1 == _CLONE_ATTEMPTS:
+                        raise
+                    shutil.rmtree(directory)
+                    directory.mkdir(mode=0o700)
+                    os.chmod(directory, 0o700)
             instance._keep_core_config()
             refs = instance._git('for-each-ref', '--format=%(refname)').splitlines()
             if refs:
@@ -608,7 +620,9 @@ class JobGit:
     def _ensure_objects(self, root, records, path_oids):
         expected = {}
         for mode, oid, _path in self._record_items(records):
-            expected[oid] = b'commit' if mode == b'160000' else b'blob'
+            # A submodule's commit lives in the submodule, never in this object store.
+            if mode != b'160000':
+                expected[oid] = b'blob'
         missing = self._batch_check(expected)
         if missing:
             found = set()

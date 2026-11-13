@@ -617,12 +617,19 @@ class JobGitTests(unittest.TestCase):
         self.assertTrue((path / 'sub').is_dir())
         self.assertEqual(list((path / 'sub').iterdir()), [])
         self.assertEqual(instance.snapshot(path), tree)
+        (path / 'beside.txt').write_bytes(b'unrelated change\n')
+        changed = instance.snapshot(path)
+        listing = git(instance.git_dir, 'ls-tree', changed).stdout.decode()
+        self.assertIn(f'160000 commit {self.external}\tsub', listing)
+        self.assertIn('beside.txt', listing)
         (path / 'sub' / 'file').write_bytes(b'forbidden')
         self.refuse(instance, path)
 
     def _gitlink_job(self):
-        tree = git(self.source, 'mktree',
-                   data=f'160000 commit {self.base}\tsub\n'.encode()).stdout.strip()
+        # A real submodule's commit is never in the superproject's object store.
+        self.external = 'a' * len(self.base)
+        tree = git(self.source, 'mktree', '--missing',
+                   data=f'160000 commit {self.external}\tsub\n'.encode()).stdout.strip()
         base = self.reachable_commit(tree)
         instance, path = self.make(base=base)
         return instance, path, tree.decode()
@@ -1101,7 +1108,7 @@ class JobGitTests(unittest.TestCase):
                 self.assertNotEqual(git(folder, 'cat-file', '-e', bad, check=False).returncode, 0)
             else:
                 sys.__stdout__.write(
-                    'skiplist: -c fetch.fsck.skipList=/dev/null left the source list in effect\n')
+                    'known limit (follow-up before wiring): a source fetch.fsck.skipList stays in effect\n')
                 self.assertEqual(
                     git(folder, 'rev-parse', 'refs/heads/weakened').stdout.decode().strip(), bad)
         else:
@@ -1242,6 +1249,58 @@ class JobGitTests(unittest.TestCase):
         self.assertEqual(git(folder, 'show', '%s:a.txt' % commit).stdout, b'hello\nchanged\n')
         self.assertIn('changed', instance.diff_text(commit))
         self.assertNotIn('Binary files', instance.diff_text(commit))
+
+    def test_source_with_two_thousand_loose_objects(self):
+        folder = self.root / 'loose-src'
+        folder.mkdir()
+        git(folder, 'init', '-q', '--template=')
+        git(folder, 'config', 'maintenance.auto', 'false')
+        for index in range(2000):
+            (folder / ('f%04d.txt' % index)).write_bytes(b'distinct %d\n' % index)
+        git(folder, 'add', '.')
+        git(folder, 'commit', '-qm', 'loose')
+        self.assertEqual(list((folder / '.git' / 'objects' / 'pack').glob('*.pack')), [])
+        base = git(folder, 'rev-parse', 'HEAD').stdout.decode().strip()
+        tree = git(folder, 'rev-parse', 'HEAD^{tree}').stdout.decode().strip()
+        self.count += 1
+        instance = JobGit.create(folder, base, 'router/job', self.root / 'state',
+                                 'job-loose-%d' % self.count)
+        path = self.root / 'loose-work'
+        path.mkdir()
+        instance.fill(path)
+        self.assertEqual(instance.snapshot(path), tree)
+
+    def test_create_retries_a_clone_that_lost_a_race(self):
+        real = JobGit._git
+        clones = []
+
+        def flaky(this, *args, **kwargs):
+            if args[0] == 'clone':
+                clones.append(args)
+                if len(clones) < 3:
+                    (this.git_dir / 'partial').write_bytes(b'left over')
+                    raise job_git.JobGitRefused('git clone failed')
+            return real(this, *args, **kwargs)
+
+        with patch.object(JobGit, '_git', flaky):
+            instance, path = self.make()
+        self.assertEqual(len(clones), 3)
+        self.assertFalse((instance.git_dir / 'partial').exists())
+        self.assertEqual(instance.snapshot(path), self.base_tree())
+
+        def broken(this, *args, **kwargs):
+            if args[0] == 'clone':
+                clones.append(args)
+                raise job_git.JobGitRefused('git clone failed')
+            return real(this, *args, **kwargs)
+
+        before = len(clones)
+        with patch.object(JobGit, '_git', broken):
+            with self.assertRaises(job_git.JobGitRefused) as caught:
+                self.make()
+        self.assertEqual(str(caught.exception), 'git clone failed')
+        self.assertEqual(len(clones) - before, 3)
+        self.assertFalse((self.root / 'state' / 'job-git' / f'job-{self.count}.git').exists())
 
     def test_two_thousand_unchanged_files_stay_fast(self):
         folder = self.root / 'bulk-src'
