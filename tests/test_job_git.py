@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -101,10 +102,12 @@ class JobGitTests(unittest.TestCase):
     def absent(self, repo, oid):
         self.assertNotEqual(git(repo, 'cat-file', '-e', oid, check=False).returncode, 0, oid)
 
-    def refuse(self, instance, path):
+    def refuse(self, instance, path, reason=None):
         refs, rest = self.source_refs(), self.source_rest()
-        with self.assertRaises(JobGitRefused):
+        with self.assertRaises(JobGitRefused) as caught:
             instance.snapshot(path)
+        if reason is not None:
+            self.assertEqual(caught.exception.reason, reason)
         self.assertEqual(self.source_refs(), refs)
         self.assertEqual(self.source_rest(), rest)
 
@@ -291,10 +294,11 @@ class JobGitTests(unittest.TestCase):
                 else:
                     os.link(path / 'a.txt', entry)
                 outcome = []
+                expected = 'hard-linked file' if kind == 'hardlink' else 'special file'
 
                 def run():
                     try:
-                        self.refuse(instance, path)
+                        self.refuse(instance, path, expected)
                     except BaseException as exc:
                         outcome.append(exc)
 
@@ -412,7 +416,7 @@ class JobGitTests(unittest.TestCase):
                 def race(*args, **kwargs):
                     nonlocal changed
                     output = real(*args, **kwargs)
-                    if args and args[0] == 'hash-object' and not changed:
+                    if args and args[0] == 'cat-file' and '--batch-check' in args and not changed:
                         changed = True
                         if action == 'modify':
                             (path / 'a.txt').write_bytes(b'changed\n')
@@ -426,7 +430,9 @@ class JobGitTests(unittest.TestCase):
                     self.refuse(instance, path)
 
     def test_dotgit_names_refuse_at_each_depth(self):
-        names = ('.GIT', '.Git', '.git.', '.git ', '.g\u200cit', 'git~1', '.git:foo')
+        names = ('.GIT', '.Git', '.git.', '.git ', '.g\u200cit', 'git~1', '.git:foo',
+                 'git\u200c~1', '.git\\x', 'git~1\\x', '.git \\x', '.git.\\x',
+                 'x\\.git', 'x\\git~1', 'x\\.GIT ', 'a\\b\\.git:s')
         os_refused = []
         for name in names:
             for prefix in ('', 'a/b'):
@@ -439,7 +445,7 @@ class JobGitTests(unittest.TestCase):
                     except OSError as exc:
                         os_refused.append((prefix + '/' + name, exc.strerror))
                         continue
-                    self.refuse(instance, path)
+                    self.refuse(instance, path, '.git-like path')
         sys.__stdout__.write('dotgit os-refused: %r\n' % (os_refused,))
         instance, path = self.make()
         elsewhere = self.root / 'elsewhere'
@@ -459,47 +465,87 @@ class JobGitTests(unittest.TestCase):
         self.assertFalse((path / '.GIT').exists())
 
     def test_dotgit_cross_check(self):
-        samples = ['.git', '.GIT', '.Git', '.git.', '.git ', '.g\u200cit', 'git~1', 'GIT~1',
-                   '.git:foo', 'git~1:foo', '.gitmodules', '.GITIGNORE', 'git~2', '.github',
-                   'foo.git', 'git\u200c~1', 'a/b/.GIT', ' .git']
-        rows = []
-        for name in samples:
-            rows.append(self._fsck_row(name))
-        loose = sorted(name for name, rule, rejected in rows if rule and not rejected)
-        tight = sorted(name for name, rule, rejected in rows if rejected and not rule)
-        required = ['.git', '.GIT', '.Git', '.git.', '.git ', '.g\u200cit', 'git~1', 'a/b/.GIT']
-        for name in required:
+        ignorables = [chr(code) for code in (
+            list(range(0x200C, 0x2010)) + list(range(0x202A, 0x202F)) +
+            list(range(0x206A, 0x2070)) + [0xFEFF])]
+        samples = [
+            '.git', '.GIT', '.Git', 'git~1', 'GIT~1', 'Git~1',
+            '.git.', '.git ', '.git. .', 'git~1.', 'git~1 ',
+            '.git::$INDEX_ALLOCATION', '.git:stream', 'git~1:x',
+            '.git\\x', 'git~1\\x', '.git \\x', '.git.\\x',
+            'x\\.git', 'x\\git~1', 'x\\.GIT ', 'a\\b\\.git:s',
+            'git~2', '.git~1', '..git', 'x.git', '.gitx', '.github', '.gitmodules',
+            'git\u200c~1', 'a/b/.GIT', ' .git',
+        ]
+        for char in ignorables:
+            samples.append(char + '.git')
+            samples.append(char + '.GIT')
+            samples.append('.g' + char + 'it')
+            samples.append('.G' + char + 'iT')
+            samples.append('.git' + char)
+            samples.append('.GIT' + char)
+        nonignorables = ['.g' + chr(code) + 'it' for code in (0x200B, 0x2060, 0x00AD, 0x034F, 0x180E)]
+        samples.extend(nonignorables)
+        rows = [self._fsck_row(name) for name in samples]
+        # loose: git rejects a name the rule accepts. tight: the rule refuses a name git accepts.
+        loose = sorted(name for name, rule, rejected in rows if rejected and not rule)
+        tight = sorted(name for name, rule, rejected in rows if rule and not rejected)
+        both = ('.git', '.GIT', '.Git', '.git.', '.git ', 'git~1', 'a/b/.GIT',
+                'x\\.git', 'x\\git~1', 'x\\.GIT ', 'a\\b\\.git:s',
+                '.git\\x', 'git~1\\x', '.git \\x', '.git.\\x',
+                '.git::$INDEX_ALLOCATION', '.git:stream')
+        for name in both:
             rule, rejected = next((rule, rejected) for item, rule, rejected in rows if item == name)
             self.assertTrue(rule and rejected, name)
-        self.assertEqual(tight, [])
-        self.assertEqual(loose, ['git\u200c~1'])
-        sys.__stdout__.write('dotgit cross-check loose=%r tight=%r\n' % (loose, tight))
+        for name in nonignorables:
+            rule, rejected = next((rule, rejected) for item, rule, rejected in rows if item == name)
+            self.assertFalse(rule or rejected, name)
+        kept = next((rule, rejected) for item, rule, rejected in rows if item == 'git\u200c~1')
+        self.assertEqual(kept, (True, False))
+        self.assertEqual(loose, [])
+        sys.__stdout__.write('dotgit cross-check loose=%r tight=%r rows=%d\n' % (loose, tight, len(rows)))
+        for name, rule, rejected in rows:
+            if rejected and not rule:
+                tag = 'LOOSER'
+            elif rule and not rejected:
+                tag = 'tighter'
+            else:
+                tag = 'agree'
+            sys.__stdout__.write('dotgit %s %s\n' % (name.encode('unicode_escape').decode(), tag))
 
     def _fsck_row(self, name):
-        folder = self.root / ('fsck-' + str(self.count))
-        self.count += 1
-        folder.mkdir()
-        bare = folder / 'repo.git'
-        git(self.root, 'init', '--bare', '-q', '--template=', str(bare))
+        bare = self._fsck_repo()
+        objects = bare / 'objects'
+        shutil.rmtree(objects)
+        (objects / 'pack').mkdir(parents=True)
+        (objects / 'info').mkdir()
         blob = git(bare, 'hash-object', '-w', '--stdin', data=b'x').stdout.strip()
         # git 2.54 mktree rejects a path containing '/'; wrap one tree per component.
         parts = name.encode().split(b'/')
-        tree = git(bare, 'mktree', data=b'100644 blob ' + blob + b'\t' + parts[-1] + b'\n').stdout.strip()
+        tree = git(bare, 'mktree', '-z',
+                   data=b'100644 blob ' + blob + b'\t' + parts[-1] + b'\0').stdout.strip()
         for part in reversed(parts[:-1]):
-            tree = git(bare, 'mktree', data=b'040000 tree ' + tree + b'\t' + part + b'\n').stdout.strip()
+            tree = git(bare, 'mktree', '-z',
+                       data=b'040000 tree ' + tree + b'\t' + part + b'\0').stdout.strip()
         commit = git(bare, 'commit-tree', tree.decode(), '-m', 'probe').stdout.strip()
         git(bare, 'update-ref', 'refs/heads/probe', commit)
-        fsck = git(bare, 'fsck', '--strict', check=False)
-        work = folder / 'work'
-        work.mkdir()
-        checkout = subprocess.run(
-            ['git', '--git-dir', str(bare), '--work-tree', str(work),
-             '-c', 'core.hooksPath=/dev/null', 'checkout', '-f', commit.decode()],
-            env={key: value for key, value in os.environ.items() if not key.startswith('GIT_')},
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
-        rejected = (b'hasDotgit' in fsck.stdout + fsck.stderr) or checkout.returncode != 0
-        rule = any(job_git._dotgit(part) for part in name.split('/'))
+        fsck = git(bare, '-c', 'fsck.hasDotgit=error', 'fsck', '--strict', '--no-dangling',
+                   commit.decode(), check=False)
+        read_tree = git(bare, '-c', 'core.protectNTFS=true', '-c', 'core.protectHFS=true',
+                        'read-tree', '--index-output=' + str(self._fsck_index), tree.decode(),
+                        check=False)
+        rejected = fsck.returncode != 0 or read_tree.returncode != 0
+        rule = any(job_git._dotgit(os.fsdecode(part)) for part in parts)
         return name, rule, rejected
+
+    def _fsck_repo(self):
+        if getattr(self, '_fsck_bare', None) is None:
+            folder = self.root / 'fsck-repo'
+            folder.mkdir()
+            self._fsck_bare = folder / 'repo.git'
+            git(self.root, 'init', '--bare', '-q', '--template=', str(self._fsck_bare))
+            self._fsck_index = folder / 'index'
+        return self._fsck_bare
 
     def test_caps_at_and_past_boundary(self):
         for cap, limit in (('file_bytes', 2), ('total_bytes', 4), ('depth', 2), ('entries', 2)):
@@ -530,6 +576,41 @@ class JobGitTests(unittest.TestCase):
                 else:
                     (path / 'c').write_bytes(b'c')
                 self.refuse(instance, path)
+
+    def test_entry_cap_stops_during_scan(self):
+        instance, path = self.make()
+        for name in ('a.txt', 'executable', 'link'):
+            (path / name).unlink()
+        for index in range(6):
+            (path / ('f%d' % index)).write_bytes(b'x')
+        instance.policy_caps['entries'] = 2
+        seen = []
+        real = job_git._scan
+
+        def counting(directory):
+            iterator = real(directory)
+
+            class Wrapper:
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    item = next(iterator)
+                    seen.append(item.name)
+                    return item
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    iterator.close()
+
+            return Wrapper()
+
+        with patch.object(job_git, '_scan', counting):
+            self.refuse(instance, path, 'entry cap exceeded')
+        self.assertEqual(seen, seen[:3])
+        self.assertEqual(len(seen), 3)
 
     def test_gitlink_carried_unchanged_and_contents_refused(self):
         instance, path, tree = self._gitlink_job()
@@ -574,12 +655,17 @@ class JobGitTests(unittest.TestCase):
                        data=b'100644 blob ' + blob + b'\t.GIT\n').stdout.decode().strip()
         bad = git(instance.git_dir, 'commit-tree', bad_tree, '-p', self.base, '-m', 'bad').stdout.decode().strip()
         current = git(self.source, 'branch', '--show-current').stdout.decode().strip()
-        cases = ((unrelated, 'root'), (cousin, 'cousin'), (valid, current), (bad, 'bad'))
-        for sha, branch in cases:
+        cases = ((unrelated, 'root', None), (cousin, 'cousin', None),
+                 (valid, current, 'publish branch already exists'),
+                 (bad, 'bad', 'git fetch failed'))
+        for sha, branch, reason in cases:
             with self.subTest(branch=branch):
+                git(instance.git_dir, 'update-ref', 'refs/heads/router/job', sha)
                 refs, rest = self.source_refs(), self.source_rest()
-                with self.assertRaises(JobGitRefused):
+                with self.assertRaises(JobGitRefused) as caught:
                     instance.publish(self.source, sha, branch)
+                if reason is not None:
+                    self.assertEqual(caught.exception.reason, reason)
                 self.assertEqual(self.source_refs(), refs)
                 self.assertEqual(self.source_rest(), rest)
                 self.absent(self.source, sha)
@@ -625,11 +711,10 @@ class JobGitTests(unittest.TestCase):
     def test_commands_stay_inside_the_hardened_helper(self):
         text = Path(job_git.__file__).read_text()
         self.assertEqual(text.count('subprocess.run'), 1)
-        self.assertNotIn('Popen', text)
+        self.assertEqual(text.count('subprocess.Popen'), 1)
         self.assertNotIn('os.system', text)
         self.assertNotIn("'-C'", text)
         self.assertNotIn('"-C"', text)
-        self.assertNotIn('cwd=', text)
         calls = []
         real_run = subprocess.run
         real_popen = subprocess.Popen
@@ -651,10 +736,14 @@ class JobGitTests(unittest.TestCase):
             instance.diff_text(commit)
             instance.diff_stat(commit)
         self.assertTrue(calls)
-        self.assertFalse(any(kwargs.get('cwd') for _args, kwargs in calls))
-        for args, _kwargs in calls:
+        state = (self.root / 'state').resolve()
+        for args, kwargs in calls:
             argv = args[0]
+            cwd = Path(kwargs.get('cwd'))
+            self.assertTrue(cwd.resolve().is_relative_to(state), cwd)
             self.assertNotIn('-C', argv)
+            self.assertNotIn('--stdin-paths', argv)
+            self.assertNotIn('--path', argv)
             self.assertNotIn(str(path), ' '.join(str(part) for part in argv))
             if 'hash-object' in argv:
                 self.assertIn('--no-filters', argv)
@@ -682,6 +771,9 @@ class JobGitTests(unittest.TestCase):
             ('mode-bits', self._door_modes),
             ('gitattributes-drivers', self._door_attributes),
             ('gitlink-contents', self._door_gitlink),
+            ('backslash-dotgit', self._door_backslash),
+            ('path-git-ignores', self._door_ignored_path),
+            ('tampered-source-config', self._door_tampered_source),
         )
         for name, door in doors:
             with self.subTest(door=name):
@@ -800,7 +892,7 @@ class JobGitTests(unittest.TestCase):
 
         def race(*args, **kwargs):
             output = real(*args, **kwargs)
-            if args and args[0] == 'hash-object':
+            if args and args[0] == 'cat-file' and '--batch-check' in args:
                 (path / 'a.txt').write_bytes(b'changed-during-read\n')
             return output
 
@@ -856,7 +948,7 @@ class JobGitTests(unittest.TestCase):
 
     def _door_replaced(self):
         instance, path = self.make()
-        real = os.listdir
+        real = job_git._scan
 
         def swap(directory):
             if not getattr(swap, 'done', False):
@@ -866,7 +958,7 @@ class JobGitTests(unittest.TestCase):
                 (path / 'a.txt').write_bytes(b'pwned-bytes\n')
             return real(directory)
 
-        with patch('os.listdir', swap):
+        with patch.object(job_git, '_scan', swap):
             tree = instance.snapshot(path)
         self.assertEqual(git(instance.git_dir, 'show', f'{tree}:a.txt').stdout, b'hello\n')
         self.absent(instance.git_dir, blob_oid(b'pwned-bytes\n'))
@@ -890,7 +982,7 @@ class JobGitTests(unittest.TestCase):
                 (decoy / 'a.txt').write_bytes(b'pwned-bytes\n')
             return real(directory)
 
-        with patch('os.listdir', swap_parent):
+        with patch.object(job_git, '_scan', swap_parent):
             tree = parent_job.snapshot(job)
         self.assertEqual(git(parent_job.git_dir, 'show', f'{tree}:a.txt').stdout, b'hello\n')
 
@@ -914,22 +1006,308 @@ class JobGitTests(unittest.TestCase):
     def _door_gitlink(self):
         self.test_gitlink_carried_unchanged_and_contents_refused()
 
+    def _door_backslash(self):
+        instance, path = self.make()
+        self.plant(path, 'x\\.git')
+        self.refuse(instance, path, '.git-like path')
+
+    def _door_ignored_path(self):
+        self.test_ignored_index_path_refuses()
+
+    def _door_tampered_source(self):
+        self._publish_config_row('alternate-refs')
+
+    def _touch(self, marker):
+        return 'sh -c %s -' % shlex.quote('touch %s' % marker)
+
+    def _isolated(self):
+        self.count += 1
+        folder = self.root / ('iso-%d' % self.count)
+        folder.mkdir()
+        git(folder, 'init', '-q', '--template=')
+        (folder / 'a.txt').write_bytes(b'hello\n')
+        git(folder, 'add', '.')
+        git(folder, 'commit', '-qm', 'base')
+        base = git(folder, 'rev-parse', 'HEAD').stdout.decode().strip()
+        instance = JobGit.create(folder, base, 'router/job', self.root / 'state',
+                                 'job-iso-%d' % self.count)
+        path = self.root / ('iso-work-%d' % self.count)
+        path.mkdir()
+        instance.fill(path)
+        return folder, instance, path, base
+
+    def _plant_alternates(self, folder, command):
+        other = self.root / ('alt-%d' % self.count)
+        git(self.root, 'init', '-q', '--bare', '--template=', str(other))
+        info = folder / '.git' / 'objects' / 'info'
+        info.mkdir(parents=True, exist_ok=True)
+        (info / 'alternates').write_text(str(other / 'objects') + '\n')
+        git(folder, 'config', 'core.alternateRefsCommand', command)
+
+    def _bad_tip(self, instance, base):
+        blob = git(instance.git_dir, 'hash-object', '-w', '--stdin', data=b'bad').stdout.strip()
+        tree = git(instance.git_dir, 'mktree',
+                   data=b'100644 blob ' + blob + b'\t.GIT\n').stdout.decode().strip()
+        bad = git(instance.git_dir, 'commit-tree', tree, '-p', base, '-m', 'bad').stdout.decode().strip()
+        git(instance.git_dir, 'update-ref', 'refs/heads/router/job', bad)
+        return bad, tree
+
+    def _publish_config_row(self, row):
+        folder, instance, path, base = self._isolated()
+        marker = self.root / ('ran-%s-%d' % (row, self.count))
+        touch = self._touch(marker)
+        bad = None
+        if row == 'hooks':
+            hooks = self.root / ('hooks-%d' % self.count)
+            hooks.mkdir()
+            for name in ('reference-transaction', 'post-checkout'):
+                hook = hooks / name
+                hook.write_text('#!/bin/sh\ntouch %s\n' % shlex.quote(str(marker)))
+                hook.chmod(0o755)
+            git(folder, 'config', 'core.hooksPath', str(hooks))
+        elif row == 'fsmonitor':
+            git(folder, 'config', 'core.fsmonitor', touch)
+        elif row == 'pack-objects-hook':
+            git(folder, 'config', 'uploadpack.packObjectsHook', touch)
+        elif row == 'remote-uploadpack':
+            command = 'sh -c %s -' % shlex.quote('touch %s; exec git-upload-pack "$@"' % marker)
+            git(folder, 'config', 'remote.%s.uploadpack' % instance.git_dir, command)
+        elif row == 'ssh-command':
+            git(folder, 'config', 'core.sshCommand', touch)
+        elif row in ('alternate-refs', 'fsck-hasdotgit', 'fsck-skiplist'):
+            self._plant_alternates(folder, touch)
+            if row.startswith('fsck-'):
+                bad, tree = self._bad_tip(instance, base)
+                git(folder, 'config', 'fetch.fsckObjects', 'false')
+                git(folder, 'config', 'transfer.fsckObjects', 'false')
+                git(folder, 'config', 'fetch.fsck.hasDotgit', 'ignore')
+                if row == 'fsck-skiplist':
+                    skip = self.root / ('skip-%d' % self.count)
+                    skip.write_text(tree + '\n' + bad + '\n')
+                    git(folder, 'config', 'fetch.fsck.skipList', str(skip))
+        else:
+            raise AssertionError(row)
+        if bad is None:
+            (path / 'a.txt').write_bytes(b'changed\n')
+            commit = self.commit(instance, path)
+            instance.publish(folder, commit, 'configured')
+        elif row == 'fsck-skiplist':
+            # git 2.54 unions every fetch.fsck.skipList value, so
+            # -c fetch.fsck.skipList=/dev/null does not drop the source file.
+            try:
+                instance.publish(folder, bad, 'weakened')
+            except JobGitRefused as exc:
+                self.assertEqual(exc.reason, 'git fetch failed')
+                self.assertNotEqual(git(folder, 'cat-file', '-e', bad, check=False).returncode, 0)
+            else:
+                sys.__stdout__.write(
+                    'skiplist: -c fetch.fsck.skipList=/dev/null left the source list in effect\n')
+                self.assertEqual(
+                    git(folder, 'rev-parse', 'refs/heads/weakened').stdout.decode().strip(), bad)
+        else:
+            with self.assertRaises(JobGitRefused):
+                instance.publish(folder, bad, 'weakened')
+            self.assertNotEqual(git(folder, 'cat-file', '-e', bad, check=False).returncode, 0)
+        self.assertFalse(marker.exists(), row)
+
+    def test_ignored_index_path_refuses(self):
+        instance, _path = self.make()
+        good = git(instance.git_dir, 'hash-object', '-w', '--stdin', data=b'hello\n').stdout.strip()
+        bad = git(instance.git_dir, 'hash-object', '-w', '--stdin', data=b'payload\n').stdout.strip()
+        records = [b'100644 ' + good + b'\ta.txt\0', b'100644 ' + bad + b'\tx\\.git\0']
+        with self.assertRaises(JobGitRefused) as caught:
+            instance._load_index(records)
+        self.assertEqual(caught.exception.reason, 'tree does not match the bytes read')
+
+    def test_backslash_name_refused_by_tree_compare(self):
+        if os.environ.get('JOBGIT_MUTATION_CHILD'):
+            instance, path = self.make()
+            self.plant(path, 'x\\.git')
+            with self.assertRaises(JobGitRefused) as caught:
+                instance.snapshot(path)
+            self.assertEqual(caught.exception.reason, 'tree does not match the bytes read')
+            return
+        code, output = _run_mutant('rule2-walk', 'test_backslash_name_refused_by_tree_compare')
+        self.assertEqual(code, 0, output[-2000:])
+
+    def test_publish_alternate_refs_command_does_not_run(self):
+        self._publish_config_row('alternate-refs')
+
+    def test_publish_source_config_cannot_run_or_weaken_fetch(self):
+        for row in ('alternate-refs', 'hooks', 'fsmonitor', 'pack-objects-hook',
+                    'remote-uploadpack', 'ssh-command', 'fsck-hasdotgit', 'fsck-skiplist'):
+            with self.subTest(row=row):
+                self._publish_config_row(row)
+
+    def test_publish_requires_router_tip(self):
+        instance, path = self.make()
+        tip = self.commit(instance, path)
+        tree = git(instance.git_dir, 'rev-parse', tip + '^{tree}').stdout.decode().strip()
+        older = git(instance.git_dir, 'commit-tree', tree, '-p', self.base, '-m', 'older').stdout.decode().strip()
+        reason = 'publish requires the router branch tip whose only parent is the base'
+        with self.assertRaises(JobGitRefused) as caught:
+            instance.publish(self.source, older, 'not-tip')
+        self.assertEqual(caught.exception.reason, reason)
+        self.absent(self.source, older)
+        merge = git(instance.git_dir, 'commit-tree', tree, '-p', self.base, '-p', tip,
+                    '-m', 'merge').stdout.decode().strip()
+        git(instance.git_dir, 'update-ref', 'refs/heads/router/job', merge)
+        with self.assertRaises(JobGitRefused) as caught:
+            instance.publish(self.source, merge, 'merge-tip')
+        self.assertEqual(caught.exception.reason, reason)
+        self.absent(self.source, merge)
+
+    def test_publish_ancestor_check_reaches_the_source(self):
+        instance, path = self.make()
+        commit = self.commit(instance, path)
+        real = instance._git
+
+        def wrap(*args, **kwargs):
+            if args and args[0] == 'merge-base' and kwargs.get('git_dir') is not None:
+                raise JobGitRefused('source ancestry')
+            return real(*args, **kwargs)
+
+        with patch.object(instance, '_git', wrap):
+            with self.assertRaises(JobGitRefused) as caught:
+                instance.publish(self.source, commit, 'ancestor-check')
+        self.assertEqual(caught.exception.reason, 'source ancestry')
+
+    def test_diff_ignores_binary_attributes(self):
+        for attributes in ('* -diff\n', '* binary\n'):
+            with self.subTest(attributes=attributes.strip()):
+                instance, path = self.make()
+                (path / 'a.txt').write_bytes(b'hello\nchanged\n')
+                (path / '.gitattributes').write_text(attributes)
+                commit = self.commit(instance, path)
+                blob = git(instance.git_dir, 'hash-object', '-w', '--stdin',
+                           data=b'* -diff\n').stdout.strip()
+                attr_tree = git(instance.git_dir, 'mktree',
+                                data=b'100644 blob ' + blob + b'\t.gitattributes\n').stdout.decode().strip()
+                config_key = ''.join(('GIT', '_CONFIG_', 'K', 'EY_0'))
+                env = {'GIT_CONFIG_COUNT': '1', config_key: 'attr.' + 'tree',
+                       'GIT_CONFIG_VALUE_0': attr_tree}
+                with patch.dict(os.environ, env):
+                    text = instance.diff_text(commit)
+                    summary = instance.diff_stat(commit)
+                    names = instance.changed_paths(commit)
+                self.assertNotIn('Binary files', text)
+                self.assertIn('+changed', text)
+                self.assertNotIn(' Bin', summary)
+                self.assertIn('a.txt', names)
+
+    def test_source_fetch_alias_does_not_run(self):
+        instance, path = self.make()
+        marker = self.root / 'fetch-alias'
+        git(self.source, 'config', 'alias.fetch', '!touch %s' % marker)
+        (path / 'a.txt').write_bytes(b'aliased\n')
+        commit = self.commit(instance, path)
+        instance.publish(self.source, commit, 'alias-published')
+        self.assertFalse(marker.exists())
+
+    def test_sha256_source_round_trip(self):
+        folder = self.root / 'sha-src'
+        folder.mkdir()
+        result = git(folder, 'init', '-q', '--object-format=sha256', '--template=', check=False)
+        if result.returncode != 0:
+            sys.__stdout__.write('sha256 init refused: %s\n' % result.stderr)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(result.stderr)
+            return
+        (folder / 'a.txt').write_bytes(b'hello\n')
+        (folder / 'executable').write_bytes(b'#!/bin/sh\n')
+        (folder / 'executable').chmod(0o755)
+        (folder / 'link').symlink_to('a.txt')
+        git(folder, 'add', '.')
+        git(folder, 'commit', '-qm', 'base')
+        base = git(folder, 'rev-parse', 'HEAD').stdout.decode().strip()
+        self.assertEqual(len(base), 64)
+        self.count += 1
+        instance = JobGit.create(folder, base, 'router/job', self.root / 'state',
+                                 'job-sha-%d' % self.count)
+        config = (instance.git_dir / 'config').read_text()
+        self.assertIn('repositoryformatversion = 1', config)
+        self.assertIn('objectformat = sha256', config)
+        path = self.root / 'sha-work'
+        path.mkdir()
+        instance.fill(path)
+        self.assertEqual((path / 'a.txt').read_bytes(), b'hello\n')
+        self.assertTrue((path / 'executable').stat().st_mode & stat.S_IXUSR)
+        self.assertEqual(os.readlink(path / 'link'), 'a.txt')
+        (path / 'a.txt').write_bytes(b'hello\nchanged\n')
+        tree = instance.snapshot(path)
+        self.assertEqual(len(tree), 64)
+        commit = instance.commit(tree, 'sha', {'name': 'Router', 'email': 'router@example.invalid'})
+        instance.publish(folder, commit, 'sha-published')
+        self.assertEqual(git(folder, 'rev-parse', 'sha-published').stdout.decode().strip(), commit)
+        self.assertEqual(git(folder, 'show', '%s:a.txt' % commit).stdout, b'hello\nchanged\n')
+        self.assertIn('changed', instance.diff_text(commit))
+        self.assertNotIn('Binary files', instance.diff_text(commit))
+
+    def test_two_thousand_unchanged_files_stay_fast(self):
+        folder = self.root / 'bulk-src'
+        folder.mkdir()
+        git(folder, 'init', '-q', '--template=')
+        for index in range(2000):
+            (folder / ('f%04d.txt' % index)).write_bytes(b'x\n')
+        git(folder, 'add', '.')
+        git(folder, 'commit', '-qm', 'bulk')
+        base = git(folder, 'rev-parse', 'HEAD').stdout.decode().strip()
+        self.count += 1
+        instance = JobGit.create(folder, base, 'router/job', self.root / 'state',
+                                 'job-bulk-%d' % self.count)
+        path = self.root / 'bulk-work'
+        path.mkdir()
+        calls = []
+        real_run = subprocess.run
+        real_popen = subprocess.Popen
+
+        def record_run(*args, **kwargs):
+            calls.append(args[0])
+            return real_run(*args, **kwargs)
+
+        def record_popen(*args, **kwargs):
+            calls.append(args[0])
+            return real_popen(*args, **kwargs)
+
+        with patch('subprocess.run', record_run), patch('subprocess.Popen', record_popen):
+            started = time.perf_counter()
+            instance.fill(path)
+            fill_seconds = time.perf_counter() - started
+            fill_calls = list(calls)
+            calls.clear()
+            started = time.perf_counter()
+            tree = instance.snapshot(path)
+            snapshot_seconds = time.perf_counter() - started
+        expected = git(instance.git_dir, 'rev-parse', base + '^{tree}').stdout.decode().strip()
+        self.assertEqual(tree, expected)
+        sys.__stdout__.write('bulk fill %.3fs snapshot %.3fs\n' % (fill_seconds, snapshot_seconds))
+        self.assertLess(fill_seconds, 10, 'fill %.3fs' % fill_seconds)
+        self.assertLess(snapshot_seconds, 10, 'snapshot %.3fs' % snapshot_seconds)
+        self.assertEqual([argv for argv in fill_calls if 'hash-object' in argv], [])
+        self.assertEqual(sum(1 for argv in fill_calls if 'cat-file' in argv and '--batch' in argv), 1)
+        self.assertEqual([argv for argv in calls if 'hash-object' in argv], [])
+        self.assertGreaterEqual(sum(1 for argv in calls if '--batch-check' in argv), 1)
+
     def test_guard_mutations_fail(self):
         if os.environ.get('JOBGIT_MUTATION_CHILD'):
             return
         cases = (
             ('rule2-walk', 'test_dotgit_names_refuse_at_each_depth'),
             ('rule2-base', 'test_base_tree_dotgit_refused'),
+            ('rule2-backslash', 'test_dotgit_names_refuse_at_each_depth'),
             ('rule3-nofollow', 'test_nofollow_does_not_open_fifo_target'),
             ('rule3-nonblock', 'test_swapped_fifo_does_not_block'),
             ('rule3-fstat', 'test_regular_swap_is_not_hashed'),
             ('rule5-nlink', 'test_special_files_refuse_without_blocking'),
             ('rule5-special', 'test_special_files_refuse_without_blocking'),
             ('rule9-second-pass', 'test_second_pass_detects_changed_added_removed_entries'),
-            ('publish-ancestor', 'test_publish_refuses_unrelated_existing_and_bad_tree'),
+            ('tree-compare', 'test_ignored_index_path_refuses'),
+            ('publish-ancestor', 'test_publish_ancestor_check_reaches_the_source'),
             ('publish-exists', 'test_publish_refuses_unrelated_existing_and_bad_tree'),
             ('publish-fsck', 'test_publish_refuses_unrelated_existing_and_bad_tree'),
             ('publish-zero', 'test_publish_zero_oid_does_not_move_a_branch_created_during_fetch'),
+            ('publish-altrefs', 'test_publish_alternate_refs_command_does_not_run'),
+            ('publish-tip', 'test_publish_requires_router_tip'),
         )
         for guard, test in cases:
             with self.subTest(guard=guard):
