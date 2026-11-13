@@ -5,6 +5,7 @@ versions follow [SemVer](https://semver.org/) (0.x: minor versions may break con
 
 ## [Unreleased]
 
+- Leak scans pass `--no-textconv` on the `git diff` and `git log -p` output they read, so a global textconv driver cannot hide committed bytes (#294).
 - `llm-router check` still blocks a deletion whose path contains a private term (#287). The name remains in the diff and in history, and the finding masks it.
 - `llm-router check` path-scans empty files inside a populated submodule (#287), committed, staged, or untracked. The reported path masks the private term.
 - `llm-router check` no longer refuses the whole run when a branch removes a submodule that is not checked out (#281). A submodule still recorded at HEAD and not initialized still refuses, before tests or review, as does a populated submodule whose leak scan errors. Re-adding a different repository at the same path refuses when the base commit is not in that repository. Each submodule leak is reported once, under the submodule path, and that location masks private terms. Submodule roots are computed once per check.

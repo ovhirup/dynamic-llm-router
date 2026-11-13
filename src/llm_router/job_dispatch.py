@@ -37,7 +37,7 @@ def review_required(worker):
 def _job_review_packet(summary, worktree, paths):
     """Evidence packet in the same shape `unit_review.review_prompt` already reviews."""
     from . import unit_review
-    diff = _git(worktree, 'diff', '--no-renames', '--no-color',
+    diff = _git(worktree, 'diff', '--no-renames', '--no-color', '--no-ext-diff', '--no-textconv',
                 f'{summary["base_sha"]}..{summary["commit"]}').stdout
     changed = sorted(paths)
     scope = list(summary.get('allowed_paths') or changed)
@@ -1012,7 +1012,8 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         dead_ends.append(f'attempt {cycle} ({selected or "none"}): {reason} — {fp["error_line"]}')
         retry_feedback.save_retry_state(
             _path(policy, 'handoffs_dir', 'handoffs'), summary['job_id'], fingerprints, dead_ends)
-        diff_now = _git(worktree, 'diff', '--no-color', summary['base_sha']).stdout if changed else ''
+        diff_now = _git(worktree, 'diff', '--no-color', '--no-ext-diff', '--no-textconv',
+                        summary['base_sha']).stdout if changed else ''
         if tracker is not None:
             tracker.record(cycle, selected, diff_now, changed_paths=worker_paths, tests=tests)
         if retry_feedback.same_failure_twice(fingerprints) and not (tracker and tracker.should_forget(cycle)):
@@ -1089,7 +1090,8 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         raise RuntimeError('worktree is not on the router branch')
     summary['commit'] = sha
     summary['diff_stat'] = _git(worktree, 'diff', '--stat', summary['base_sha'], sha).stdout.strip()
-    diff_text = _git(worktree, 'diff', '--no-color', summary['base_sha'], sha).stdout
+    diff_text = _git(worktree, 'diff', '--no-color', '--no-ext-diff', '--no-textconv',
+                     summary['base_sha'], sha).stdout
     risk = risk_tiers.classify_diff(worker_paths, diff_text=diff_text, policy=policy)
     summary['risk_tier'] = risk['risk_tier']
     summary['approval_required'] = risk['approval_required']
