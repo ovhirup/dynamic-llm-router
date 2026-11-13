@@ -37,6 +37,7 @@ No third-party runtime dependencies, please. Anything new should work with the P
   screens must be scrubbed captures.
 - **Safety defaults stay safe.** New workers and observers are off by default. Prompts never go in argv.
   Don't read credential files, keychains or cookies, and don't call undocumented billing endpoints.
+- **Link issues honestly.** `Closes #N` only when the PR meets the issue's whole done-check; otherwise `Related: #N`.
 - Keep the gate strict: no force push, `--admin`, `--auto` or branch deletion paths.
 
 ## Adding a worker

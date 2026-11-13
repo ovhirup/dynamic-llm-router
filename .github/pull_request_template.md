@@ -1,6 +1,7 @@
 ## Summary
 
-<!-- What does this change and why? Link the issue it fixes, e.g. "Fixes #123". -->
+<!-- What does this change and why? Write "Closes #123" only if this PR meets that issue's whole done-check;
+     otherwise write "Related: #123". -->
 
 ## Checklist
 
