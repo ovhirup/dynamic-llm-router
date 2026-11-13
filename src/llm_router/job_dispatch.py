@@ -441,6 +441,22 @@ def reserve_output_stamp(out_dir, stamp, job_id):
         return name
 
 
+def supersede_claims(out_dir, stamp, job_id):
+    """Remove every other claim that names `job_id`, once its worktree add has succeeded (#288).
+
+    Only the start holding the repo lock can add a worktree for `job_id`, and git refuses a worktree at an
+    existing path, so no live job holds that id: a second claim for it is a leftover from a start that
+    crashed after claiming. Claims of other jobs are never touched."""
+    from . import live_jobs_feed
+    out_dir = Path(out_dir)
+    for other, owner in live_jobs_feed.read_claims(out_dir):
+        if owner == job_id and other != stamp:
+            try:
+                (out_dir / f'{other}-job.json').unlink()
+            except OSError:
+                pass
+
+
 def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full', worker=None,
             keep=None, policy=None, run_task=td.run_task, select=None, now=None, test_runner=td.run_bounded,
             popen=subprocess.Popen, notifier=None, meter=None, task_class=None,
@@ -544,7 +560,8 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
         # Worker logs and live events are named by this stamp; jobs started in the same second (any repo) must
         # never share it, or they would write into each other's files and show in each other's live lane.
         # Claimed only once the repo lock is held, and released if the job cannot start, so a refused start
-        # never leaves a claim naming a job it does not belong to.
+        # never leaves a claim naming a job it does not belong to. Invariant: once the worktree add succeeds,
+        # the only claim naming this job id is this one; supersede_claims removes any leftover from a crash.
         stamp = summary['output_stamp'] = reserve_output_stamp(out_dir, stamp, job_id)
         try:
             _git(repo, 'worktree', 'add', '-q', '-b', branch, str(worktree), base_sha, check=True)
@@ -555,6 +572,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
                 pass
             raise
         try:
+            supersede_claims(out_dir, stamp, job_id)
             if not test_cmd:  # detected at base, so the worker cannot choose the command that judges it
                 test_cmd = detect_test_cmd(worktree, repo)
                 test_source = 'auto' if test_cmd else None

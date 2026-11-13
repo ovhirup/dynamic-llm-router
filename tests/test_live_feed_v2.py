@@ -10,12 +10,13 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import unittest
 from unittest import mock
 
 import test_job_dispatch as tjd
 from helpers import TERM, load_policy
-from llm_router import job_dispatch as jd, live_jobs_feed, pr_gate, task_dispatch as td, watch
+from llm_router import allocation_dispatch, job_dispatch as jd, live_jobs_feed, pr_gate, task_dispatch as td, watch
 from test_worker_events import replay
 from test_task_dispatch import repo as make_repo
 
@@ -510,25 +511,72 @@ class RefusedStartTests(unittest.TestCase):
             jd.run_job(self.repo, self.task, policy=self.policy, select=self.select, test_cmd='true')
         self.assertEqual(list((self.base / 'out').glob('*-job.json')), [])
 
+    def test_a_crashed_start_never_lends_its_output_to_a_later_same_id_job(self):
+        class Crash(BaseException):
+            pass
+
+        out = self.base / 'out'
+        fixed = datetime(2026, 11, 12, 17, 50, tzinfo=timezone.utc)
+        seen, record = [], {}
+        real_finish = jd._finish
+
+        def body(policy, summary, task_path, task_text, worktree, size, worker, test_cmd, test_timeout, stamp,
+                 out_dir, *args, **kwargs):
+            marker = 'new-live-job' if seen else 'old-crashed-job'
+            (out_dir / f'{stamp}-a1-codex.events.jsonl').write_text(
+                json.dumps({'kind': 'command', 'text': marker, 'ts': fixed.isoformat()}) + '\n')
+            summary['status'] = 'failed'
+            seen.append((summary['job_id'], stamp))
+            if len(seen) == 2:
+                live = live_jobs_feed.build_live_jobs_feed(policy=policy, now=fixed)['running'][0]
+                record.update(feed_now=live['now'], mapped_stamp=live_jobs_feed.job_output_stamps(out_dir)[
+                    summary['job_id']], first_claim_remains=(out_dir / f'{seen[0][1]}-job.json').exists())
+
+        def finish(*args):
+            real_finish(*args)  # ordinary cleanup, then the process dies before the job is persisted
+            raise Crash()
+
+        with mock.patch.object(jd, '_job_body', body), mock.patch.object(jd, '_finish', finish):
+            for attempt in range(2):
+                if attempt == 1:
+                    (out / '20261112-175000-9-job.json').write_text(json.dumps({'job_id': 'other-job'}))
+                with self.assertRaises(Crash):
+                    jd.run_job(self.repo, self.task, policy=self.policy, select=self.select, test_cmd='true',
+                               now=fixed)
+        (first_id, first_stamp), (second_id, second_stamp) = seen
+        self.assertEqual(first_id, second_id)
+        self.assertEqual(second_stamp, first_stamp + '-2')
+        self.assertEqual(record['feed_now'], 'running new-live-job')
+        self.assertEqual(record['mapped_stamp'], second_stamp)
+        self.assertFalse(record['first_claim_remains'])
+        self.assertEqual(json.loads((out / '20261112-175000-9-job.json').read_text()), {'job_id': 'other-job'})
+
 
 class ReviewRound2Tests(FeedFixture):
     """Review of #292, items 1-4."""
 
     JOB, STAMP = 'demo-20261112-175000', '20261112-175000'
 
-    def test_a_second_claim_for_the_same_job_never_hides_its_events(self):
+    def test_two_claims_for_one_job_show_no_output(self):
         self.running(self.JOB, self.STAMP)
         self.events(self.STAMP, 1, 'codex', [('command', 'ls')])
-        (self.out / f'{self.STAMP}-2-job.json').write_text(json.dumps({'job_id': self.JOB}))  # stale, no output
-        job = self.find(self.feed(), self.JOB)
-        self.assertEqual([event['text'] for event in job['events']], ['ls'])
-        self.assertEqual(job['now'], 'running ls')
-
-    def test_a_claim_with_output_wins_over_an_earlier_empty_one(self):
-        self.running(self.JOB, self.STAMP)  # empty claim left by a start that never ran
         (self.out / f'{self.STAMP}-2-job.json').write_text(json.dumps({'job_id': self.JOB}))
         self.events(f'{self.STAMP}-2', 1, 'codex', [('command', 'pwd')])
-        self.assertEqual(self.find(self.feed(), self.JOB)['now'], 'running pwd')
+        job = self.find(self.feed(), self.JOB)
+        self.assertEqual(job['events'], [])
+        self.assertIsNone(job['now'])
+        body = json.dumps(job)
+        self.assertNotIn('ls', body)
+        self.assertNotIn('pwd', body)
+
+    def test_id_stamp_fallback_never_takes_a_claimed_stamp(self):
+        self.running(self.JOB, self.STAMP)
+        self.events(self.STAMP, 1, 'codex', [('command', 'ls')])
+        other = 'other-20261112-175000-2'  # same start second as JOB, no claim of its own
+        self.running(other)
+        feed = self.feed()
+        self.assertEqual(self.find(feed, other)['events'], [])
+        self.assertEqual([event['text'] for event in self.find(feed, self.JOB)['events']], ['ls'])
 
     def test_escapes_that_split_a_secret_or_term_cannot_rejoin_it(self):
         split = lambda text: text[:5] + '\x1b[0m' + text[5:8] + '\x1b]0;t\x07' + text[8:]
@@ -596,6 +644,190 @@ class ReviewRound2Tests(FeedFixture):
         self.assertEqual(job['attempt'], 2)
         frame = watch.render({'running': [job], 'recent': [], 'history': [], 'updated_at': ''}, 120)
         self.assertIn('codex', frame.splitlines()[2])
+
+
+def sidecar_plan(worker, role='coder'):
+    """A minimal allocation plan, shaped as `allocation_dispatch.write_sidecar` persists it."""
+    return {'as_of': NOW.isoformat(), 'role': role, 'worker': worker, 'order': [worker] if worker else [],
+            'excluded': {}, 'scores': {}, 'actions': [], 'reasons': {}}
+
+
+def feed_strings(value):
+    """Every string in a feed value, dict keys included."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, list):
+        for item in value:
+            yield from feed_strings(item)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from feed_strings(key)
+            yield from feed_strings(item)
+
+
+class ReviewRound3Tests(FeedFixture):
+    """Review of #292, round 3: one mechanism per class (claim-to-job, text, current worker, bounded reads)."""
+
+    T0 = NOW.timestamp() - 600
+    TERMS = ('Zephyrquill', 'Zephyr quill')
+    NEEDLES = (SECRET.lower(), 'zephyrquill', 'zephyr quill')
+
+    def play(self, stamp, ops):
+        """Write one job's output files. Each op is (kind, attempt, worker, items, seconds): `ev` an events file,
+        `log` a worker log, `tests` the tests log, `side` the allocation sidecar. Mtimes are `T0 + seconds`."""
+        for kind, attempt, worker, items, seconds in ops:
+            if kind == 'ev':
+                self.events(stamp, attempt, worker, items or [('command', 'work')])
+                path = self.out / f'{stamp}-a{attempt}-{worker}.events.jsonl'
+            elif kind == 'side':
+                path = Path(allocation_dispatch.write_sidecar(self.out, f'{stamp}-a{attempt}',
+                                                              {'allocation': sidecar_plan(worker)}))
+            else:
+                name = 'tests' if kind == 'tests' else worker
+                path = self.out / f'{stamp}-a{attempt}-{name}.log'
+                path.write_text('output\n')
+            os.utime(path, (self.T0 + seconds, self.T0 + seconds))
+
+    def test_worker_reconciliation_table(self):
+        def hop(a, b, n):
+            return {'from': a, 'to': b, 'attempt': n}
+
+        two = [('log', 1, 'claude', None, 10), ('ev', 1, 'claude', None, 5), ('ev', 2, 'codex', None, 20)]
+        claude_then_codex = ('codex', ['claude', 'codex'], [hop('claude', 'codex', 2)], 2)
+        rows = [
+            ([('ev', 1, 'codex', None, 10)], ('codex', ['codex'], [], 1)),
+            (two, claude_then_codex),
+            ([('log', 1, 'claude', None, 10), ('ev', 1, 'claude', None, 5), ('ev', 1, 'codex', None, 20)],
+             ('codex', ['claude', 'codex'], [hop('claude', 'codex', 1)], 1)),
+            (two + [('side', 2, 'codex', None, 15)], claude_then_codex),
+            ([('log', 1, 'claude', None, 10), ('side', 2, 'codex', None, 15)], claude_then_codex),
+            ([('log', 1, 'claude', None, 10), ('ev', 1, 'claude', None, 5), ('log', 2, 'codex', None, 30),
+              ('ev', 2, 'codex', None, 25), ('ev', 3, 'claude', [('command', 'current claude')], 40)],
+             ('claude', ['claude', 'codex', 'claude'], [hop('claude', 'codex', 2), hop('codex', 'claude', 3)], 3)),
+            ([('log', 1, 'claude', None, 10), ('ev', 1, 'claude', None, 5),
+              ('ev', 2, 'codex', [('command', f'codex step {n}') for n in range(25)], 20)], claude_then_codex),
+            ([('ev', 1, 'codex', None, 10), ('ev', 2, 'Zephyr\tquill', [('message', 'spoof')], 10),
+              ('ev', 2, 'Codex', [('message', 'spoof')], 10), ('ev', 2, 'bad worker', [('message', 'spoof')], 10),
+              ('log', 3, 'Bad Name', None, 10)],
+             ('codex', ['codex'], [], 1)),
+            ([('log', 1, 'codex', None, 10), ('log', 1, 'claude', None, 20), ('tests', 1, None, None, 30)],
+             ('claude', ['codex', 'claude'], [hop('codex', 'claude', 1)], 1)),
+            ([('log', 1, 'codex', None, 10), ('side', 2, None, None, 20)], ('codex', ['codex'], [], 2)),
+        ]
+        for number, (ops, _expected) in enumerate(rows, 1):
+            stamp = f'20261112-1750{number:02d}'
+            self.running(f'demo-{stamp}', stamp)
+            self.play(stamp, ops)
+        feed = self.feed()
+        for number, (_ops, expected) in enumerate(rows, 1):
+            stamp = f'20261112-1750{number:02d}'
+            job = self.find(feed, f'demo-{stamp}')
+            with self.subTest(row=number):
+                self.assertEqual((job['worker'], job['workers'], job['hops'], job['attempt']), expected)
+                if number == 6:
+                    self.assertEqual(job['now'], 'running current claude')
+                if number == 7:
+                    self.assertEqual(len(job['events']), 20)
+                    self.assertEqual({event['worker'] for event in job['events']}, {'codex'})
+                if number == 8:
+                    self.assertNotIn('spoof', json.dumps(job).lower())
+                    self.assertNotIn('zephyr', json.dumps(job).lower())
+
+    def test_text_never_reveals_a_secret_or_term_after_any_insertion(self):
+        (self.base / 'terms.txt').write_text('\n'.join(self.TERMS) + '\n')
+        insertions = ['\t', '\n', '\r', '  ', '\x0b', '\x0c', '\x85', '\xa0', '\u2028', '\u3000', '\x00', '\x1b[0m',
+                      '\x1b]0;t\x07', '\x9b', '\xad', '\u034f', '\u061c', '\u180e', '\u200b', '\u200c', '\u200d',
+                      '\u200e', '\u202e', '\u2060', '\u2066', '\ufe0f', '\ufeff', '\U000e0041', '\ud800']
+        for index, x in enumerate(insertions):
+            stamp = f'20261112-1751{index:02d}'
+            self.running(f'demo-{stamp}', stamp)
+            self.events(stamp, 1, 'codex', [
+                ('message', f'a {SECRET[:10]}{x}{SECRET[10:]} b'),
+                ('message', 'Zephyr' + x + 'quill'),
+                ('message', 'Zep' + x + 'hyr quill'),
+                ('message', 'Zephyr ' + x + 'quill')])
+            self.finished(f'demo-20261112-1740{index:02d}', task='Zephyr' + x + 'quill.md', review_required=True,
+                          review={'status': 'error', 'reviewer': 'grok-bot',
+                                  'reason': 'Zephyr' + x + ' quill ' + SECRET[:10] + x + SECRET[10:]})
+            if x not in ('\x00', '\ud800'):
+                try:
+                    self.events(stamp, 2, 'Zephyr' + x + 'quill', [('message', 'filename worker text')])
+                except OSError:
+                    pass  # the OS refuses this file name: nothing to show
+        feed = self.feed()
+        for text in feed_strings(feed):
+            self.assertEqual(live_jobs_feed.normalize_text(text), text)
+            self.assertEqual(live_jobs_feed.clean_text(text, self.TERMS), text)
+        for width in (80, 160):
+            for frame in (watch.render(feed, width, terms=self.TERMS), watch.render(feed, width)):
+                for needle in self.NEEDLES:
+                    self.assertNotIn(needle, frame.lower())
+                self.assertEqual([ch for ch in frame if ch != '\n' and
+                                  unicodedata.category(ch) in ('Cc', 'Cf', 'Cs')], [])
+        for as_json in (False, True):
+            stream = io.StringIO()
+            watch.run(policy=self.policy, once=True, as_json=as_json, stream=stream, width=160,
+                      build=lambda policy: feed)
+            for needle in self.NEEDLES:
+                self.assertNotIn(needle, stream.getvalue().lower())
+        json_body = json.dumps(feed, ensure_ascii=False).lower()
+        for needle in self.NEEDLES:
+            self.assertNotIn(needle, json_body)
+
+    def test_watch_masks_a_feed_it_did_not_build(self):
+        (self.base / 'terms.txt').write_text('\n'.join(self.TERMS) + '\n')
+        feed = demo_feed()
+        feed['running'][0]['now'] = 'says Zephyr\u200b\tquill ' + SECRET[:6] + '\u200b' + SECRET[6:]
+        feed['recent'][0]['task'] = 'Zephyr\u2060quill'
+        feed['running'][0]['workers'] = ['Zephyr\tquill']
+        stream = io.StringIO()
+        watch.run(policy=self.policy, once=True, as_json=True, stream=stream, build=lambda policy: feed)
+        frame = watch.render(feed, 160, terms=self.TERMS)
+        for needle in self.NEEDLES:
+            self.assertNotIn(needle, frame.lower())
+            self.assertNotIn(needle, stream.getvalue().lower())
+
+    def test_rows_cannot_join_fields_into_a_term(self):
+        (self.base / 'terms.txt').write_text('Zephyr quill\n')
+        self.finished('demo-20261112-174000', repo='/tmp/Zephyr', task='quill.md')
+        feed = self.feed()
+        feed['running'] = [{
+            'job_id': 'hand-built', 'repo': 'demo', 'task': 'x', 'worker': 'codex', 'workers': ['codex'],
+            'state': 'running', 'elapsed_seconds': 5, 'now': None,
+            'events': [{'ts': '', 'worker': 'codex', 'attempt': 1, 'kind': 'Zephyr', 'text': 'quill'}],
+            'gates': live_jobs_feed.running_gates('running')}]
+        for width in (80, 160):
+            frame = watch.render(feed, width, terms=('Zephyr quill',))
+            self.assertIsNone(re.search(r'zephyr\s+quill', frame.lower()))
+
+    def test_untrusted_dict_keys_are_cleaned(self):
+        (self.base / 'terms.txt').write_text('Zephyr quill\n')
+        self.running('demo-20261112-175000', '20261112-175000')
+        plan = sidecar_plan('codex')
+        planted_key = 'Zephyr quill ' + SECRET
+        plan['reasons'] = {planted_key: 'fine'}
+        allocation_dispatch.write_sidecar(self.out, '20261112-175000-a1', {'allocation': plan})
+        feed = self.feed()
+        stream = io.StringIO()
+        watch.run(policy=self.policy, once=True, as_json=True, stream=stream, build=lambda policy: feed)
+        for text in (json.dumps(feed).lower(), stream.getvalue().lower()):
+            self.assertNotIn('zephyr quill', text)
+            self.assertNotIn(SECRET.lower(), text)
+
+    def test_sidecar_and_job_json_never_stall_the_feed(self):
+        stamp, job_id = '20261112-175000', 'demo-20261112-175000'
+        self.running(job_id, stamp)
+        allocation_dispatch.write_sidecar(self.out, f'{stamp}-a2', {'allocation': sidecar_plan('codex')})
+        os.mkfifo(self.out / f'{stamp}-a3-allocation.json')
+        os.mkfifo(self.base / 'jobs' / 'stuck.json')
+        big_stamp = '20261112-175100'
+        self.running(f'demo-{big_stamp}', big_stamp)
+        big = sidecar_plan('codex')
+        big['reasons'] = {'filler': 'y' * (300 * 1024)}
+        allocation_dispatch.write_sidecar(self.out, f'{big_stamp}-a1', {'allocation': big})
+        feed = build_within(self)
+        self.assertEqual(self.find(feed, job_id)['allocation']['worker'], 'codex')
+        self.assertNotIn('allocation', self.find(feed, f'demo-{big_stamp}'))
 
 
 if __name__ == '__main__':

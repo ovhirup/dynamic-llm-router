@@ -9,7 +9,7 @@ import shutil
 import sys
 import time
 
-from . import live_jobs_feed, security
+from . import live_jobs_feed
 
 WIDE = 100          # below this many columns, lanes stack vertically
 LANE_MIN = 34       # narrowest side-by-side lane
@@ -21,12 +21,7 @@ COLORS = {'passed': '32', 'failed': '31', 'blocked': '31', 'running': '33', 'wai
 GATES = (('tests', 'tests'), ('leak_check', 'leak'), ('review', 'review'), ('approval', 'approval'))
 
 
-def _clean(text):
-    """One safe line. Worker output is untrusted: terminal escape sequences and control characters are removed
-    first, then secrets are redacted again (removing an escape can join the halves of a split secret), then
-    whitespace runs become single spaces. The feed has already done both, private terms included; this covers
-    a feed from any other source."""
-    return ' '.join(security.redact(live_jobs_feed.strip_controls(text or '')).split())
+_clean = live_jobs_feed.normalize_text  # one field; secrets and private terms are masked on each assembled row
 
 
 def _fit(text, width):
@@ -67,7 +62,7 @@ def _workers(job):
     return '→'.join(_clean(name) for name in chain) or 'choosing worker'
 
 
-def lane(job, width):
+def lane(job, width, terms=()):
     """The lines of one running job's lane, each exactly `width` characters."""
     events = (job.get('events') or [])[-LANE_EVENTS:]
     rows = [f'{_clean(job.get("repo")) or "?"} · {_workers(job)} · {_elapsed(job.get("elapsed_seconds"))}',
@@ -75,20 +70,21 @@ def lane(job, width):
     rows += [f'  {_clean(event["kind"]):<7} {_clean(event["text"])}' for event in events]
     rows += [''] * (LANE_EVENTS - len(events))
     rows.append(gate_strip(job.get('gates')))
-    return [_pad(row, width) for row in rows]
+    return [_pad(live_jobs_feed.mask_text(row, terms), width) for row in rows]
 
 
-def _finished_lines(job, width):
+def _finished_lines(job, width, terms=()):
     gates = job.get('gates') or {}
     state = 'done' if job.get('state') == 'done' else 'failed'
-    lines = [_fit(f'{SYMBOLS["passed"] if state == "done" else SYMBOLS["failed"]} {_clean(job.get("repo")) or "?"} '
-                  f'{_clean(job.get("task"))} · {_workers(job)} · {_clean(job.get("status") or state)} · '
-                  f'{gate_strip(gates)}', width)]
+    lines = [_fit(live_jobs_feed.mask_text(
+        f'{SYMBOLS["passed"] if state == "done" else SYMBOLS["failed"]} {_clean(job.get("repo")) or "?"} '
+        f'{_clean(job.get("task"))} · {_workers(job)} · {_clean(job.get("status") or state)} · '
+        f'{gate_strip(gates)}', terms), width)]
     approval = gates.get('approval') or {}
     if approval.get('state') == 'waiting':  # never cut: the owner approves this exact SHA
-        lines.append(f'  {_clean(approval.get("detail"))}')
+        lines.append(live_jobs_feed.mask_text(f'  {_clean(approval.get("detail"))}', terms))
         if approval.get('command'):
-            lines.append(f'  {_clean(approval["command"])}')
+            lines.append(live_jobs_feed.mask_text(f'  {_clean(approval["command"])}', terms))
     return lines
 
 
@@ -99,11 +95,12 @@ def select_job(feed, job_id):
     return {**feed, 'running': pick['running'], 'recent': pick['recent'] + pick['history'], 'history': []}
 
 
-def render(feed, width=WIDE, color=False):
-    """One frame of the watch view as a string. Pure: same feed and width, same text."""
+def render(feed, width=WIDE, color=False, terms=()):
+    """One frame of the watch view as a string. Pure: same feed, width and terms, same text."""
     width = max(40, int(width))
     running, recent = feed.get('running') or [], feed.get('recent') or []
-    out = [_fit(f'DLR watch · {_clean(feed.get("updated_at"))} · {len(running)} running', width), '']
+    header = live_jobs_feed.mask_text(f'DLR watch · {_clean(feed.get("updated_at"))} · {len(running)} running', terms)
+    out = [_fit(header, width), '']
     lanes = [(job, job.get('gates')) for job in running]
     if not lanes:
         out.append('No running jobs.')
@@ -112,7 +109,7 @@ def render(feed, width=WIDE, color=False):
         column = (width - len(SEPARATOR) * (per_row - 1)) // per_row
         for start in range(0, len(lanes), per_row):
             group = lanes[start:start + per_row]
-            cells = [lane(job, column) for job, _ in group]
+            cells = [lane(job, column, terms) for job, _ in group]
             for index in range(len(cells[0])):
                 parts = [cells[n][index] for n in range(len(group))]
                 if color:
@@ -121,13 +118,13 @@ def render(feed, width=WIDE, color=False):
             out.append('')
     else:
         for job, gates in lanes:
-            rows = lane(job, width)
+            rows = lane(job, width, terms)
             out += [(_colorize(row, gates) if color else row).rstrip() for row in rows] + ['']
     finished = recent
     if finished:
         out += [_fit('Recent', width)]
         for job in finished:
-            lines = _finished_lines(job, width)
+            lines = _finished_lines(job, width, terms)
             out += [_colorize(line, job.get('gates')) if color else line for line in lines]
         out.append('')
     out.append(_fit('Ctrl-C to quit. Read-only: watch never starts, stops or approves anything.', width))
@@ -137,19 +134,21 @@ def render(feed, width=WIDE, color=False):
 def run(policy=None, once=False, interval=2.0, job_id=None, as_json=False, stream=None, sleep=time.sleep,
         width=None, build=None):
     """Draw frames until Ctrl-C (or one with `once`). Returns the exit code."""
+    from . import task_dispatch as td  # local: the terms come from the policy's own file, never config here
     stream = stream or sys.stdout
     build = build or live_jobs_feed.build_live_jobs_feed
     tty = bool(getattr(stream, 'isatty', lambda: False)())
+    terms = tuple(td.private_terms(policy) or ()) if policy is not None else ()
     try:
         while True:
-            feed = build(policy=policy)
+            feed = live_jobs_feed.clean_obj(build(policy=policy), terms)
             if job_id:
                 feed = select_job(feed, job_id)
             if as_json:
                 stream.write(json.dumps(feed, indent=2) + '\n')
                 return 0
             columns = width or shutil.get_terminal_size((WIDE, 40)).columns
-            frame = render(feed, columns, color=tty)
+            frame = render(feed, columns, color=tty, terms=terms)
             if tty and not once:
                 stream.write('\x1b[H\x1b[2J')
             stream.write(frame + '\n')
