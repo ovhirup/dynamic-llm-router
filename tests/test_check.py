@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from helpers import TERM, load_policy
-from llm_router import cli, handoff, job_dispatch, selection, task_dispatch, unit_review
+from llm_router import cli, handoff, job_dispatch, security, selection, task_dispatch, unit_review
 from test_task_dispatch import repo
 
 
@@ -185,6 +185,27 @@ class CheckTests(unittest.TestCase):
         self.assertNotIn(TERM, stdout)
         self.assertNotIn(PLANTED_VALUE, stdout)
 
+    def test_term_named_file_in_parent_masks_location(self):
+        name = f'notes/{TERM}.txt'
+        (self.target / 'notes').mkdir()
+        (self.target / name).write_text(TERM + '\n')
+        masked = f'notes/{security.mask(TERM)}.txt'
+        expected = [
+            {'file': f'{masked} (path)', 'kind': 'private_term'},
+            {'file': f'{masked}:1', 'kind': 'private_term'},
+        ]
+        result, stdout = self.check_json(1)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertEqual(len(result['leak_check']['findings']), len(expected))
+        self.assertEqual(result['leak_check']['findings'], expected)
+        self.assertNotIn(TERM.lower(), stdout.lower())
+        code, human, human_err = self.invoke()
+        self.assertEqual(code, 1, human)
+        combined = f'{human}\n{human_err}'.lower()
+        self.assertNotIn(TERM.lower(), combined)
+        printed = [line for line in human.splitlines() if line.endswith('(private_term)')]
+        self.assertEqual(len(printed), len(expected))
+
     def check_empty_addition(self, state, private):
         name = f'notes/{TERM}-empty.txt' if private else 'notes/empty.txt'
         path = self.target / name
@@ -228,6 +249,54 @@ class CheckTests(unittest.TestCase):
 
     def test_committed_clean_empty_addition_passes(self):
         self.check_empty_addition('committed', private=False)
+
+    def _delete_private_named_file(self, commit_deletion):
+        name = f'{TERM}.txt'
+        (self.repo / name).write_text('public\n')
+        self.commit(self.repo)
+        self.git(self.target, 'merge', '--ff-only', 'main')
+        self.git(self.target, 'rm', '-f', name)
+        if commit_deletion:
+            self.commit(self.target)
+        result, stdout = self.check_json(1)
+        self.assertEqual(result['leak_check']['findings'],
+                         [{'file': f'{security.mask(TERM)}.txt (path)', 'kind': 'private_term'}])
+        self.assertNotIn(TERM, stdout)
+        self.assertNotIn(TERM, json.dumps(result))
+
+    def test_committed_deletion_of_private_path_blocks(self):
+        self._delete_private_named_file(commit_deletion=True)
+
+    def test_staged_deletion_of_private_path_blocks(self):
+        self._delete_private_named_file(commit_deletion=False)
+
+    def test_mode_only_change_of_private_path_is_scanned(self):
+        name = f'{TERM}.txt'
+        (self.repo / name).write_text('public\n')
+        self.commit(self.repo)
+        self.git(self.target, 'merge', '--ff-only', 'main')
+        (self.target / name).chmod(0o755)
+        self.commit(self.target)
+        diff = self.git(self.target, 'diff', 'main', 'HEAD')
+        self.assertIn('old mode', diff)
+        self.assertNotIn('@@', diff)
+        result, stdout = self.check_json(1)
+        self.assertEqual(result['leak_check']['findings'],
+                         [{'file': f'{security.mask(TERM)}.txt (path)', 'kind': 'private_term'}])
+        self.assertNotIn(TERM, stdout)
+        self.assertNotIn(TERM, json.dumps(result))
+
+    def test_rename_only_to_private_path_is_scanned(self):
+        original = (self.target / 'README.md').read_text()
+        self.git(self.target, 'mv', 'README.md', f'{TERM}.txt')
+        self.commit(self.target)
+        self.assertEqual((self.target / f'{TERM}.txt').read_text(), original)
+        result, stdout = self.check_json(1)
+        blob = json.dumps(result['leak_check']['findings'])
+        self.assertIn('(path)', blob)
+        self.assertIn(security.mask(TERM), blob)
+        self.assertNotIn(TERM, stdout)
+        self.assertNotIn(TERM, blob)
 
     def test_untracked_private_term_and_unstaged_key_are_scanned(self):
         (self.target / 'notes.txt').write_text(TERM)
