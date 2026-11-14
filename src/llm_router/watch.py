@@ -4,7 +4,6 @@ Read-only: it renders `live_jobs_feed.build_live_jobs_feed()` and never starts, 
 `render(feed, width)` is a pure function; `run()` redraws it every `interval` seconds until Ctrl-C.
 Plain ANSI only, and none at all when stdout is not a terminal.
 """
-import json
 import shutil
 import sys
 import time
@@ -128,7 +127,8 @@ def render(feed, width=WIDE, color=False, terms=()):
             out += [_colorize(line, job.get('gates')) if color else line for line in lines]
         out.append('')
     out.append(_fit('Ctrl-C to quit. Read-only: watch never starts, stops or approves anything.', width))
-    return '\n'.join(out)
+    # After lanes are joined: a private term can be formed only by the separator between two lanes.
+    return '\n'.join(live_jobs_feed.final_mask(line, terms) for line in out)
 
 
 def run(policy=None, once=False, interval=2.0, job_id=None, as_json=False, stream=None, sleep=time.sleep,
@@ -145,7 +145,7 @@ def run(policy=None, once=False, interval=2.0, job_id=None, as_json=False, strea
             if job_id:
                 feed = select_job(feed, job_id)
             if as_json:
-                stream.write(json.dumps(feed, indent=2) + '\n')
+                stream.write(live_jobs_feed.emit_feed_json(feed) + '\n')
                 return 0
             columns = width or shutil.get_terminal_size((WIDE, 40)).columns
             frame = render(feed, columns, color=tty, terms=terms)

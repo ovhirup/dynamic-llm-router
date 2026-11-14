@@ -7,7 +7,12 @@ JSON yet), and `<state_dir>/logs/task-output/*.log` to build a redacted, lightwe
     `failed` / `done`), `branch`, `commit`, `log_path`, and `preview` (last 3 redacted output lines).
   - Splits jobs into `running`, `recent` (finished within 30 minutes), and `history`.
   - Never includes secrets or private terms in `preview` or metadata: every string goes through `clean_text`
-    (`normalize_text`, then `mask_text`) before it is clipped or output.
+    (`normalize_text`, then `mask_text`) before it is clipped or output. Serialised JSON gets one more
+    `final_mask` where it is emitted, because a key and a value can form a secret only once they are joined.
+  - Which stamp a job owns is a router record under the jobs directory (`stamps/<job_id>.json`), or
+    `output_stamp` on the saved job. `<stamp>-job.json` claims only reserve a stamp; their contents never
+    choose a lane. A missing record uses the stamp in the job id when that cannot belong to another job,
+    and otherwise an empty lane.
   - A running job's `preview` comes from its newest `<stamp>-a<N>-<worker>.events.jsonl` live events file
     (#288) when one exists, as `"<kind>: <text>"` lines; otherwise from the output log as before.
   - A job's workers, hops and attempt come from `worker_chain` over its worker logs, events files and
@@ -65,6 +70,23 @@ def mask_text(text, terms=()):
     for pattern in _term_patterns(tuple(term for term in (terms or ()) if term)):
         text = pattern.sub(security.REDACTED, text)
     return text
+
+
+def final_mask(text, terms=()):
+    """`mask_text` for a string assembled after per-field cleaning. A second call is a no-op.
+
+    Joining fields (a serialised `"password": "..."` pair, or two watch lanes) can create a secret or a
+    private term that no single field contained."""
+    return mask_text('' if text is None else str(text), terms)
+
+
+def emit_feed_json(feed, indent=2):
+    """The feed as JSON, then `final_mask` so a secret created by serialising is removed.
+
+    Private terms are not applied here. Values were already cleaned, and a term equal to a schema key
+    (`text`, `worker`, `events`) must not be rewritten or readers such as `watch` break. Secrets are
+    masked in any case, which is what catches a credential-shaped assignment."""
+    return final_mask(json.dumps(feed, indent=indent))
 
 
 def clean_text(text, terms=()):
@@ -133,6 +155,10 @@ def read_bounded(path, limit=TAIL_BYTES):
 
 # An output stamp is the job's start second, plus `-N` when another job claimed that second first (#288).
 _STAMP = r'\d{8}-\d{6}(?:-\d+)?'
+_STAMP_RE = re.compile('^' + _STAMP + '$')
+# Attribution lives here, under the jobs directory: not the output directory (the worker writes logs and
+# events there) and not the job's worktree. Claim files stay in the output directory for reservation only.
+STAMP_RECORD_DIR = 'stamps'
 _ID_RE = re.compile(r'^(?P<repo>.+)-(?P<stamp>\d{8}-\d{6})(?:-\d+)?$')
 _LOG_RE = re.compile(r'^(?P<stamp>' + _STAMP + r')-a(?P<attempt>\d+)-(?P<tail>.+)\.log$')
 _JOB_STAMP_RE = re.compile(r'^(?P<stamp>' + _STAMP + r')-job\.json$')
@@ -277,22 +303,95 @@ def _claimed_stamps(claims):
 
 
 def job_output_stamps(out_dir):
-    """`{job_id: output stamp}` from the `<stamp>-job.json` claims `run_job` makes (#288)."""
+    """`{job_id: output stamp}` from claim files. Reservation bookkeeping only: the feed does not use it.
+
+    A claim's contents are writable with the output directory, so they must not decide which lane shows
+    which events. `read_stamp_records` is that map."""
     return _claimed_stamps(read_claims(out_dir))
 
 
-def _job_stamp(job_id, claimed, claimed_stamps, recorded=None):
-    """The output stamp a job's files use, or '' when none can be named without guessing.
+def _stamp_record_path(jobs_dir, job_id):
+    if (not isinstance(job_id, str) or not job_id or job_id in ('.', '..')
+            or any(char in job_id for char in '/\\') or Path(job_id).name != job_id):
+        return None
+    return Path(jobs_dir) / STAMP_RECORD_DIR / f'{job_id}.json'
 
-    A stamp recorded in the job's JSON wins; then the one claim that names the job; otherwise the id's own
-    start stamp, unless some claim already uses that stamp (then another job's output would be shown)."""
-    if recorded:
-        return str(recorded)
-    if job_id in claimed:
-        return claimed[job_id] or ''
-    match = _ID_RE.match(job_id)
+
+def write_stamp_record(jobs_dir, job_id, stamp):
+    """Record that `job_id` owns `stamp`, where the worker cannot write it. Returns the path, or None.
+
+    The file is `<jobs_dir>/stamps/<job_id>.json`. The worker's cwd is the worktree and its logs go to the
+    output directory; neither is this path. An unsafe id or a stamp that is not an output stamp is refused."""
+    path = _stamp_record_path(jobs_dir, job_id)
+    if path is None or not isinstance(stamp, str) or not _STAMP_RE.fullmatch(stamp):
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, 'w') as handle:
+        json.dump({'job_id': job_id, 'output_stamp': stamp}, handle)
+        handle.write('\n')
+    os.chmod(path, 0o600)
+    return path
+
+
+def delete_stamp_record(jobs_dir, job_id):
+    path = _stamp_record_path(jobs_dir, job_id)
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def read_stamp_records(jobs_dir):
+    """`{job_id: stamp}` written by `write_stamp_record`. Unreadable, truncated, or mismatched records are skipped."""
+    records = {}
+    directory = Path(jobs_dir) / STAMP_RECORD_DIR
+    if not directory.is_dir():
+        return records
+    for path in directory.glob('*.json'):
+        got = read_bounded(path, CLAIM_BYTES)
+        if got is None or got[1]:
+            continue
+        try:
+            data = json.loads(got[0].decode('utf-8', 'replace'))
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        job_id, stamp = data.get('job_id'), data.get('output_stamp')
+        if job_id != path.stem or not isinstance(stamp, str) or not _STAMP_RE.fullmatch(stamp):
+            continue
+        records[job_id] = stamp
+    return records
+
+
+def _job_stamp(job_id, owned, recorded=None, peers=()):
+    """The output stamp a job's files use, or '' when naming one could show another job's events.
+
+    A stamp saved on the job wins, then the router record in `owned` (`{job_id: stamp}`). Claim files are
+    not consulted. Otherwise the stamp embedded in the job id is used only when no record gives that stamp
+    to someone else and no other job without a record embeds it. Ambiguity is an empty lane."""
+    if isinstance(recorded, str) and recorded:
+        return recorded if _STAMP_RE.fullmatch(recorded) else ''
+    theirs = owned.get(job_id) if isinstance(owned, dict) else None
+    if isinstance(theirs, str) and _STAMP_RE.fullmatch(theirs):
+        return theirs
+    match = _ID_RE.match(job_id or '')
     stamp = match.group('stamp') if match else ''
-    return '' if stamp in claimed_stamps else stamp
+    if not stamp:
+        return ''
+    if any(owner != job_id and their == stamp for owner, their in (owned or {}).items()):
+        return ''
+    for peer in peers:
+        if peer == job_id or (owned and peer in owned):
+            continue
+        peer_match = _ID_RE.match(peer or '')
+        if peer_match and peer_match.group('stamp') == stamp:
+            return ''
+    return stamp
 
 
 def _event_records(path, private_terms=(), tail_bytes=TAIL_BYTES):
@@ -522,28 +621,40 @@ def build_live_jobs_feed(policy=None, now=None):
     wt_root = config.policy_path(policy, 'run_job', 'worktree_root', 'worktrees')
     terms = td.private_terms(policy)
     logs_by_stamp = _scan_output_logs(out_dir)
-    claims = read_claims(out_dir)  # read once: the claim map and the set of claimed stamps come from it
-    claimed, claimed_stamps = _claimed_stamps(claims), {stamp for stamp, _ in claims}
     from . import pr_gate
     approvals = pr_gate.approval_records(policy)  # read once per build, not once per job
 
-    all_jobs = []
-    seen_ids = set()
+    saved = []
+    if jobs_dir.is_dir():
+        for path in sorted(jobs_dir.glob('*.json')):
+            got = read_bounded(path, JOB_BYTES)
+            if got is None or got[1]:
+                continue
+            try:
+                data = json.loads(got[0].decode('utf-8', 'replace'))
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(data, dict):
+                saved.append((str(data.get('job_id') or path.stem), data, path))
+    seen_ids = {jid for jid, _, _ in saved}
+    worktrees = []
+    if wt_root.is_dir():
+        for wt in sorted(wt_root.glob('*')):
+            if wt.is_dir() and wt.name not in seen_ids and _ID_RE.match(wt.name):
+                worktrees.append(wt)
+    # Claim files are not read. Ownership is the router record, else a saved output_stamp.
+    owned = read_stamp_records(jobs_dir)
+    for jid, data, _path in saved:
+        recorded = data.get('output_stamp')
+        if isinstance(recorded, str) and _STAMP_RE.fullmatch(recorded):
+            owned[jid] = recorded
+    peers = [jid for jid, _, _ in saved] + [wt.name for wt in worktrees]
 
-    for path in sorted(jobs_dir.glob('*.json')) if jobs_dir.is_dir() else ():
-        got = read_bounded(path, JOB_BYTES)
-        if got is None or got[1]:
-            continue
-        try:
-            data = json.loads(got[0].decode('utf-8', 'replace'))
-        except (ValueError, RecursionError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        jid = str(data.get('job_id') or path.stem)
-        seen_ids.add(jid)
+    all_jobs = []
+
+    for jid, data, path in saved:
         match = _ID_RE.match(jid)
-        stamp = _job_stamp(jid, claimed, claimed_stamps, recorded=data.get('output_stamp'))
+        stamp = _job_stamp(jid, owned, recorded=data.get('output_stamp'), peers=peers)
         sidecar = _read_sidecar(out_dir, stamp)
         info = _worker_info(logs_by_stamp.get(stamp, ()), _events_files(out_dir, stamp), sidecar)
         workers = list(data.get('workers') or info['workers'])
@@ -583,13 +694,9 @@ def build_live_jobs_feed(policy=None, now=None):
             '_sort_ts': (finished_dt or started_dt or datetime.min.replace(tzinfo=timezone.utc)).timestamp(),
         })
 
-    for wt in sorted(wt_root.glob('*')) if wt_root.is_dir() else ():
-        if not wt.is_dir() or wt.name in seen_ids:
-            continue
+    for wt in worktrees:
         match = _ID_RE.match(wt.name)
-        if not match:
-            continue
-        repo_name, stamp = match.group('repo'), _job_stamp(wt.name, claimed, claimed_stamps)
+        repo_name, stamp = match.group('repo'), _job_stamp(wt.name, owned, peers=peers)
         sidecar = _read_sidecar(out_dir, stamp)
         info = _worker_info(logs_by_stamp.get(stamp, ()), _events_files(out_dir, stamp), sidecar)
         started_dt = _stamp_to_dt(match.group('stamp'), zone)

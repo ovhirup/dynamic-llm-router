@@ -817,7 +817,11 @@ def main(argv=None, *, policy=None):
         except job_dispatch.Refused as refusal:
             print(json.dumps({'ok': False, 'refused': str(refusal)}))
             return 3
-        _print(result)
+        if args.command == 'jobs' and getattr(args, 'live_feed', False):
+            from . import live_jobs_feed
+            print(live_jobs_feed.emit_feed_json(result))
+        else:
+            _print(result)
         if result.get('status') == 'handoff_to_orchestrator':
             return 0
         return 3 if result.get('status') == 'refused' else 0 if result.get('ok', True) else 1
