@@ -1424,12 +1424,12 @@ def _inodes(root):
 
 
 def _run_mutant(guard, test):
-    source = Path(job_git.__file__).read_text()
+    repo = Path(__file__).resolve().parents[1]
+    source = (repo / 'src' / 'llm_router' / 'job_git.py').read_text()
     pattern = re.compile(r'^[ \t]*# guard:%s\n.*?^[ \t]*# endguard:%s\n' % (guard, guard), re.M | re.S)
     updated, count = pattern.subn('', source)
     if count < 1:
         raise AssertionError('guard %s not found' % guard)
-    repo = Path(job_git.__file__).resolve().parents[2]
     temp = tempfile.TemporaryDirectory(prefix='jobgit-mutant-')
     try:
         dest = Path(temp.name) / 'src'
