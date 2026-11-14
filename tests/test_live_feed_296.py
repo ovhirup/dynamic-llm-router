@@ -1,11 +1,12 @@
 """Issue #296: planted claim files cannot choose a lane, and text assembled after masking is masked again."""
+import contextlib
 import io
 import json
 import re
 import unittest
 
 from test_live_feed_v2 import SECRET, FeedFixture, sidecar_plan
-from llm_router import allocation_dispatch, live_jobs_feed, security, watch
+from llm_router import allocation_dispatch, cli, live_jobs_feed, security, watch
 
 
 class PlantedClaimTests(FeedFixture):
@@ -77,6 +78,37 @@ class PlantedClaimTests(FeedFixture):
         self.assertEqual(self.texts(self.A), ['alpha-events'])
         self.assertEqual(self.texts(self.B), ['beta-events'])
         self.assertNotIn('ghost-events', self.texts(self.A) + self.texts(self.B))
+
+    def _poisoned_stamp_record(self, jobs, out):
+        """A and B own distinct stamps. A's record is then rewritten to B's stamp."""
+        jobs.mkdir(parents=True, exist_ok=True)
+        out.mkdir(parents=True, exist_ok=True)
+        self.policy['run_job']['jobs_dir'] = str(jobs)
+        self.policy['run_task']['output_dir'] = str(out)
+        self.out = out
+        alpha, beta = 'alpha-20261112-175000', 'beta-20261112-175100'
+        stamp_a, stamp_b = '20261112-175000', '20261112-175100'
+        for job_id, stamp, worker, text in (
+                (alpha, stamp_a, 'codex', 'alpha-events'),
+                (beta, stamp_b, 'claude', 'beta-events')):
+            (self.base / 'wt' / job_id).mkdir()
+            live_jobs_feed.write_stamp_record(jobs, job_id, stamp)
+            self.events(stamp, 1, worker, [('message', text)])
+        record = jobs / live_jobs_feed.STAMP_RECORD_DIR / f'{alpha}.json'
+        record.write_text(json.dumps({'job_id': alpha, 'output_stamp': stamp_b}) + '\n')
+        self.assertIn(stamp_b, record.read_text())
+        self.assertEqual(self.texts(alpha), ['alpha-events'])
+        self.assertEqual(self.texts(beta), ['beta-events'])
+        self.assertNotIn('beta-events', self.texts(alpha))
+
+    def test_jobs_dir_inside_output_dir_cannot_rewrite_a_lane(self):
+        out = self.base / 'logs'
+        self._poisoned_stamp_record(out / 'jobs', out)
+
+    def test_output_dir_inside_jobs_dir_cannot_rewrite_a_lane(self):
+        # The output directory is the stamp-record directory, which lives inside jobs_dir.
+        jobs = self.base / 'jobs'
+        self._poisoned_stamp_record(jobs, jobs / live_jobs_feed.STAMP_RECORD_DIR)
 
 
 def _two_lanes(term_now='LEFT'):
@@ -159,6 +191,54 @@ class AssembledTextTests(FeedFixture):
             for line in frame.splitlines():
                 self.assertEqual(line, live_jobs_feed.mask_text(line, terms))
                 self.assertEqual(list(security.find_secrets(line)), [])
+
+    def _assert_stable_json(self, text):
+        try:
+            parsed = json.loads(text)
+        except ValueError as error:
+            self.fail(f'emitted feed is not JSON: {error}')
+        self.assertEqual(list(security.find_secrets(text)), [])
+        self.assertEqual(text.strip(), live_jobs_feed.emit_feed_json(parsed))
+        self.assertEqual(text, live_jobs_feed.final_mask(text))
+
+    def test_an_escaped_quote_in_event_text_stays_valid_json(self):
+        stamp = '20261112-175000'
+        self.running(f'demo-{stamp}', stamp)
+        self.events(stamp, 1, 'codex', [('message', 'AUTH:abc"x')])
+        feed = self.feed()
+        stream = io.StringIO()
+        watch.run(policy=self.policy, once=True, as_json=True, stream=stream, build=lambda **_kw: feed)
+        self._assert_stable_json(stream.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(['jobs', '--live-feed'], policy=self.policy)
+        self.assertEqual(code, 0)
+        self._assert_stable_json(out.getvalue())
+
+    def test_a_non_ascii_value_that_is_not_a_secret_is_not_masked(self):
+        stamp = '20261112-175000'
+        self.running(f'demo-{stamp}', stamp)
+        self.events(stamp, 1, 'codex', [('message', 'TOKEN=é b'), ('message', 'é')])
+        out = live_jobs_feed.emit_feed_json(self.feed())
+        self.assertIn('TOKEN=é b', out)
+        self.assertIn('"é"', out)
+        self.assertEqual(list(security.find_secrets(out)), [])
+        self.assertEqual(out, live_jobs_feed.emit_feed_json(json.loads(out)))
+        self.assertEqual(out, live_jobs_feed.final_mask(out))
+
+    def test_a_term_joined_across_lanes_cannot_leave_a_secret_shaped_line(self):
+        terms = ('AB │ ▶ RIGHT',)
+        for pad in range(30, 46):
+            left = {'repo': 'demo', 'worker': 'codex', 'workers': ['codex'], 'elapsed_seconds': 0,
+                    'state': 'running', 'now': 'x' * pad + ' PASSWORD=AB', 'events': [], 'gates': {}}
+            right = {**left, 'now': 'RIGHTzzzz'}
+            feed = {'updated_at': '2026-11-12T18:00:00+00:00', 'running': [left, right],
+                    'recent': [], 'history': []}
+            for width in (100, 160):
+                with self.subTest(pad=pad, width=width):
+                    for line in watch.render(feed, width, terms=terms).splitlines():
+                        self.assertEqual(line, live_jobs_feed.mask_text(line, terms))
+                        self.assertEqual(list(security.find_secrets(line)), [])
 
 
 if __name__ == '__main__':

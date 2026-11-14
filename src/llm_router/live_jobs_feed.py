@@ -7,12 +7,14 @@ JSON yet), and `<state_dir>/logs/task-output/*.log` to build a redacted, lightwe
     `failed` / `done`), `branch`, `commit`, `log_path`, and `preview` (last 3 redacted output lines).
   - Splits jobs into `running`, `recent` (finished within 30 minutes), and `history`.
   - Never includes secrets or private terms in `preview` or metadata: every string goes through `clean_text`
-    (`normalize_text`, then `mask_text`) before it is clipped or output. Serialised JSON gets one more
-    `final_mask` where it is emitted, because a key and a value can form a secret only once they are joined.
+    (`normalize_text`, then `mask_text`) before it is clipped or output. `emit_feed_json` checks the data
+    again before `json.dumps`, because a key and a value can form a secret only once they are joined.
   - Which stamp a job owns is a router record under the jobs directory (`stamps/<job_id>.json`), or
     `output_stamp` on the saved job. `<stamp>-job.json` claims only reserve a stamp; their contents never
-    choose a lane. A missing record uses the stamp in the job id when that cannot belong to another job,
-    and otherwise an empty lane.
+    choose a lane. Records are ignored when that directory, the output directory, and the worktree root
+    are not pairwise separate.
+    A missing record uses the stamp in the job id when that cannot belong to another job, and otherwise
+    an empty lane.
   - A running job's `preview` comes from its newest `<stamp>-a<N>-<worker>.events.jsonl` live events file
     (#288) when one exists, as `"<kind>: <text>"` lines; otherwise from the output log as before.
   - A job's workers, hops and attempt come from `worker_chain` over its worker logs, events files and
@@ -33,6 +35,7 @@ RECENT_WINDOW_SECONDS = 30 * 60
 STALE_IN_FLIGHT_SECONDS = 6 * 3600
 TESTS_SETTLED_SECONDS = 15
 PREVIEW_LINES = 3
+_MASK_PASSES = 4
 TAIL_BYTES = 8192
 CLAIM_BYTES = 4096
 SIDECAR_BYTES = 256 * 1024
@@ -65,28 +68,76 @@ def _term_patterns(terms):
 
 
 def mask_text(text, terms=()):
-    """`text` with secrets (`security.redact`) and every private term replaced by `security.REDACTED`."""
-    text = security.redact(text)
-    for pattern in _term_patterns(tuple(term for term in (terms or ()) if term)):
-        text = pattern.sub(security.REDACTED, text)
+    """`text` with secrets (`security.redact`) and every private term replaced by `security.REDACTED`.
+
+    Secrets are masked before terms. Replacing a term can join with the characters beside it and form a
+    new secret-shaped span, so the two steps repeat until the line stops changing, at most `_MASK_PASSES`
+    times."""
+    patterns = _term_patterns(tuple(term for term in (terms or ()) if term))
+    for _ in range(_MASK_PASSES):
+        cleaned = security.redact(text)
+        for pattern in patterns:
+            cleaned = pattern.sub(security.REDACTED, cleaned)
+        if cleaned == text:
+            return cleaned
+        text = cleaned
     return text
 
 
 def final_mask(text, terms=()):
     """`mask_text` for a string assembled after per-field cleaning. A second call is a no-op.
 
-    Joining fields (a serialised `"password": "..."` pair, or two watch lanes) can create a secret or a
-    private term that no single field contained."""
+    Joining two watch lanes can create a secret or a private term that no single field contained.
+    Serialised JSON is not masked here: `emit_feed_json` does that on the data, so the text stays valid."""
     return mask_text('' if text is None else str(text), terms)
 
 
+def _json_text(value):
+    """`value` as a JSON token, with non-ASCII left as itself.
+
+    The default `json.dumps` writes `é` as `\\u00e9`. That escape is long enough for an assignment such as
+    `TOKEN=é` to look like a secret, which it is not."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _secret_shaped(text):
+    return security.redact(text) != text
+
+
+def _mask_json_value(value, depth=0):
+    """Replace strings that are secret-shaped on their own or once they are JSON-encoded.
+
+    A dict value is also replaced when `json.dumps(key) + ': ' + json.dumps(value)` is secret-shaped, which
+    is how a `password` key and a plain value become a credential only in the document. The whole string
+    becomes `security.REDACTED`. Rewriting the encoded text would delete escape characters and leave JSON
+    that does not parse. Dict keys are left as they are."""
+    if depth > _MAX_DEPTH:
+        return security.REDACTED
+    if isinstance(value, str):
+        if _secret_shaped(value) or _secret_shaped(_json_text(value)):
+            return security.REDACTED
+        return value
+    if isinstance(value, list):
+        return [_mask_json_value(item, depth + 1) for item in value]
+    if isinstance(value, dict):
+        masked = {}
+        for key, item in value.items():
+            if (isinstance(key, str) and isinstance(item, str)
+                    and _secret_shaped(_json_text(key) + ': ' + _json_text(item))):
+                masked[key] = security.REDACTED
+            else:
+                masked[key] = _mask_json_value(item, depth + 1)
+        return masked
+    return value
+
+
 def emit_feed_json(feed, indent=2):
-    """The feed as JSON, then `final_mask` so a secret created by serialising is removed.
+    """The feed as JSON. A secret created by pairing a key with a value is removed from the data first.
 
     Private terms are not applied here. Values were already cleaned, and a term equal to a schema key
-    (`text`, `worker`, `events`) must not be rewritten or readers such as `watch` break. Secrets are
-    masked in any case, which is what catches a credential-shaped assignment."""
-    return final_mask(json.dumps(feed, indent=indent))
+    (`text`, `worker`, `events`) must not be rewritten or readers such as `watch` break. The result parses,
+    `security.find_secrets` finds nothing in it, and emitting the parsed value again is the same text."""
+    return json.dumps(_mask_json_value(feed), indent=indent, ensure_ascii=False)
 
 
 def clean_text(text, terms=()):
@@ -368,6 +419,23 @@ def read_stamp_records(jobs_dir):
     return records
 
 
+def _paths_overlap(left, right):
+    """True when either resolved path is the other or contained in it."""
+    left, right = Path(left).resolve(), Path(right).resolve()
+    return left.is_relative_to(right) or right.is_relative_to(left)
+
+
+def _stamp_records_untrusted(jobs_dir, output_dir, worktree_root):
+    """True when `jobs_dir/stamps`, the output directory, or the worktree root overlap.
+
+    The worker can write the output directory and the worktree. A stamp record inside either is not
+    router-owned, and neither is a layout where those two directories are the same tree. The feed then
+    ignores records and uses the job-id rule, which is empty when that stamp could belong to someone else."""
+    stamps = Path(jobs_dir) / STAMP_RECORD_DIR
+    paths = (stamps, output_dir, worktree_root)
+    return any(_paths_overlap(paths[i], paths[j]) for i in range(len(paths)) for j in range(i + 1, len(paths)))
+
+
 def _job_stamp(job_id, owned, recorded=None, peers=()):
     """The output stamp a job's files use, or '' when naming one could show another job's events.
 
@@ -643,7 +711,8 @@ def build_live_jobs_feed(policy=None, now=None):
             if wt.is_dir() and wt.name not in seen_ids and _ID_RE.match(wt.name):
                 worktrees.append(wt)
     # Claim files are not read. Ownership is the router record, else a saved output_stamp.
-    owned = read_stamp_records(jobs_dir)
+    # Nested dirs would let whoever writes the output dir or the worktree rewrite the record.
+    owned = {} if _stamp_records_untrusted(jobs_dir, out_dir, wt_root) else read_stamp_records(jobs_dir)
     for jid, data, _path in saved:
         recorded = data.get('output_stamp')
         if isinstance(recorded, str) and _STAMP_RE.fullmatch(recorded):
