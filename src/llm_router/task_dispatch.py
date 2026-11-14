@@ -15,7 +15,9 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -320,18 +322,141 @@ def delivery(policy, worker):
     return mode
 
 
+def _prompt_name(stamp, worker):
+    """Fresh basename for one prompt write. Callers keep the `{stamp}-{worker}` prefix and `.md` suffix."""
+    return f'{stamp}-{worker}-{secrets.token_hex(8)}.md'
+
+
+def _refuse_directory(directory):
+    try:
+        info = os.lstat(directory)
+    except OSError:
+        return 'prompt path is a symlink or not a directory'
+    if stat.S_ISLNK(info.st_mode):
+        return 'prompt path is a symlink'
+    if not stat.S_ISDIR(info.st_mode):
+        return 'prompt path is not a directory'
+    return 'prompt path is a symlink or not a directory'
+
+
+def _classify_prompt(dir_fd, name):
+    try:
+        info = os.lstat(name, dir_fd=dir_fd)
+    except OSError:
+        return 'prompt path is a symlink, hard link, or not a regular file'
+    if stat.S_ISLNK(info.st_mode):
+        return 'prompt path is a symlink'
+    if not stat.S_ISREG(info.st_mode):
+        return 'prompt path is not a regular file'
+    if info.st_nlink != 1:
+        return 'prompt path is a hard link'
+    return 'prompt path is a symlink, hard link, or not a regular file'
+
+
+def _write_all(fd, payload):
+    view = memoryview(payload)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def _open_directory_nofollow(directory):
+    """Directory fd for `directory`. A final-component symlink is refused. Caller closes the fd."""
+    try:
+        return os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise Refused(_refuse_directory(directory)) from error
+
+
+def _open_prompt_directory(directory):
+    """Create `router-prompts` at 0700, refuse a symlink, and return a directory fd. Caller closes it."""
+    try:
+        os.mkdir(directory, 0o700)
+    except FileExistsError:
+        pass
+    try:
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise Refused(_refuse_directory(directory)) from error
+    try:
+        os.fchmod(descriptor, 0o700)
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise Refused('prompt path is not a directory')
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _create_prompt(dir_fd, name, text):
+    """Create a new 0600 regular file (one link) under `dir_fd`. An existing name is refused."""
+    try:
+        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                             dir_fd=dir_fd)
+    except OSError as error:
+        raise Refused(_classify_prompt(dir_fd, name)) from error
+    try:
+        os.fchmod(descriptor, 0o600)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise Refused('prompt path is a hard link or not a regular file')
+        _write_all(descriptor, text.encode())
+    except BaseException:
+        os.close(descriptor)
+        try:
+            os.unlink(name, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+    os.close(descriptor)
+
+
+def _replace_prompt(dir_fd, name, text):
+    """Rewrite `name` under `dir_fd` only when it is a regular file with one link."""
+    try:
+        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    except OSError as error:
+        raise Refused(_classify_prompt(dir_fd, name)) from error
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise Refused('prompt path is not a regular file')
+        if info.st_nlink != 1:
+            raise Refused('prompt path is a hard link')
+        os.ftruncate(descriptor, 0)
+        _write_all(descriptor, text.encode())
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+
+
+def write_replaced_prompt(directory, name, text):
+    """Write `name` inside `directory` without following a symlink or a hard link."""
+    directory = Path(directory)
+    dir_fd = _open_directory_nofollow(directory)
+    try:
+        _replace_prompt(dir_fd, name, text)
+    finally:
+        os.close(dir_fd)
+    return directory / name
+
+
 def write_prompt_file(cwd, stamp, worker, prompt):
-    """0600 prompt file inside the checkout's git dir: never in the diff or untracked list."""
+    """0600 prompt file inside the checkout's git dir: never in the diff or untracked list.
+
+    Each write uses a fresh name. A symlinked prompts directory, or a symlink or hard link at
+    that name, is refused before any byte is written.
+    """
     git_dir = _git(cwd, 'rev-parse', '--absolute-git-dir').stdout.strip()
     directory = Path(git_dir) / 'router-prompts'
-    directory.mkdir(mode=0o700, exist_ok=True)
-    os.chmod(directory, 0o700)
-    path = directory / f'{stamp}-{worker}.md'
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'w') as handle:
-        handle.write(prompt)
-    os.chmod(path, 0o600)
-    return path
+    name = _prompt_name(stamp, worker)
+    dir_fd = _open_prompt_directory(directory)
+    try:
+        _create_prompt(dir_fd, name, prompt)
+    finally:
+        os.close(dir_fd)
+    return directory / name
 
 
 def developer_draft(policy, prompt, opener=None):
@@ -695,6 +820,7 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                                                     private_terms=private_terms(policy))
                 except OSError:
                     summary['warnings'].append(f'{name}: live events unavailable (events file not writable)')
+            prompt_error = None
             try:
                 timeout = policy['run_task']['timeouts_seconds'][name]
                 elapsed = 0
@@ -703,7 +829,14 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                 while True:
                     check_prompt_size(policy, invocation_prompt)
                     if mode in ('file', 'pointer'):
-                        prompt_file = write_prompt_file(cwd, stamp, name, invocation_prompt)
+                        try:
+                            new_prompt = write_prompt_file(cwd, stamp, name, invocation_prompt)
+                        except (Refused, OSError) as error:
+                            prompt_error = error
+                            break
+                        if prompt_file is not None:
+                            prompt_file.unlink(missing_ok=True)
+                        prompt_file = new_prompt
                     sink_token = LINE_SINK.set(events.feed if events is not None else None)
                     try:
                         result = runner(build_argv(policy, name, run_cwd, prompt_file,
@@ -731,14 +864,15 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                         task, chosen_effort, timeout, elapsed=round(elapsed, 1),
                         prefix=policy['run_task']['prompt_prefix'], extra=hop_extra,
                         tail=claude_tail, open_items=final['open_items'])
-                if name == 'claude':
-                    record['continuations'] = continuation
-                    result['elapsed_seconds'] = elapsed
-                from . import eval_corpus
-                extracted_tokens = eval_corpus.extract_tokens_from_text(
-                    '\n'.join(item.get('stdout', '') for item in logs))
-                if extracted_tokens is not None:
-                    record['tokens'] = extracted_tokens
+                if prompt_error is None:
+                    if name == 'claude':
+                        record['continuations'] = continuation
+                        result['elapsed_seconds'] = elapsed
+                    from . import eval_corpus
+                    extracted_tokens = eval_corpus.extract_tokens_from_text(
+                        '\n'.join(item.get('stdout', '') for item in logs))
+                    if extracted_tokens is not None:
+                        record['tokens'] = extracted_tokens
             finally:
                 if events is not None:
                     events.close()
@@ -748,6 +882,17 @@ def _run_task(task_file, cwd, size='full', worker=None, allow_dirty=False, selec
                     actions = [handoff_restore(cwd, snap) for snap in snapshots]
                     summary['handoff_cleanup'] = (actions[0] if len(actions) == 1 else
                                                   {snap['name']: act for snap, act in zip(snapshots, actions)})
+            if prompt_error is not None:
+                message = str(prompt_error)
+                record.update(ok=False, error=message, failure_reason=message, prompt_delivery=mode,
+                              stderr_tail=message)
+                record['reason'] = hop_reason(record)
+                record['output_path'] = str(path)
+                path.write_text(security.redact(message))
+                summary['attempts'].append(record)
+                summary.update(worker=name, ok=False, output_path=str(path), stackwich=record['stackwich'])
+                summary['warnings'].append(message)
+                break
             record['prompt_delivery'] = mode
             path.write_text(security.redact_lines('\n'.join(
                 '$ exit=%s timed_out=%s elapsed=%ss\n--- stdout\n%s\n--- stderr\n%s\n' % (
