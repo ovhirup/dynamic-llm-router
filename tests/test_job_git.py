@@ -1273,6 +1273,24 @@ class JobGitTests(unittest.TestCase):
     def test_create_retries_a_clone_that_lost_a_race(self):
         real = JobGit._git
         clones = []
+        # Keep the raced blob loose so deleting the clone's copy is a real gap.
+        git(self.source, 'config', 'maintenance.auto', 'false')
+        git(self.source, 'config', 'gc.auto', '0')
+        oid = blob_oid(b'hello\n')
+        source_loose = self.source / '.git' / 'objects' / oid[:2] / oid[2:]
+        self.assertTrue(source_loose.is_file())
+        self.assertEqual(list((self.source / '.git' / 'objects' / 'pack').glob('*.pack')), [])
+
+        def missing(this, *args, **kwargs):
+            result = real(this, *args, **kwargs)
+            if args[0] == 'clone':
+                clones.append(args)
+                if len(clones) == 1:
+                    loose = this.git_dir / 'objects' / oid[:2] / oid[2:]
+                    self.assertTrue(loose.is_file())
+                    self.assertEqual(list((this.git_dir / 'objects' / 'pack').glob('*.pack')), [])
+                    loose.unlink()
+            return result
 
         def flaky(this, *args, **kwargs):
             if args[0] == 'clone':
@@ -1282,25 +1300,38 @@ class JobGitTests(unittest.TestCase):
                     raise job_git.JobGitRefused('git clone failed')
             return real(this, *args, **kwargs)
 
-        with patch.object(JobGit, '_git', flaky):
-            instance, path = self.make()
-        self.assertEqual(len(clones), 3)
-        self.assertFalse((instance.git_dir / 'partial').exists())
-        self.assertEqual(instance.snapshot(path), self.base_tree())
-
         def broken(this, *args, **kwargs):
             if args[0] == 'clone':
                 clones.append(args)
                 raise job_git.JobGitRefused('git clone failed')
             return real(this, *args, **kwargs)
 
-        before = len(clones)
-        with patch.object(JobGit, '_git', broken):
-            with self.assertRaises(job_git.JobGitRefused) as caught:
-                self.make()
-        self.assertEqual(str(caught.exception), 'git clone failed')
-        self.assertEqual(len(clones) - before, 3)
-        self.assertFalse((self.root / 'state' / 'job-git' / f'job-{self.count}.git').exists())
+        with patch('llm_router.job_git.time.sleep') as sleep:
+            with patch.object(JobGit, '_git', missing):
+                instance, path = self.make()
+            self.assertEqual(len(clones), 2)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [1])
+            self.assertTrue(source_loose.is_file())
+            self.assertEqual(instance.snapshot(path), self.base_tree())
+
+            clones.clear()
+            sleep.reset_mock()
+            with patch.object(JobGit, '_git', flaky):
+                instance, path = self.make()
+            self.assertEqual(len(clones), 3)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+            self.assertFalse((instance.git_dir / 'partial').exists())
+            self.assertEqual(instance.snapshot(path), self.base_tree())
+
+            sleep.reset_mock()
+            before = len(clones)
+            with patch.object(JobGit, '_git', broken):
+                with self.assertRaises(job_git.JobGitRefused) as caught:
+                    self.make()
+            self.assertEqual(str(caught.exception), 'git clone failed')
+            self.assertEqual(len(clones) - before, 3)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+            self.assertFalse((self.root / 'state' / 'job-git' / f'job-{self.count}.git').exists())
 
     def test_two_thousand_unchanged_files_stay_fast(self):
         folder = self.root / 'bulk-src'

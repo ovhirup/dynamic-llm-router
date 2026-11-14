@@ -351,15 +351,18 @@ class JobGit:
             created = True
             os.chmod(directory, 0o700)
             # Background maintenance in the source can pack loose objects away while
-            # the copy runs; the clone then fails with a missing file. Start again.
+            # the copy runs. The clone then fails with a missing file, or it returns
+            # without a reachable object. Start again.
             for attempt in range(_CLONE_ATTEMPTS):
                 try:
                     instance._git('clone', '--bare', '--local', '--no-hardlinks', '--template=',
                                   '--', str(Path(source_repo).absolute()), str(directory))
+                    instance._git('rev-list', '--objects', '--all')
                     break
                 except JobGitRefused:
                     if attempt + 1 == _CLONE_ATTEMPTS:
                         raise
+                    time.sleep(attempt + 1)
                     shutil.rmtree(directory)
                     directory.mkdir(mode=0o700)
                     os.chmod(directory, 0o700)
