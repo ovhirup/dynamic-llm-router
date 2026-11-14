@@ -14,8 +14,9 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from llm_router import job_git
 from llm_router.job_git import JobGit, JobGitRefused
@@ -49,6 +50,26 @@ def _mkfifo_at(directory, name, root):
     else:
         assert os.path.samestat(os.fstat(directory), os.stat(root))
         os.mkfifo(root / name)
+
+
+def _bind_unix_socket(sock, entry):
+    # sun_path is about 104 bytes. A long TMPDIR still has to leave a real socket at entry.
+    try:
+        sock.bind(str(entry))
+    except OSError as exc:
+        if 'too long' not in str(exc) and exc.errno != errno.ENAMETOOLONG:
+            raise
+        short = tempfile.mkdtemp(dir='/tmp')
+        try:
+            name = os.path.join(short, 's')
+            sock.bind(name)
+            os.rename(name, entry)
+        finally:
+            leftover = os.path.join(short, 's')
+            if os.path.lexists(leftover):
+                os.unlink(leftover)
+            os.rmdir(short)
+    assert stat.S_ISSOCK(os.lstat(entry).st_mode)
 
 
 class JobGitTests(unittest.TestCase):
@@ -292,7 +313,7 @@ class JobGitTests(unittest.TestCase):
                 elif kind == 'socket':
                     sock = __import__('socket').socket(__import__('socket').AF_UNIX)
                     self.addCleanup(sock.close)
-                    sock.bind(str(entry))
+                    _bind_unix_socket(sock, entry)
                 elif kind == 'device':
                     try:
                         os.mknod(entry, stat.S_IFCHR | 0o600, os.makedev(1, 3))
@@ -1320,7 +1341,10 @@ class JobGitTests(unittest.TestCase):
                 raise job_git.JobGitRefused('git clone failed')
             return real(this, *args, **kwargs)
 
-        with patch('llm_router.job_git.time.sleep') as sleep:
+        fake_time = types.SimpleNamespace(**{n: getattr(time, n) for n in dir(time) if not n.startswith('_')})
+        fake_time.sleep = Mock()
+        sleep = fake_time.sleep
+        with patch.object(job_git, 'time', fake_time):
             with patch.object(JobGit, '_git', missing):
                 instance, path = self.make()
             self.assertEqual(len(clones), 2)
