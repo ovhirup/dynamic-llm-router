@@ -70,14 +70,16 @@ def _term_patterns(terms):
 def mask_text(text, terms=()):
     """`text` with secrets (`security.redact`) and every private term replaced by `security.REDACTED`.
 
-    Secrets are masked before terms. Replacing a term can join with the characters beside it and form a
-    new secret-shaped span, so the two steps repeat until the line stops changing, at most `_MASK_PASSES`
-    times."""
+    Secrets are masked before terms. A term pattern is applied only between existing placeholders, once
+    per pattern per pass, so a term that occurs inside `security.REDACTED` is not replaced again.
+    Replacing a term can join with the characters beside it and form a new secret-shaped span, so the two
+    steps repeat until the line stops changing, at most `_MASK_PASSES` times."""
     patterns = _term_patterns(tuple(term for term in (terms or ()) if term))
     for _ in range(_MASK_PASSES):
         cleaned = security.redact(text)
         for pattern in patterns:
-            cleaned = pattern.sub(security.REDACTED, cleaned)
+            cleaned = security.REDACTED.join(
+                pattern.sub(security.REDACTED, part) for part in cleaned.split(security.REDACTED))
         if cleaned == text:
             return cleaned
         text = cleaned
@@ -104,13 +106,28 @@ def _secret_shaped(text):
     return security.redact(text) != text
 
 
+def _masked_dict_key(key, taken):
+    """`key`, or `security.REDACTED` when the key is secret-shaped raw or as a JSON token.
+
+    A second key that collapses to a name already stored gets `-2`, then `-3`, and so on, so the entry
+    is kept."""
+    if isinstance(key, str) and (_secret_shaped(key) or _secret_shaped(_json_text(key))):
+        key = security.REDACTED
+    if not isinstance(key, str) or key not in taken:
+        return key
+    number = 2
+    while f'{key}-{number}' in taken:
+        number += 1
+    return f'{key}-{number}'
+
+
 def _mask_json_value(value, depth=0):
     """Replace strings that are secret-shaped on their own or once they are JSON-encoded.
 
     A dict value is also replaced when `json.dumps(key) + ': ' + json.dumps(value)` is secret-shaped, which
-    is how a `password` key and a plain value become a credential only in the document. The whole string
-    becomes `security.REDACTED`. Rewriting the encoded text would delete escape characters and leave JSON
-    that does not parse. Dict keys are left as they are."""
+    is how a `password` key and a plain value become a credential only in the document. A string key gets
+    the same check as a string value. The whole string becomes `security.REDACTED`. Rewriting the encoded
+    text would delete escape characters and leave JSON that does not parse."""
     if depth > _MAX_DEPTH:
         return security.REDACTED
     if isinstance(value, str):
@@ -122,11 +139,12 @@ def _mask_json_value(value, depth=0):
     if isinstance(value, dict):
         masked = {}
         for key, item in value.items():
+            stored = _masked_dict_key(key, masked)
             if (isinstance(key, str) and isinstance(item, str)
                     and _secret_shaped(_json_text(key) + ': ' + _json_text(item))):
-                masked[key] = security.REDACTED
+                masked[stored] = security.REDACTED
             else:
-                masked[key] = _mask_json_value(item, depth + 1)
+                masked[stored] = _mask_json_value(item, depth + 1)
         return masked
     return value
 
@@ -419,10 +437,75 @@ def read_stamp_records(jobs_dir):
     return records
 
 
+def _casefold_parts(path):
+    """Resolved path as NFC, case-folded components. Letter case is not a different directory."""
+    folded = unicodedata.normalize('NFC', str(Path(path).resolve())).casefold()
+    return Path(folded).parts
+
+
+def _casefold_prefix(left, right):
+    """True when one case-folded path equals the other or is a component-wise prefix of it."""
+    a, b = _casefold_parts(left), _casefold_parts(right)
+    if len(a) > len(b):
+        a, b = b, a
+    return a == b[:len(a)]
+
+
+def _dir_identity(path):
+    """`(st_dev, st_ino)` of `path`, following links the way `os.path.samefile` does, or None."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def _nearest_identity(path):
+    """Identity of `path` when it exists, otherwise of the nearest existing ancestor."""
+    current = Path(path)
+    while True:
+        identity = _dir_identity(current)
+        if identity is not None:
+            return identity
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def _ancestor_identities(path):
+    """Identities of `path`, when it exists, and of every existing ancestor."""
+    found = set()
+    current = Path(path)
+    while True:
+        identity = _dir_identity(current)
+        if identity is not None:
+            found.add(identity)
+        parent = current.parent
+        if parent == current:
+            return found
+        current = parent
+
+
+def _same_existing_directory(left, right):
+    """True when one path's nearest existing directory is the other path or an existing ancestor of it."""
+    left_id, right_id = _nearest_identity(left), _nearest_identity(right)
+    if left_id is None or right_id is None:
+        return False
+    return left_id in _ancestor_identities(right) or right_id in _ancestor_identities(left)
+
+
 def _paths_overlap(left, right):
-    """True when either resolved path is the other or contained in it."""
+    """True when either path is the other or contained in it, including another spelling of that path.
+
+    A case-folded component prefix counts, and so does the same directory by device and inode. An extra
+    overlap only makes the feed ignore stamp records."""
     left, right = Path(left).resolve(), Path(right).resolve()
-    return left.is_relative_to(right) or right.is_relative_to(left)
+    if left.is_relative_to(right) or right.is_relative_to(left):
+        return True
+    if _casefold_prefix(left, right):
+        return True
+    return _same_existing_directory(left, right)
 
 
 def _stamp_records_untrusted(jobs_dir, output_dir, worktree_root):

@@ -110,6 +110,11 @@ class PlantedClaimTests(FeedFixture):
         jobs = self.base / 'jobs'
         self._poisoned_stamp_record(jobs, jobs / live_jobs_feed.STAMP_RECORD_DIR)
 
+    def test_case_variant_output_dir_cannot_rewrite_a_lane(self):
+        # `<base>/LOGS` and `<base>/logs/jobs` are one tree on a case-insensitive disk, and the case-folded
+        # prefix says they overlap on a case-sensitive disk too. Not skipped: a skip would not count.
+        self._poisoned_stamp_record(self.base / 'logs' / 'jobs', self.base / 'LOGS')
+
 
 def _two_lanes(term_now='LEFT'):
     """Two running lanes. At width >= 100 the now-row joins as `LEFT │ ▶ RIGHT`."""
@@ -225,6 +230,52 @@ class AssembledTextTests(FeedFixture):
         self.assertEqual(list(security.find_secrets(out)), [])
         self.assertEqual(out, live_jobs_feed.emit_feed_json(json.loads(out)))
         self.assertEqual(out, live_jobs_feed.final_mask(out))
+
+    def test_a_secret_shaped_sidecar_key_is_masked_in_emitted_json(self):
+        stamp = '20261112-175000'
+        self.running(f'demo-{stamp}', stamp)
+        plan = sidecar_plan('codex')
+        plan['reasons'] = {'AUTH:abc"': 'fine'}
+        allocation_dispatch.write_sidecar(self.out, f'{stamp}-a1', {'allocation': plan})
+        feed = self.feed()
+        stream = io.StringIO()
+        watch.run(policy=self.policy, once=True, as_json=True, stream=stream, build=lambda **_kw: feed)
+        self._assert_stable_json(stream.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(['jobs', '--live-feed'], policy=self.policy)
+        self.assertEqual(code, 0)
+        self._assert_stable_json(out.getvalue())
+
+    def test_a_term_inside_the_placeholder_does_not_grow(self):
+        terms = ('Ed',)
+        (self.base / 'terms.txt').write_text('Ed\n')
+        stamp = '20261112-175000'
+        self.running(f'demo-{stamp}', stamp)
+        self.events(stamp, 1, 'codex', [('message', 'handed to Ed for review')])
+        synthetic = {
+            'updated_at': '2026-11-12T18:00:00+00:00',
+            'running': [{
+                'repo': 'demo', 'worker': 'codex', 'workers': ['codex'], 'elapsed_seconds': 0,
+                'state': 'running', 'now': 'note for Ed',
+                'events': [{'ts': '', 'worker': 'codex', 'attempt': 1, 'kind': 'message',
+                            'text': 'handed to Ed for review'}],
+                'gates': {},
+            }],
+            'recent': [], 'history': [],
+        }
+        for source in (self.feed(), synthetic):
+            for width in (80, 100, 160):
+                frame = watch.render(source, width, terms=terms)
+                for line in frame.splitlines():
+                    self.assertEqual(line, live_jobs_feed.mask_text(line, terms))
+                    self.assertEqual(list(security.find_secrets(line)), [])
+                    self.assertLessEqual(len(line), width)
+        repeated = 'Ed ' * 200
+        pattern = live_jobs_feed._term_patterns(terms)[0]
+        once = security.REDACTED.join(
+            pattern.sub(security.REDACTED, part) for part in security.redact(repeated).split(security.REDACTED))
+        self.assertEqual(live_jobs_feed.mask_text(repeated, terms), once)
 
     def test_a_term_joined_across_lanes_cannot_leave_a_secret_shaped_line(self):
         terms = ('AB │ ▶ RIGHT',)
