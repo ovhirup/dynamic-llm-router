@@ -6,6 +6,7 @@ versions follow [SemVer](https://semver.org/) (0.x: minor versions may break con
 ## [Unreleased]
 
 - Add `JobGit`, a router-owned bare repository that snapshots a job directory as plain bytes and publishes one new branch (#213).
+- Refuse to write worker and review prompt files through a symlink or hard link (Related: #298).
 
 - Add job phase traces (#236): spans for plan, dispatch, test, judge, fix, and approval wait record worker,
   model, tokens, a cost estimate, and exit status. Local JSONL is the default export. OTLP is the optional
