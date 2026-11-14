@@ -5,6 +5,7 @@ versions follow [SemVer](https://semver.org/) (0.x: minor versions may break con
 
 ## [Unreleased]
 
+- JobGit: router-side publish fsck, bounded stderr drain in streaming git I/O, and per-file byte caps only on paths changed from base (Related: #303).
 - Add `JobGit`, a router-owned bare repository that snapshots a job directory as plain bytes and publishes one new branch (#213).
 - Refuse to write worker and review prompt files through a symlink or hard link (Related: #298).
 

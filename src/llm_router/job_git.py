@@ -8,10 +8,10 @@ tree, and the only subprocess boundary is `JobGit._git`.
 Job paths are never passed to git (`--stdin-paths`, `--path`, or any path
 argument): git would open them by path and the check-then-open race would return.
 
-`publish` forces `fetch.fsck.hasDotgit=error` and also passes
-`fetch.fsck.skipList=/dev/null`. On git 2.54 that key is multi-valued, so a
-skip list set in the source is still applied. Other per-message
-`fetch.fsck.<id>` settings in the source are not overridden.
+`publish` runs a router-side `fsck --strict` before fetch so a source
+repository cannot weaken object checks during transfer. Fetch still forces
+`fetch.fsck.hasDotgit=error`; other per-message `fetch.fsck.<id>` settings in
+the source are not overridden.
 """
 import hashlib
 import os
@@ -42,6 +42,7 @@ _DEFAULT_CAPS = {'file_bytes': 16 * 1024 * 1024, 'total_bytes': 256 * 1024 * 102
 _CLONE_ATTEMPTS = 3
 _BLOB_MODES = (b'100644', b'100755', b'120000', b'160000')
 _TIMEOUT = 300
+_STDERR_CAP = 64 * 1024
 # `git hash-object -t tree --stdin` of an empty tree, sha1 then sha256.
 _EMPTY_TREE = {
     40: '4b825dc642cb6eb9a060e54bf8d69288fbee4904',
@@ -248,6 +249,21 @@ class JobGit:
 
         thread = threading.Thread(target=feed, daemon=True)
         thread.start()
+
+        def drain_stderr():
+            kept = 0
+            try:
+                while True:
+                    chunk = proc.stderr.read(65536)
+                    if not chunk:
+                        break
+                    if kept < _STDERR_CAP:
+                        kept += min(len(chunk), _STDERR_CAP - kept)
+            except (OSError, ValueError):
+                pass
+
+        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        stderr_thread.start()
         timer = threading.Timer(_TIMEOUT, proc.kill)
         timer.daemon = True
         timer.start()
@@ -271,6 +287,7 @@ class JobGit:
         finally:
             timer.cancel()
             thread.join(timeout=5)
+            stderr_thread.join(timeout=5)
             if proc.poll() is None:
                 proc.kill()
                 try:
@@ -419,6 +436,14 @@ class JobGit:
             listed.append((mode, oid, path))
         return listed
 
+    def _base_blobs(self):
+        try:
+            return self._base_blob_paths
+        except AttributeError:
+            self._base_blob_paths = {path: oid for mode, oid, path in self._entries()
+                                     if mode != b'160000'}
+            return self._base_blob_paths
+
     def _root(self, job_dir):
         try:
             return os.open(job_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -549,10 +574,16 @@ class JobGit:
         walk(root, b'', 1)
         return entries
 
-    def _read_entry(self, directory, name, info, total):
+    def _read_entry(self, directory, name, info, total, base_oid=None):
+        file_cap = self.policy_caps['file_bytes']
         if stat.S_ISLNK(info.st_mode):
             content = os.readlink(os.fsencode(name), dir_fd=directory)
             mode = b'120000'
+            if base_oid is not None:
+                if _blob_id(content, len(self.base_sha)) != base_oid and len(content) > file_cap:
+                    raise JobGitRefused('file byte cap exceeded')
+            elif len(content) > file_cap:
+                raise JobGitRefused('file byte cap exceeded')
         elif stat.S_ISREG(info.st_mode):
             # guard:rule5-nlink
             if info.st_nlink != 1:
@@ -567,20 +598,24 @@ class JobGit:
                         (info.st_dev, info.st_ino, info.st_size, info.st_nlink)):
                     raise JobGitRefused('file changed before open')
                 # endguard:rule3-fstat
-                if actual.st_size > self.policy_caps['file_bytes']:
+                read_cap = actual.st_size if base_oid is not None else file_cap
+                if base_oid is None and actual.st_size > file_cap:
                     raise JobGitRefused('file byte cap exceeded')
-                content = _read_capped(fd, self.policy_caps['file_bytes'])
+                content = _read_capped(fd, read_cap)
             finally:
                 os.close(fd)
             mode = b'100755' if info.st_mode & stat.S_IXUSR else b'100644'
+            if base_oid is not None:
+                if _blob_id(content, len(self.base_sha)) != base_oid and len(content) > file_cap:
+                    raise JobGitRefused('file byte cap exceeded')
+            elif len(content) > file_cap:
+                raise JobGitRefused('file byte cap exceeded')
         else:
             content = b''
             mode = b'100644'
             # guard:rule5-special
             raise JobGitRefused('special file')
             # endguard:rule5-special
-        if len(content) > self.policy_caps['file_bytes']:
-            raise JobGitRefused('file byte cap exceeded')
         total[0] += len(content)
         if total[0] > self.policy_caps['total_bytes']:
             raise JobGitRefused('total byte cap exceeded')
@@ -694,8 +729,11 @@ class JobGit:
                        for path, oid in self._gitlinks.items()]
             path_oids = {}
 
+            base_blobs = self._base_blobs()
+
             def visit(directory, name, path, expected):
-                mode, content = self._read_entry(directory, name, expected, total)
+                mode, content = self._read_entry(directory, name, expected, total,
+                                                 base_blobs.get(path))
                 oid = _blob_id(content, len(self.base_sha))
                 path_oids[path] = oid
                 records.append(mode + b' ' + oid + b'\t' + path + b'\0')
@@ -782,11 +820,13 @@ class JobGit:
         if self._git('for-each-ref', '--format=%(refname)', ref, git_dir=source).strip():
             raise JobGitRefused('publish branch already exists')
         # endguard:publish-exists
+        # guard:publish-strict
+        self._git('-c', 'fsck.hasDotgit=error', 'fsck', '--strict', '--no-dangling', commit_sha)
+        # endguard:publish-strict
         self._git(
             # guard:publish-fsck
             '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true',
             '-c', 'fetch.fsck.hasDotgit=error',
-            '-c', 'fetch.fsck.skipList=/dev/null',
             # endguard:publish-fsck
             # guard:publish-altrefs
             '-c', 'core.alternateRefsCommand=true',
