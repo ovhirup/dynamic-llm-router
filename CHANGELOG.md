@@ -5,6 +5,8 @@ versions follow [SemVer](https://semver.org/) (0.x: minor versions may break con
 
 ## [Unreleased]
 
+- Add `JobGit`, a router-owned bare repository that snapshots a job directory as plain bytes and publishes one new branch (#213).
+
 - Add job phase traces (#236): spans for plan, dispatch, test, judge, fix, and approval wait record worker,
   model, tokens, a cost estimate, and exit status. Local JSONL is the default export. OTLP is the optional
   `otlp` extra, with no new core dependency. `dlr report traces --since` prints p50 and p95 latency and cost
