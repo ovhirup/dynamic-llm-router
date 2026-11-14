@@ -176,7 +176,7 @@ def range_leak_check(policy, repo, base, head, public=False, branch=None, max_by
     content of every changed file at head and the branch name. Missing terms on a public repo = error."""
     terms, allow = _terms(policy), _allow(policy)
     findings = []
-    diff = _git(repo, 'diff', '--no-color', '--no-ext-diff', '-U0', base, head)
+    diff = _git(repo, 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '-U0', base, head)
     log = _git(repo, 'log', '--format=%B', f'{base}..{head}')
     if diff.returncode != 0 or log.returncode != 0:
         return {'status': 'error', 'error': 'git diff/log failed', 'findings': []}
@@ -250,7 +250,8 @@ def review(job_id, policy=None, now=None, screenshot_runner=None):
     os.chmod(out, 0o700)
     stat = _git(repo, 'diff', '--stat', base, head).stdout
     (out / 'diffstat.txt').write_text(stat)
-    (out / 'diff.patch').write_text(security.redact(_git(repo, 'diff', '--no-color', '--no-ext-diff', base, head).stdout))
+    (out / 'diff.patch').write_text(security.redact(
+        _git(repo, 'diff', '--no-color', '--no-ext-diff', '--no-textconv', base, head).stdout))
     parts = []
     for number, test in enumerate(job.get('tests') or [], 1):
         log = Path(test.get('log') or '/nonexistent')
