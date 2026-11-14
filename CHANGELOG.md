@@ -9,6 +9,8 @@ versions follow [SemVer](https://semver.org/) (0.x: minor versions may break con
 - `llm-router check` path-scans empty files inside a populated submodule (#287), committed, staged, or untracked. The reported path masks the private term.
 - `llm-router check` no longer refuses the whole run when a branch removes a submodule that is not checked out (#281). A submodule still recorded at HEAD and not initialized still refuses, before tests or review, as does a populated submodule whose leak scan errors. Re-adding a different repository at the same path refuses when the base commit is not in that repository. Each submodule leak is reported once, under the submodule path, and that location masks private terms. Submodule roots are computed once per check.
 - Leak-scan finding locations mask private terms in the file name (#281).
+- Add `JobGit`, a router-owned bare repository that snapshots a job directory as plain bytes and publishes one new branch (#213).
+- Refuse to write worker and review prompt files through a symlink or hard link (Related: #298).
 
 - Add job phase traces (#236): spans for plan, dispatch, test, judge, fix, and approval wait record worker,
   model, tokens, a cost estimate, and exit status. Local JSONL is the default export. OTLP is the optional
