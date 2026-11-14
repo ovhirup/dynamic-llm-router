@@ -155,19 +155,26 @@ def review_output_text(raw):
 
 
 def _write_prompt(worktree, prompt):
-    """Prompt file under the worktree's git dir, so it never shows up as a change in the unit."""
+    """Prompt file under the worktree's git dir, so it never shows up as a change in the unit.
+
+    A symlink or hard link at the fixed prompt name is refused before the file is truncated.
+    """
+    from . import task_dispatch
     git_dir = Path(_git(worktree, 'rev-parse', '--absolute-git-dir', check=True).stdout.strip())
-    path = git_dir / PROMPT_NAME
-    path.write_text(prompt)
-    path.chmod(0o600)
-    return path
+    return task_dispatch.write_replaced_prompt(git_dir, PROMPT_NAME, prompt)
 
 
 def default_reviewer(name, packet, prompt, policy):
     """claude runs headless in the unit worktree via task_dispatch.run_task; grok-bot is never run by the
     router, so its prompt file is handed to the orchestrator. Returns {'status', 'text'?, 'reason'?, ...}."""
     from . import task_dispatch
-    task_file = _write_prompt(Path(packet['worktree']), prompt)
+    try:
+        task_file = _write_prompt(Path(packet['worktree']), prompt)
+    except task_dispatch.Refused as refusal:
+        return {'status': 'unavailable', 'reason': str(refusal)}
+    except OSError as error:
+        return {'status': 'unavailable',
+                'reason': security.redact(f'{type(error).__name__}: {error}')[:300]}
     if name == 'grok-bot':
         return {'status': 'handoff_to_orchestrator', 'task_file': str(task_file)}
     output = {}
