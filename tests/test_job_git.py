@@ -42,6 +42,15 @@ def blob_oid(payload):
     return hashlib.sha1(b'blob %d\0' % len(payload) + payload).hexdigest()
 
 
+def _mkfifo_at(directory, name, root):
+    # python.org macOS builds lack mkfifoat, so dir_fd raises NotImplementedError.
+    if os.mkfifo in os.supports_dir_fd:
+        os.mkfifo(name, dir_fd=directory)
+    else:
+        assert os.path.samestat(os.fstat(directory), os.stat(root))
+        os.mkfifo(root / name)
+
+
 class JobGitTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -364,7 +373,7 @@ class JobGitTests(unittest.TestCase):
             if name == 'a.txt' and not getattr(swap, 'done', False):
                 swap.done = True
                 os.unlink(name, dir_fd=directory)
-                os.mkfifo(name, dir_fd=directory)
+                _mkfifo_at(directory, name, path)
             return real(directory, name)
 
         outcome = []
@@ -386,6 +395,11 @@ class JobGitTests(unittest.TestCase):
             self.fail('snapshot blocked after the file became a fifo')
         if outcome:
             raise outcome[0]
+
+    def test_swapped_fifo_without_dir_fd_does_not_block(self):
+        without = os.supports_dir_fd - {os.mkfifo}
+        with patch.object(os, 'supports_dir_fd', without):
+            self.test_swapped_fifo_does_not_block()
 
     def test_regular_swap_is_not_hashed(self):
         instance, path = self.make()
