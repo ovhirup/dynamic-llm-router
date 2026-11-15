@@ -6,6 +6,7 @@ versions follow [SemVer](https://semver.org/) (0.x: minor versions may break con
 ## [Unreleased]
 
 - JobGit: router-side publish fsck, bounded stderr drain in streaming git I/O, and per-file byte caps only on paths changed from base (Related: #303).
+- Draft the demo rehearsal: a public sample repository, the command sequence, and an offline end-to-end test. The recording itself is still to be made.
 - Leak scans pass `--no-textconv` on the `git diff` and `git log -p` output they read, so a global textconv driver cannot hide committed bytes (#294).
 - `llm-router check` still blocks a deletion whose path contains a private term (#287). The name remains in the diff and in history, and the finding masks it.
 - `llm-router check` path-scans empty files inside a populated submodule (#287), committed, staged, or untracked. The reported path masks the private term.
