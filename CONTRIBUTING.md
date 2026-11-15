@@ -21,8 +21,11 @@ account unless the CLA changes. DLR is licensed under AGPL-3.0-only, see [LICENS
 ```bash
 python -m venv .venv
 .venv/bin/pip install -e .
-cd tests && ../.venv/bin/python -m unittest discover -t . -s .
+source .venv/bin/activate
+cd tests && python -m unittest discover -t . -s . -v
 ```
+
+The last line is the exact command CI runs. Activate the venv first so `python` is the one with the editable install.
 
 No third-party runtime dependencies, please. Anything new should work with the Python 3.10 standard library.
 
@@ -37,6 +40,7 @@ No third-party runtime dependencies, please. Anything new should work with the P
   screens must be scrubbed captures.
 - **Safety defaults stay safe.** New workers and observers are off by default. Prompts never go in argv.
   Don't read credential files, keychains or cookies, and don't call undocumented billing endpoints.
+- **Link issues honestly.** `Closes #N` only when the PR meets the issue's whole done-check; otherwise `Related: #N`.
 - Keep the gate strict: no force push, `--admin`, `--auto` or branch deletion paths.
 
 ## Adding a worker
