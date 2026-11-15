@@ -125,6 +125,12 @@ class FeedFixture(unittest.TestCase):
         (self.base / 'wt' / job_id).mkdir()
         if stamp:
             (self.out / f'{stamp}-job.json').write_text(json.dumps({'job_id': job_id}))
+            # The feed attributes a lane from this router record, not from the claim file above.
+            # `stamps` matches `live_jobs_feed.STAMP_RECORD_DIR`. Written here, not via that helper,
+            # so the file exists even when an older `src/` is on PYTHONPATH.
+            record = self.base / 'jobs' / 'stamps' / f'{job_id}.json'
+            record.parent.mkdir(parents=True, exist_ok=True)
+            record.write_text(json.dumps({'job_id': job_id, 'output_stamp': stamp}) + '\n')
 
     def events(self, stamp, attempt, worker, items, start=0):
         path = self.out / f'{stamp}-a{attempt}-{worker}.events.jsonl'
@@ -607,17 +613,16 @@ class ReviewRound2Tests(FeedFixture):
 
     JOB, STAMP = 'demo-20261112-175000', '20261112-175000'
 
-    def test_two_claims_for_one_job_show_no_output(self):
+    def test_a_planted_second_claim_cannot_redirect_the_lane(self):
+        # Was: two claims naming one job blanked the lane, because the claim text was the ownership map.
+        # A planted claim is output-directory content. It must not move the lane or hide the recorded stamp.
         self.running(self.JOB, self.STAMP)
         self.events(self.STAMP, 1, 'codex', [('command', 'ls')])
         (self.out / f'{self.STAMP}-2-job.json').write_text(json.dumps({'job_id': self.JOB}))
         self.events(f'{self.STAMP}-2', 1, 'codex', [('command', 'pwd')])
         job = self.find(self.feed(), self.JOB)
-        self.assertEqual(job['events'], [])
-        self.assertIsNone(job['now'])
-        body = json.dumps(job)
-        self.assertNotIn('ls', body)
-        self.assertNotIn('pwd', body)
+        self.assertEqual([event['text'] for event in job['events']], ['ls'])
+        self.assertNotIn('pwd', json.dumps(job))
 
     def test_id_stamp_fallback_never_takes_a_claimed_stamp(self):
         self.running(self.JOB, self.STAMP)
