@@ -420,6 +420,27 @@ def hops(summary):
     return out
 
 
+def reserve_output_stamp(out_dir, stamp, job_id):
+    """Claim a unique output stamp (`stamp`, `stamp-2`, ...) for one job in `out_dir`; return it.
+
+    The claim is an exclusively created `<stamp>-job.json` naming the job, so concurrent jobs (threads or
+    processes, any repo) never get the same stamp. A stamp that older output files already use is skipped."""
+    out_dir = Path(out_dir)
+    n = 1
+    while True:
+        name = stamp if n == 1 else f'{stamp}-{n}'
+        n += 1
+        if any(out_dir.glob(f'{name}-a*')):
+            continue
+        try:
+            fd = os.open(out_dir / f'{name}-job.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, 'w') as handle:
+            json.dump({'job_id': job_id}, handle)
+        return name
+
+
 def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full', worker=None,
             keep=None, policy=None, run_task=td.run_task, select=None, now=None, test_runner=td.run_bounded,
             popen=subprocess.Popen, notifier=None, meter=None, task_class=None,
@@ -482,16 +503,27 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
             raise Refused(f'branch {branch} already exists')
     root = _path(policy, 'worktree_root', 'worktrees')
     prefix = policy['run_job'].get('branch_prefix', 'router/')
-    n = 1
-    while True:  # two jobs started in the same second get a -N suffix
-        suffix = '' if n == 1 else f'-{n}'
-        worktree = root / f'{slugify(repo.name)}-{stamp}{suffix}'
-        candidate = branch or f'{prefix}{slug}-{stamp}{suffix}'
-        if not (worktree.exists() or (_path(policy, 'jobs_dir', 'logs/jobs') / f'{worktree.name}.json').exists()
-                or (branch is None and exists(candidate))):
-            break
-        n += 1
-    branch = candidate
+    from . import live_jobs_feed
+    requested_branch = branch
+
+    def pick_names():
+        """`(worktree, branch)` for the first free job id. A job id is never reused while any output claim
+        names it: a start that crashed, or one that has pruned its worktree and not yet saved its result,
+        still owns its id (#288)."""
+        claimed_ids = {owner for _, owner in live_jobs_feed.read_claims(
+            td._router_path(policy, 'output_dir', 'logs/task-output'))}
+        n = 1
+        while True:  # two jobs started in the same second get a -N suffix
+            suffix = '' if n == 1 else f'-{n}'
+            path = root / f'{slugify(repo.name)}-{stamp}{suffix}'
+            candidate = requested_branch or f'{prefix}{slug}-{stamp}{suffix}'
+            if not (path.exists() or path.name in claimed_ids
+                    or (_path(policy, 'jobs_dir', 'logs/jobs') / f'{path.name}.json').exists()
+                    or (requested_branch is None and exists(candidate))):
+                return path, candidate
+            n += 1
+
+    worktree, branch = pick_names()
     if _git(repo, 'check-ref-format', '--branch', branch).returncode != 0:
         raise Refused(f'invalid branch name {branch!r}')
     job_id = worktree.name
@@ -500,7 +532,7 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
         detected_orch = orch_module.resolve(orchestrator, orchestrator_decision)
     out_dir = td._router_path(policy, 'output_dir', 'logs/task-output')
     out_dir.mkdir(parents=True, exist_ok=True)
-    summary = {'job_id': job_id, 'repo': str(repo), 'task': task_path.name, 'base': base_ref,
+    summary = {'job_id': job_id, 'output_stamp': None, 'repo': str(repo), 'task': task_path.name, 'base': base_ref,
                'base_sha': base_sha, 'branch': branch, 'worktree': str(worktree), 'size': size,
                'orchestrator': detected_orch['orchestrator'], 'orchestrator_reason': detected_orch['reason'],
                'started_at': started.isoformat(timespec='seconds'), 'finished_at': None,
@@ -519,8 +551,29 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
         summary['orchestrator_decision'] = orch_module.decision_summary(orchestrator_decision)
     with RepoLock(_path(policy, 'lock_dir', 'logs/locks'), repo), _NoSleep(policy, popen):
         before = main_state(repo)
+        # The names were picked before the lock was held. Another start in this repository may have used
+        # them and finished in between, so pick again now that no other start here can interleave.
+        worktree, branch = pick_names()
+        if worktree.name != job_id:
+            if requested_branch is not None and exists(requested_branch):
+                raise Refused(f'branch {requested_branch} already exists')
+            job_id = worktree.name
+            summary.update(job_id=job_id, branch=branch, worktree=str(worktree))
         worktree.parent.mkdir(parents=True, exist_ok=True)
-        _git(repo, 'worktree', 'add', '-q', '-b', branch, str(worktree), base_sha, check=True)
+        # Worker logs and live events are named by this stamp; jobs started in the same second (any repo) must
+        # never share it, or they would write into each other's files and show in each other's live lane.
+        # Claimed only once the repo lock is held, and released if the job cannot start, so a refused start
+        # never leaves a claim naming a job it does not belong to. Job ids named by a claim are never handed
+        # out again (see the id loop above), so one claim names each job id.
+        stamp = summary['output_stamp'] = reserve_output_stamp(out_dir, stamp, job_id)
+        try:
+            _git(repo, 'worktree', 'add', '-q', '-b', branch, str(worktree), base_sha, check=True)
+        except BaseException:
+            try:
+                (out_dir / f'{stamp}-job.json').unlink()
+            except OSError:
+                pass
+            raise
         try:
             if not test_cmd:  # detected at base, so the worker cannot choose the command that judges it
                 test_cmd = detect_test_cmd(worktree, repo)
