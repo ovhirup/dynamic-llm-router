@@ -229,24 +229,29 @@ def _submodule_leak_findings(source, root, parent_base, terms, allow, env):
     return findings
 
 
+def _leak_env(env):
+    return security.leak_scan_git_env(env)
+
+
 def _snapshot(repo, scratch, base, head, env, review, populated=None, sub_roots=None):
     populated = [] if populated is None else populated
+    leak_env = _leak_env(env)
     if sub_roots is None:
         sub_roots = _submodule_roots_for_evidence(repo, base, head, env)
     jobs._git(repo, '-c', 'core.hooksPath=/dev/null', 'clone', '--local', '--no-hardlinks',
               '--no-checkout', '--template=', '-c', 'core.hooksPath=/dev/null',
-              '--', str(repo), str(scratch), check=True, env=env)
-    jobs._git(scratch, 'remote', 'remove', 'origin', check=True, env=env)
-    jobs._git(scratch, 'update-ref', 'HEAD', head, check=True, env=env)
-    jobs._git(scratch, 'read-tree', head, check=True, env=env)
-    committed = _diff(scratch, base, env, '--cached', '--text', '-U0')
-    committed_paths = security.changed_paths(scratch, base, cached=True, env=env)
-    staged = _diff(repo, base, env, '--cached', '--text', '-U0')
-    staged_paths = security.changed_paths(repo, base, cached=True, env=env)
-    _copy_files(repo, scratch, env, populated, submodule_roots=sub_roots)
-    jobs._git(scratch, 'add', '--intent-to-add', '--force', '--', '.', check=True, env=env)
-    working = _diff(scratch, base, env, '--text', '-U0')
-    working_paths = security.changed_paths(scratch, base, env=env)
+              '--', str(repo), str(scratch), check=True, env=leak_env)
+    jobs._git(scratch, 'remote', 'remove', 'origin', check=True, env=leak_env)
+    jobs._git(scratch, 'update-ref', 'HEAD', head, check=True, env=leak_env)
+    jobs._git(scratch, 'read-tree', head, check=True, env=leak_env)
+    committed = _diff(scratch, base, leak_env, '--cached', '--text', '-U0')
+    committed_paths = security.changed_paths(scratch, base, cached=True, env=leak_env)
+    staged = _diff(repo, base, leak_env, '--cached', '--text', '-U0')
+    staged_paths = security.changed_paths(repo, base, cached=True, env=leak_env)
+    _copy_files(repo, scratch, leak_env, populated, submodule_roots=sub_roots)
+    jobs._git(scratch, 'add', '--intent-to-add', '--force', '--', '.', check=True, env=leak_env)
+    working = _diff(scratch, base, leak_env, '--text', '-U0')
+    working_paths = security.changed_paths(scratch, base, env=leak_env)
     review_patch = _diff(scratch, base, env) if review else ''
     if review:
         for root in sub_roots:

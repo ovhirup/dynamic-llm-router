@@ -274,24 +274,26 @@ class AmbientDriverTests(unittest.TestCase):
         self.assertFalse(self.marker.exists())
         self.assertNotIn(TERM, self._added_blob())
 
-    def test_clean_filter_committed_check_blocks(self):
+    def test_clean_filter_committed_check_blocks_raw_worktree_line(self):
         self._plant_clean('committed')
         self._expect_check_blocked(*self.check_json())
         self.assertNotIn(TERM, self._added_blob())
 
-    def test_clean_filter_staged_check_blocks(self):
+    def test_clean_filter_staged_check_blocks_raw_worktree_line(self):
         self._plant_clean('staged')
         self._expect_check_blocked(*self.check_json())
+        self.assertNotIn(TERM, self._added_blob())
 
-    def test_clean_filter_working_tree_check_blocks(self):
+    def test_clean_filter_working_tree_check_blocks_raw_worktree_line(self):
         self._plant_clean('working')
         self._expect_check_blocked(*self.check_json())
         self.assertNotIn(TERM, self._added_blob())
 
-    def test_clean_filter_untracked_check_blocks(self):
+    def test_clean_filter_untracked_check_blocks_raw_worktree_line(self):
         self._plant_clean('untracked')
         self._expect_check_blocked(*self.check_json())
         self.assertFalse(self.marker.exists())
+        self.assertNotIn(TERM, self._added_blob())
 
     def test_clean_filter_retroactive_uncached_diff_reads_raw_worktree(self):
         """A blob committed before the clean filter applied still holds the term.
@@ -596,22 +598,6 @@ class AmbientDriverTests(unittest.TestCase):
         self.assertEqual(result['status'], 'blocked_by_leak_check', result)
         self.assertFalse(self.marker.exists())
 
-    def test_clean_filter_run_job_final_leak_check_blocks_staged_secret(self):
-        """Router final cached scan reads worktree bytes and blocks before commit."""
-        self._prepare_run_job()
-        self._install_clean()
-        self._clear_marker()
-        task = self.root / 'task.md'
-        task.write_text('# Stage and commit\n')
-        code = ("open('.gitattributes','w').write('*.txt filter=hide\\n'); "
-                f"open('secret.txt','w').write('{TERM}\\n')")
-        self.policy['run_task']['commands']['codex'] = [sys.executable, '-c', code, '-']
-        select = lambda _chars, **_kw: {'eligible': ['codex'], 'meters': {'codex': 10}, 'reason': 'test'}
-        result = job_dispatch.run_job(self.repo, task, policy=self.policy, test_cmd='true', select=select)
-        self.assertEqual(result['status'], 'blocked_by_leak_check', result)
-        self.assertIsNone(result['commit'])
-        self.assertFalse(self.marker.exists())
-
     def test_clean_filter_run_job_post_worker_leak_check_blocks_untracked_worktree(self):
         """Untracked worktree bytes are read from disk, not through a clean filter."""
         self._prepare_run_job()
@@ -626,6 +612,24 @@ class AmbientDriverTests(unittest.TestCase):
         result = job_dispatch.run_job(self.repo, task, policy=self.policy, test_cmd='true', select=select)
         self.assertEqual(result['status'], 'blocked_by_leak_check', result)
         self.assertFalse(self.marker.exists())
+
+    def test_clean_filter_run_job_final_leak_check_blocks_staged_secret(self):
+        """Final cached scan and router staging ignore ambient clean-filter drivers."""
+        self._prepare_run_job()
+        self._install_clean()
+        self._clear_marker()
+        task = self.root / 'task.md'
+        task.write_text('# Stage filtered blob\n')
+        code = ("open('.gitattributes','w').write('*.txt filter=hide\\n'); "
+                f"open('secret.txt','w').write('{TERM}\\n'); "
+                "import subprocess; subprocess.run(['git','add','-A'], check=True)")
+        self.policy['run_task']['commands']['codex'] = [sys.executable, '-c', code, '-']
+        select = lambda _chars, **_kw: {'eligible': ['codex'], 'meters': {'codex': 10}, 'reason': 'test'}
+        result = job_dispatch.run_job(self.repo, task, policy=self.policy, test_cmd='true', select=select)
+        self.assertEqual(result['status'], 'blocked_by_leak_check', result)
+        self.assertIsNone(result['commit'])
+        self.assertIn('private_term', {item['kind'] for item in (result.get('leak_check') or {}).get('findings', [])})
+        self.assertNotIn(TERM, json.dumps(result))
 
     def test_clean_filter_range_leak_check_reads_stored_blob(self):
         """A commit-to-commit range never runs a clean filter. The stored blob is what the gate sees."""

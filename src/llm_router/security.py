@@ -240,11 +240,16 @@ _LEAK_SCAN_GIT_CONFIG = (
 )
 
 
+_LEAK_SCAN_GIT_ENV_KEEP = ('GIT_ALLOW_PROTOCOL', 'GIT_OPTIONAL_LOCKS', 'GIT_NO_LAZY_FETCH')
+
+
 def leak_scan_git_env(env=None):
     """Strip ambient Git config so leak scans never run textconv, filter or diff drivers."""
     from . import job_dispatch as jobs
 
-    return jobs._isolated_git_env(env)
+    extra = {key: value for key, value in (env or {}).items()
+             if not key.startswith('GIT_') or key in _LEAK_SCAN_GIT_ENV_KEEP}
+    return jobs._isolated_git_env(extra or None)
 
 
 def _leak_git(cwd, *args, env=None, **kwargs):
@@ -323,9 +328,18 @@ def _diff_path_name(header):
 
 def _added_lines(cwd, base, cached=False):
     """Map file -> [(new_line_number, text)] for lines added relative to base (or empty tree)."""
-    args = ['diff', '--no-color', '--no-ext-diff', '--no-textconv', '-U0'] + (['--cached'] if cached else [])
-    args += [base] if base else ['4b825dc642cb6eb9a060e54bf8d69288fbee4904']
-    out = _leak_git(cwd, *args, capture_output=True, timeout=60).stdout
+    if cached:
+        # Diff the index tree to base without touching the worktree. A cached diff can
+        # racy-refresh stat info and re-read worktree bytes instead of index blobs.
+        base_tree = base if base else '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+        index_tree = _leak_git(cwd, 'write-tree', capture_output=True, check=True, timeout=60,
+                               text=True).stdout.strip()
+        args = ['diff-tree', '--no-color', '--no-textconv', '-U0', '-p', base_tree, index_tree]
+        out = _leak_git(cwd, *args, capture_output=True, timeout=60).stdout
+    else:
+        args = ['diff', '--no-color', '--no-ext-diff', '--no-textconv', '-U0']
+        args += [base] if base else ['4b825dc642cb6eb9a060e54bf8d69288fbee4904']
+        out = _leak_git(cwd, *args, capture_output=True, timeout=60).stdout
     return _parse_added_lines(out.decode(errors='replace'))
 
 
