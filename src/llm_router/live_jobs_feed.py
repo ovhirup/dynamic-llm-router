@@ -56,12 +56,57 @@ def normalize_text(text):
     return ' '.join(_IGNORABLE.sub('', kept).split())
 
 
+# Look-alikes: letters from other scripts that read as a Latin letter. Matching folds them (after NFKC, which
+# maps fullwidth and other compatibility forms) so `ＡＣＭＥ` or `acmе` with a Cyrillic `е` still hits the
+# term `acme`. This is a small table of common cases, not full confusables coverage.
+_LOOKALIKES = {
+    **dict(zip('аеорсхіјѕукмтнв', 'aeopcxijsykmthb')),  # Cyrillic
+    **dict(zip('АЕОРСХІЈЅУКМТНВ', 'AEOPCXIJSYKMTHB')),
+    **dict(zip('οαερντικυ', 'oaepvtiku')),  # Greek
+    **dict(zip('ΑΒΕΖΗΙΚΜΝΟΡΤΥΧ', 'ABEZHIKMNOPTYX')),
+}
+
+
+def _fold_char(char):
+    return ''.join(_LOOKALIKES.get(c, c) for c in unicodedata.normalize('NFKC', char))
+
+
+def _fold_text(text):
+    """`(folded, origin)`: `text` with each character NFKC-folded and look-alikes mapped to Latin letters.
+    `origin[i]` is the index in `text` of the character that produced `folded[i]`."""
+    folded, origin = [], []
+    for index, char in enumerate(text):
+        piece = _fold_char(char)
+        folded.append(piece)
+        origin.extend([index] * len(piece))
+    return ''.join(folded), origin
+
+
+def _sub_term(pattern, part):
+    """`part` with each match of `pattern` on its folded form replaced by `security.REDACTED`.
+
+    The original characters are replaced, so no partial term is left behind. Plain ASCII skips folding."""
+    if part.isascii():
+        return pattern.sub(security.REDACTED, part)
+    folded, origin = _fold_text(part)
+    out, last = [], 0
+    for match in pattern.finditer(folded):
+        start, end = origin[match.start()], origin[match.end() - 1] + 1
+        if start < last:
+            start = last
+        out.append(part[last:start])
+        out.append(security.REDACTED)
+        last = max(last, end)
+    out.append(part[last:])
+    return ''.join(out)
+
+
 @functools.lru_cache(maxsize=256)
 def _term_patterns(terms):
     """One case-insensitive pattern per private term; its words may be separated by any whitespace run."""
     patterns = []
     for term in terms:
-        words = normalize_text(term).split()
+        words = _fold_text(normalize_text(term))[0].split()
         if words:
             patterns.append(re.compile(r'\s+'.join(re.escape(word) for word in words), re.IGNORECASE))
     return tuple(patterns)
@@ -79,7 +124,7 @@ def mask_text(text, terms=()):
         cleaned = security.redact(text)
         for pattern in patterns:
             cleaned = security.REDACTED.join(
-                pattern.sub(security.REDACTED, part) for part in cleaned.split(security.REDACTED))
+                _sub_term(pattern, part) for part in cleaned.split(security.REDACTED))
         if cleaned == text:
             return cleaned
         text = cleaned
@@ -191,17 +236,76 @@ def _clip(text, limit):
     return text if len(text) <= limit else text[:limit - 1] + '…'
 
 
+_MAX_LINKS = 8
+
+
+def _open_dir_nofollow(path):
+    """fd of the directory at `path`, or None. Every component is opened `O_NOFOLLOW` from `/` with `dir_fd`.
+
+    A symlink anywhere in the path is refused, except one owned by root (such as `/var` or `/tmp` on macOS),
+    which only the system can create and is followed at most `_MAX_LINKS` times. A link the router's own user
+    can create, which is all a worker can make, is never followed."""
+    parts = list(Path(os.path.abspath(str(path))).parts[1:])
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)
+    try:
+        fd = os.open('/', flags)
+    except OSError:
+        return None
+    links = 0
+    while parts:
+        name = parts.pop(0)
+        if name in ('', '.'):
+            continue
+        try:
+            child = os.open(name, flags, dir_fd=fd)
+        except OSError:
+            child = None
+            try:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode) and info.st_uid == 0 and links < _MAX_LINKS:
+                    target = os.readlink(name, dir_fd=fd)
+                    links += 1
+                    if target.startswith('/'):
+                        os.close(fd)
+                        fd = os.open('/', flags)
+                    parts = [p for p in target.split('/') if p] + parts
+                    continue
+            except OSError:
+                pass
+            os.close(fd)
+            return None
+        os.close(fd)
+        fd = child
+    return fd
+
+
+def dir_is_safe(path):
+    """True when `path` is a directory reached without following a symlink the router's user could have made."""
+    fd = _open_dir_nofollow(path)
+    if fd is None:
+        return False
+    os.close(fd)
+    return True
+
+
 def read_bounded(path, limit=TAIL_BYTES):
     """`(last <= limit bytes, truncated)` of a regular file, or None.
 
     Never follows a symlink and never blocks: a FIFO, device, directory or link at `path` gives None. At most
-    `limit` bytes are read even if the file grows while it is being read. The output directory is the router's
-    own 0700 state directory: only the final component is `O_NOFOLLOW`, a symlinked parent is out of scope, and
-    content still passes `clean_text`."""
+    `limit` bytes are read even if the file grows while it is being read. Every directory on the way is opened
+    with `O_NOFOLLOW` through a directory fd (`_open_dir_nofollow`), so a symlinked parent gives None too, apart
+    from root-owned system links. Content still passes `clean_text`."""
+    path = Path(os.path.abspath(str(path)))
+    dir_fd = _open_dir_nofollow(path.parent)
+    if dir_fd is None:
+        return None
     try:
-        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0),
+                     dir_fd=dir_fd)
     except OSError:
         return None
+    finally:
+        os.close(dir_fd)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
@@ -762,6 +866,9 @@ def _read_sidecar(out_dir, stamp):
     return (fields, attempt, mtime) if fields else absent
 
 
+_NO_DIR = Path(os.devnull) / 'no-output-dir'  # never a directory: stands in for an unsafe output dir
+
+
 def build_live_jobs_feed(policy=None, now=None):
     """Build the live jobs feed dict (`running`, `recent`, `history`, `jobs`) from router state."""
     policy = policy or config.load_policy()
@@ -771,6 +878,8 @@ def build_live_jobs_feed(policy=None, now=None):
     out_dir = config.policy_path(policy, 'run_task', 'output_dir', 'logs/task-output')
     wt_root = config.policy_path(policy, 'run_job', 'worktree_root', 'worktrees')
     terms = td.private_terms(policy)
+    if not dir_is_safe(out_dir):  # a symlinked output directory or parent: read nothing through it
+        out_dir = _NO_DIR
     logs_by_stamp = _scan_output_logs(out_dir)
     from . import pr_gate
     approvals = pr_gate.approval_records(policy)  # read once per build, not once per job
