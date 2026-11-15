@@ -24,7 +24,7 @@ Keep this procedure under one page. DLR's **never-idle rule** guarantees a job i
 
 3. **Hand off `feature`, `bugfix`, and `review` work to Grok Bot (or the active orchestrator):**
    - When all cloud workers are out for a non-mechanical class, `run-job --class <feature|bugfix|review>` returns `"status": "handoff_to_orchestrator"` with `"worker": "grok-bot"` and `"task_file"` instead of failing.
-   - Execute the change directly in the orchestrator session on a branch, run `python -m pytest -q` (0 skipped), and keep the commit local until human approval.
+   - Execute the change directly in the orchestrator session on a branch, run the full suite (`cd tests && python -m unittest discover -t . -s .`, 0 skipped), and keep the commit local until human approval.
 
 ## 2. Reset Windows & Cadence Reference
 
