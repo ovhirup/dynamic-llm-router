@@ -436,32 +436,29 @@ class JobGit:
             listed.append((mode, oid, path))
         return listed
 
-    def _blob_sizes(self, oids):
-        sizes = {}
-        if not oids:
-            return sizes
-
-        def reader(stdout):
-            for oid in oids:
-                parts = _read_line(stdout).split(b' ')
-                if (len(parts) != 3 or parts[0] != oid or parts[1] != b'blob' or
-                        not parts[2].isdigit()):
-                    raise JobGitRefused('cat-file framing mismatch')
-                sizes[oid] = int(parts[2])
-            if stdout.read(1):
-                raise JobGitRefused('cat-file framing mismatch')
-
-        self._git('cat-file', '--batch-check', data=b''.join(oid + b'\n' for oid in oids),
-                  reader=reader)
-        return sizes
-
     def _base_blobs(self):
         try:
             return self._base_blob_paths
         except AttributeError:
-            blobs = [(path, oid) for mode, oid, path in self._entries() if mode != b'160000']
-            sizes = self._blob_sizes([oid for _path, oid in blobs])
-            self._base_blob_paths = {path: (oid, sizes[oid]) for path, oid in blobs}
+            blobs = {}
+            raw = self._git('ls-tree', '-r', '-z', '-l', '--full-tree', self.base_sha)
+            for record in raw.split(b'\0'):
+                if not record:
+                    continue
+                meta, path = record.split(b'\t', 1)
+                parts = meta.split()
+                if len(parts) != 4:
+                    raise JobGitRefused('ls-tree framing mismatch')
+                mode, _kind, oid, size_token = parts
+                if mode not in _BLOB_MODES:
+                    raise JobGitRefused('unsupported base entry mode')
+                if mode == b'160000':
+                    continue
+                self._components(path)
+                if not size_token.isdigit():
+                    raise JobGitRefused('ls-tree framing mismatch')
+                blobs[path] = (oid, int(size_token))
+            self._base_blob_paths = blobs
             return self._base_blob_paths
 
     def _root(self, job_dir):
