@@ -699,7 +699,7 @@ class JobGitTests(unittest.TestCase):
         current = git(self.source, 'branch', '--show-current').stdout.decode().strip()
         cases = ((unrelated, 'root', None), (cousin, 'cousin', None),
                  (valid, current, 'publish branch already exists'),
-                 (bad, 'bad', 'git fetch failed'))
+                 (bad, 'bad', 'git fsck failed'))
         for sha, branch, reason in cases:
             with self.subTest(branch=branch):
                 git(instance.git_dir, 'update-ref', 'refs/heads/router/job', sha)
@@ -1134,18 +1134,10 @@ class JobGitTests(unittest.TestCase):
             commit = self.commit(instance, path)
             instance.publish(folder, commit, 'configured')
         elif row == 'fsck-skiplist':
-            # git 2.54 unions every fetch.fsck.skipList value, so
-            # -c fetch.fsck.skipList=/dev/null does not drop the source file.
-            try:
+            with self.assertRaises(JobGitRefused) as caught:
                 instance.publish(folder, bad, 'weakened')
-            except JobGitRefused as exc:
-                self.assertEqual(exc.reason, 'git fetch failed')
-                self.assertNotEqual(git(folder, 'cat-file', '-e', bad, check=False).returncode, 0)
-            else:
-                sys.__stdout__.write(
-                    'known limit (follow-up before wiring): a source fetch.fsck.skipList stays in effect\n')
-                self.assertEqual(
-                    git(folder, 'rev-parse', 'refs/heads/weakened').stdout.decode().strip(), bad)
+            self.assertEqual(caught.exception.reason, 'git fsck failed')
+            self.assertNotEqual(git(folder, 'cat-file', '-e', bad, check=False).returncode, 0)
         else:
             with self.assertRaises(JobGitRefused):
                 instance.publish(folder, bad, 'weakened')
@@ -1171,6 +1163,117 @@ class JobGitTests(unittest.TestCase):
             return
         code, output = _run_mutant('rule2-walk', 'test_backslash_name_refused_by_tree_compare')
         self.assertEqual(code, 0, output[-2000:])
+
+    def test_publish_source_fsck_skiplist_refused_in_router(self):
+        folder, instance, path, base = self._isolated()
+        marker = self.root / ('skip-router-%d' % self.count)
+        touch = self._touch(marker)
+        self._plant_alternates(folder, touch)
+        bad, _tree = self._bad_tip(instance, base)
+        git(folder, 'config', 'fetch.fsckObjects', 'false')
+        git(folder, 'config', 'transfer.fsckObjects', 'false')
+        git(folder, 'config', 'fetch.fsck.hasDotgit', 'ignore')
+        skip = self.root / ('skip-router-file-%d' % self.count)
+        skip.write_text('%s\n%s\n' % (_tree, bad))
+        git(folder, 'config', 'fetch.fsck.skipList', str(skip))
+        with self.assertRaises(JobGitRefused) as caught:
+            instance.publish(folder, bad, 'weakened')
+        self.assertEqual(caught.exception.reason, 'git fsck failed')
+        self.assertNotEqual(git(folder, 'cat-file', '-e', bad, check=False).returncode, 0)
+        self.assertFalse(marker.exists())
+
+    def test_git_read_drains_large_stderr_without_hanging(self):
+        instance, _path = self.make()
+        script = self.root / 'fake-git.py'
+        script.write_text(
+            'import sys\n'
+            'if "cat-file" in sys.argv and "--batch-check" in sys.argv:\n'
+            '    sys.stderr.buffer.write(b"z" * (2 * 1024 * 1024))\n'
+            '    oid = sys.stdin.buffer.readline().strip()\n'
+            '    sys.stdout.buffer.write(oid + b" missing\\n")\n'
+            '    sys.stdout.buffer.flush()\n'
+            '    raise SystemExit(0)\n'
+            'raise SystemExit(2)\n')
+        env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_SYSTEM='/dev/null',
+                   GIT_CONFIG_GLOBAL='/dev/null', GIT_NO_REPLACE_OBJECTS='1',
+                   GIT_NO_LAZY_FETCH='1', GIT_ALLOW_PROTOCOL='file',
+                   GIT_TERMINAL_PROMPT='0', GIT_ATTR_NOSYSTEM='1',
+                   GIT_DIR=str(instance.git_dir))
+        argv = [sys.executable, str(script), 'cat-file', '--batch-check']
+        errors = []
+
+        def reader(stdout):
+            line = stdout.readline()
+            if not line.endswith(b' missing\n'):
+                errors.append(line)
+
+        started = time.monotonic()
+        instance._git_read(argv, env, str(instance.git_dir), b'%s\n' % instance.base_sha.encode(),
+                           reader, 'cat-file')
+        elapsed = time.monotonic() - started
+        sys.__stdout__.write('stderr drain elapsed %.3fs\n' % elapsed)
+        self.assertLess(elapsed, 5.0, 'stderr drain hung')
+        self.assertFalse(errors)
+
+    def test_snapshot_allows_unchanged_base_file_over_file_cap(self):
+        over = 17 * 1024 * 1024
+        (self.source / 'large.bin').write_bytes(b'l' * over)
+        git(self.source, 'add', 'large.bin')
+        git(self.source, 'commit', '-qm', 'large base')
+        self.base = git(self.source, 'rev-parse', 'HEAD').stdout.decode().strip()
+        instance, path = self.make()
+        self.assertGreater((path / 'large.bin').stat().st_size, instance.policy_caps['file_bytes'])
+        tree = instance.snapshot(path)
+        self.assertEqual(tree, self.base_tree())
+
+    def test_snapshot_refuses_added_file_over_file_cap(self):
+        instance, path = self.make()
+        (path / 'huge.bin').write_bytes(b'h' * (17 * 1024 * 1024))
+        self.refuse(instance, path, 'file byte cap exceeded')
+
+    def test_snapshot_refuses_modified_file_over_file_cap(self):
+        instance, path = self.make()
+        (path / 'a.txt').write_bytes(b'm' * (17 * 1024 * 1024))
+        self.refuse(instance, path, 'file byte cap exceeded')
+
+    def test_snapshot_refuses_inflated_base_path_without_bounded_read(self):
+        instance, path = self.make()
+        for name in ('executable', 'link'):
+            (path / name).unlink()
+        huge = 100 * 1024 * 1024
+        fd = os.open(path / 'a.txt', os.O_RDWR)
+        try:
+            os.ftruncate(fd, huge)
+        finally:
+            os.close(fd)
+        self.assertGreater(huge, instance.policy_caps['file_bytes'])
+        self.assertGreater(huge, len(b'hello\n'))
+        read_bytes = []
+        real = job_git._read_capped
+
+        def capped(fd, limit):
+            data = real(fd, limit)
+            read_bytes.append(len(data))
+            return data
+
+        with patch.object(job_git, '_read_capped', capped):
+            self.refuse(instance, path, 'file byte cap exceeded')
+        self.assertEqual(sum(read_bytes), 0)
+
+    def test_snapshot_allows_small_growth_of_tracked_base_file(self):
+        instance, path = self.make()
+        grown = b'hello, this tracked file grew a bit\n'
+        (path / 'a.txt').write_bytes(grown)
+        commit = self.commit(instance, path)
+        self.assertEqual(git(instance.git_dir, 'show', f'{commit}:a.txt').stdout, grown)
+
+    def test_snapshot_allows_shrink_of_tracked_base_file(self):
+        instance, path = self.make()
+        shrunk = b'hi\n'
+        (path / 'a.txt').write_bytes(shrunk)
+        commit = self.commit(instance, path)
+        self.assertEqual(git(instance.git_dir, 'show', f'{commit}:a.txt').stdout, shrunk)
 
     def test_publish_alternate_refs_command_does_not_run(self):
         self._publish_config_row('alternate-refs')
@@ -1432,7 +1535,7 @@ class JobGitTests(unittest.TestCase):
             ('tree-compare', 'test_ignored_index_path_refuses'),
             ('publish-ancestor', 'test_publish_ancestor_check_reaches_the_source'),
             ('publish-exists', 'test_publish_refuses_unrelated_existing_and_bad_tree'),
-            ('publish-fsck', 'test_publish_refuses_unrelated_existing_and_bad_tree'),
+            ('publish-strict', 'test_publish_source_fsck_skiplist_refused_in_router'),
             ('publish-zero', 'test_publish_zero_oid_does_not_move_a_branch_created_during_fetch'),
             ('publish-altrefs', 'test_publish_alternate_refs_command_does_not_run'),
             ('publish-tip', 'test_publish_requires_router_tip'),

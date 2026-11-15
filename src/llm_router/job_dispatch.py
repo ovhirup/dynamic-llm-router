@@ -562,17 +562,21 @@ def run_job(repo, task_file, base=None, branch=None, test_cmd=None, size='full',
         worktree.parent.mkdir(parents=True, exist_ok=True)
         # Worker logs and live events are named by this stamp; jobs started in the same second (any repo) must
         # never share it, or they would write into each other's files and show in each other's live lane.
-        # Claimed only once the repo lock is held, and released if the job cannot start, so a refused start
-        # never leaves a claim naming a job it does not belong to. Job ids named by a claim are never handed
-        # out again (see the id loop above), so one claim names each job id.
+        # The claim file only reserves the stamp (exclusive create). Which job owns it is recorded under the
+        # jobs directory, where the worker does not write. Both are released if the job cannot start, so a
+        # refused start never leaves a claim naming a job it does not belong to. Job ids named by a claim are
+        # never handed out again (see the id loop above), so one claim names each job id.
+        jobs_dir = _path(policy, 'jobs_dir', 'logs/jobs')
         stamp = summary['output_stamp'] = reserve_output_stamp(out_dir, stamp, job_id)
         try:
+            live_jobs_feed.write_stamp_record(jobs_dir, job_id, stamp)
             _git(repo, 'worktree', 'add', '-q', '-b', branch, str(worktree), base_sha, check=True)
         except BaseException:
             try:
                 (out_dir / f'{stamp}-job.json').unlink()
             except OSError:
                 pass
+            live_jobs_feed.delete_stamp_record(jobs_dir, job_id)
             raise
         try:
             if not test_cmd:  # detected at base, so the worker cannot choose the command that judges it
