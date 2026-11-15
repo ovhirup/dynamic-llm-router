@@ -878,6 +878,7 @@ def build_live_jobs_feed(policy=None, now=None):
     out_dir = config.policy_path(policy, 'run_task', 'output_dir', 'logs/task-output')
     wt_root = config.policy_path(policy, 'run_job', 'worktree_root', 'worktrees')
     terms = td.private_terms(policy)
+    configured_out_dir = out_dir  # the overlap check below must see the real path, not the stand-in
     if not dir_is_safe(out_dir):  # a symlinked output directory or parent: read nothing through it
         out_dir = _NO_DIR
     logs_by_stamp = _scan_output_logs(out_dir)
@@ -904,7 +905,7 @@ def build_live_jobs_feed(policy=None, now=None):
                 worktrees.append(wt)
     # Claim files are not read. Ownership is the router record, else a saved output_stamp.
     # Nested dirs would let whoever writes the output dir or the worktree rewrite the record.
-    owned = {} if _stamp_records_untrusted(jobs_dir, out_dir, wt_root) else read_stamp_records(jobs_dir)
+    owned = {} if _stamp_records_untrusted(jobs_dir, configured_out_dir, wt_root) else read_stamp_records(jobs_dir)
     for jid, data, _path in saved:
         recorded = data.get('output_stamp')
         if isinstance(recorded, str) and _STAMP_RE.fullmatch(recorded):
