@@ -625,7 +625,10 @@ class JobGit:
                 if base_oid is not None:
                     if actual.st_size > file_cap and actual.st_size != base_size:
                         raise JobGitRefused('file byte cap exceeded')
-                    read_cap = base_size
+                    if actual.st_size == base_size:
+                        read_cap = max(file_cap, base_size)
+                    else:
+                        read_cap = file_cap
                 else:
                     if actual.st_size > file_cap:
                         raise JobGitRefused('file byte cap exceeded')
@@ -636,7 +639,7 @@ class JobGit:
             mode = b'100755' if info.st_mode & stat.S_IXUSR else b'100644'
             if base_oid is not None:
                 if (_blob_id(content, len(self.base_sha)) != base_oid and
-                        (len(content) > file_cap or actual.st_size != base_size)):
+                        len(content) > file_cap):
                     raise JobGitRefused('file byte cap exceeded')
             elif len(content) > file_cap:
                 raise JobGitRefused('file byte cap exceeded')

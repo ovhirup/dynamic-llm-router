@@ -1261,6 +1261,20 @@ class JobGitTests(unittest.TestCase):
             self.refuse(instance, path, 'file byte cap exceeded')
         self.assertEqual(sum(read_bytes), 0)
 
+    def test_snapshot_allows_small_growth_of_tracked_base_file(self):
+        instance, path = self.make()
+        grown = b'hello, this tracked file grew a bit\n'
+        (path / 'a.txt').write_bytes(grown)
+        commit = self.commit(instance, path)
+        self.assertEqual(git(instance.git_dir, 'show', f'{commit}:a.txt').stdout, grown)
+
+    def test_snapshot_allows_shrink_of_tracked_base_file(self):
+        instance, path = self.make()
+        shrunk = b'hi\n'
+        (path / 'a.txt').write_bytes(shrunk)
+        commit = self.commit(instance, path)
+        self.assertEqual(git(instance.git_dir, 'show', f'{commit}:a.txt').stdout, shrunk)
+
     def test_publish_alternate_refs_command_does_not_run(self):
         self._publish_config_row('alternate-refs')
 
