@@ -9,6 +9,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
@@ -17,6 +18,7 @@ from pathlib import Path
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from fake_worker import FakeWorkerHarness
 from helpers import TERM, load_policy
 from llm_router import check as check_mod
 from llm_router import cli, job_dispatch, pr_gate, security, unit_review
@@ -242,11 +244,10 @@ class AmbientDriverTests(unittest.TestCase):
         self.assertNotIn('harmless', patch)
         self.assertFalse(self.marker.exists())
 
-    def test_clean_filter_committed_leak_check_agrees_with_blob(self):
+    def test_clean_filter_committed_leak_check_blocks_raw_worktree_line(self):
         self._plant_clean('committed')
         result = security.leak_check(self.repo, self.base, [], [TERM])
-        self.assertEqual(result['status'], 'clean', result)
-        # Stat-clean worktree: the diff reuses the stored blob and does not re-run the filter.
+        self.assertEqual(result['status'], 'blocked', result)
         self.assertNotIn(TERM, self.git(self.repo, 'cat-file', 'blob', 'HEAD:secret.txt'))
         self.assertNotIn(TERM, self._added_blob())
 
@@ -257,11 +258,11 @@ class AmbientDriverTests(unittest.TestCase):
         self.assertFalse(self.marker.exists())
         self.assertNotIn(TERM, self._added_blob())
 
-    def test_clean_filter_working_tree_leak_check_agrees_with_blob(self):
+    def test_clean_filter_working_tree_leak_check_blocks_without_ambient_filter(self):
         self._plant_clean('working')
         result = security.leak_check(self.repo, self.base, [], [TERM])
-        self.assertEqual(result['status'], 'clean', result)
-        self.assertTrue(self.marker.exists())
+        self.assertEqual(result['status'], 'blocked', result)
+        self.assertFalse(self.marker.exists())
         self.assertNotIn(TERM, self._added_blob())
 
     def test_clean_filter_untracked_leak_check_reads_worktree_bytes(self):
@@ -307,13 +308,12 @@ class AmbientDriverTests(unittest.TestCase):
         self.assertTrue(self.marker.exists())
         self.assertNotIn(TERM, self._added_blob())
 
-    def test_clean_filter_retroactive_uncached_diff_hides_stored_blob(self):
-        """Stop: do not change filter handling.
+    def test_clean_filter_retroactive_uncached_diff_reads_raw_worktree(self):
+        """A blob committed before the clean filter applied still holds the term.
 
-        A blob committed before the clean filter applied still holds the term.
-        `leak_check` without `--cached` diffs the worktree, so the filter rewrites
-        that view and the finding is missed. `git diff --cached` and `llm-router
-        check` still read the stored blob. `git add` would replace it.
+        Isolated leak-scan git ignores ambient filter drivers, so the uncached diff
+        shows worktree bytes. `git diff --cached`, `llm-router check`, and `git add`
+        still use the stored blob until renormalized.
         """
         (self.repo / 'secret.txt').write_text(TERM + '\n')
         self._commit(self.repo)
@@ -325,8 +325,8 @@ class AmbientDriverTests(unittest.TestCase):
         self.git(self.repo, 'commit', '-qm', 'attrs')
         self._clear_marker()
         uncached = security.leak_check(self.repo, self.base, [], [TERM])
-        self.assertEqual(uncached['status'], 'clean', uncached)
-        self.assertTrue(self.marker.exists())
+        self.assertEqual(uncached['status'], 'blocked', uncached)
+        self.assertFalse(self.marker.exists())
         self.assertIn(TERM, self.git(self.repo, 'cat-file', 'blob', 'HEAD:secret.txt'))
         self._clear_marker()
         cached = security.leak_check(self.repo, self.base, [], [TERM], cached=True)
@@ -473,6 +473,17 @@ class AmbientDriverTests(unittest.TestCase):
     def _head(self):
         return self.git(self.repo, 'rev-parse', 'HEAD').strip()
 
+    def _prepare_run_job(self):
+        rt, run_job = self.policy['run_task'], self.policy['run_job']
+        rt.update(ledger=str(self.root / 'ledger.csv'), output_dir=str(self.root / 'worker-out'),
+                  block_log=str(self.root / 'block.log'), shim_dir=str(self.root / 'shims'))
+        run_job.update(worktree_root=str(self.root / 'wt'), lock_dir=str(self.root / 'locks'),
+                       jobs_dir=str(self.root / 'jobs'), repo_config=str(self.root / 'repos.json'))
+        self.policy['alerts'] = {'file': str(self.root / 'alerts.jsonl'), 'macos_notification': False}
+        run_job['caffeinate'] = False
+        for name in ('codex', 'grok-build', 'cursor'):
+            FakeWorkerHarness('fail').install(self.policy, name)
+
     def _isolate_gate(self):
         run_job = self.policy['run_job']
         run_job['jobs_dir'] = str(self.root / 'jobs')
@@ -569,6 +580,54 @@ class AmbientDriverTests(unittest.TestCase):
             'tests': [{'command': 'true', 'status': 'passed', 'returncode': 0, 'tail': ''}],
         }, self.repo, ['secret.txt'])
         self._expect_raw_packet(packet['diff'])
+
+    def test_textconv_run_job_post_worker_leak_check_blocks(self):
+        """Post-worker and final leak scans must see raw bytes, not the textconv output."""
+        self._prepare_run_job()
+        self._install_textconv()
+        self._clear_marker()
+        task = self.root / 'task.md'
+        task.write_text('# Add secret\n')
+        code = ("open('.gitattributes','w').write('*.txt diff=hide\\n'); "
+                f"open('secret.txt','w').write('{TERM}\\n')")
+        self.policy['run_task']['commands']['codex'] = [sys.executable, '-c', code, '-']
+        select = lambda _chars, **_kw: {'eligible': ['codex'], 'meters': {'codex': 10}, 'reason': 'test'}
+        result = job_dispatch.run_job(self.repo, task, policy=self.policy, test_cmd='true', select=select)
+        self.assertEqual(result['status'], 'blocked_by_leak_check', result)
+        self.assertIsNone(result['commit'])
+        self.assertIn('private_term', {item['kind'] for item in (result.get('leak_check') or {}).get('findings', [])})
+        self.assertNotIn(TERM, json.dumps(result))
+        self.assertFalse(self.marker.exists())
+
+    def test_textconv_run_job_final_leak_check_blocks_staged_secret(self):
+        self._prepare_run_job()
+        self._install_textconv()
+        self._clear_marker()
+        task = self.root / 'task.md'
+        task.write_text('# Stage secret\n')
+        code = ("open('.gitattributes','w').write('*.txt diff=hide\\n'); "
+                f"open('secret.txt','w').write('{TERM}\\n'); "
+                "import subprocess; subprocess.run(['git','add','-A'], check=True)")
+        self.policy['run_task']['commands']['codex'] = [sys.executable, '-c', code, '-']
+        select = lambda _chars, **_kw: {'eligible': ['codex'], 'meters': {'codex': 10}, 'reason': 'test'}
+        result = job_dispatch.run_job(self.repo, task, policy=self.policy, test_cmd='true', select=select)
+        self.assertEqual(result['status'], 'blocked_by_leak_check', result)
+        self.assertFalse(self.marker.exists())
+
+    def test_clean_filter_run_job_post_worker_leak_check_blocks_untracked_worktree(self):
+        """Untracked worktree bytes are read from disk, not through a clean filter."""
+        self._prepare_run_job()
+        self._install_clean()
+        self._clear_marker()
+        task = self.root / 'task.md'
+        task.write_text('# Secret in worktree\n')
+        code = ("open('.gitattributes','w').write('*.txt filter=hide\\n'); "
+                f"open('secret.txt','w').write('{TERM}\\n')")
+        self.policy['run_task']['commands']['codex'] = [sys.executable, '-c', code, '-']
+        select = lambda _chars, **_kw: {'eligible': ['codex'], 'meters': {'codex': 10}, 'reason': 'test'}
+        result = job_dispatch.run_job(self.repo, task, policy=self.policy, test_cmd='true', select=select)
+        self.assertEqual(result['status'], 'blocked_by_leak_check', result)
+        self.assertFalse(self.marker.exists())
 
     def test_clean_filter_range_leak_check_reads_stored_blob(self):
         """A commit-to-commit range never runs a clean filter. The stored blob is what the gate sees."""

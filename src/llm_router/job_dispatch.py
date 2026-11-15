@@ -175,6 +175,16 @@ def out_of_scope(paths, scope):
     return sorted(p for p in paths if not any(s == p or task_dag._covers(s, p) for s in scope))
 
 
+def _isolated_git_env(env=None):
+    """Git environment for leak scans and job-tree reads: no ambient config or attribute drivers."""
+    isolated = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    isolated.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_SYSTEM='/dev/null', GIT_CONFIG_GLOBAL='/dev/null',
+                    GIT_NO_REPLACE_OBJECTS='1', GIT_NO_LAZY_FETCH='1', GIT_TERMINAL_PROMPT='0')
+    if env:
+        isolated.update(env)
+    return isolated
+
+
 def _git(cwd, *args, check=False, env=None, errors=None, binary=False):
     done = subprocess.run(['git', '-C', str(cwd), *args], stdin=subprocess.DEVNULL,
                           capture_output=True, text=not binary, timeout=120, env=env, errors=errors)
@@ -361,7 +371,8 @@ def remove_bytecode_caches(cwd):
 def changed_paths(cwd):
     """Paths with any change vs HEAD (tracked or untracked), from porcelain -z. Untracked interpreter caches are
     left out (counting them caused spurious out-of-scope failures); tracked ones still count."""
-    out = _git(cwd, 'status', '--porcelain', '-z', '--untracked-files=all').stdout
+    out = _git(cwd, 'status', '--porcelain', '-z', '--untracked-files=all',
+               env=_isolated_git_env()).stdout
     entries, paths, skip = out.split('\0'), set(), False
     for entry in entries:
         if skip:

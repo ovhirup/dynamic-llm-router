@@ -234,6 +234,24 @@ def count_lines(path):
 
 # ---- leak check --------------------------------------------------------------------
 
+_LEAK_SCAN_GIT_CONFIG = (
+    '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+    '-c', 'commit.gpgsign=false',
+)
+
+
+def leak_scan_git_env(env=None):
+    """Strip ambient Git config so leak scans never run textconv, filter or diff drivers."""
+    from . import job_dispatch as jobs
+
+    return jobs._isolated_git_env(env)
+
+
+def _leak_git(cwd, *args, env=None, **kwargs):
+    argv = ['git', '-C', str(cwd), *_LEAK_SCAN_GIT_CONFIG, *args]
+    return subprocess.run(argv, stdin=subprocess.DEVNULL, env=leak_scan_git_env(env), **kwargs)
+
+
 def load_terms(path):
     """Private terms, one per line; '#' comments and blanks ignored. Missing file -> None."""
     try:
@@ -305,9 +323,9 @@ def _diff_path_name(header):
 
 def _added_lines(cwd, base, cached=False):
     """Map file -> [(new_line_number, text)] for lines added relative to base (or empty tree)."""
-    args = ['git', '-C', str(cwd), 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '-U0'] + (['--cached'] if cached else [])
+    args = ['diff', '--no-color', '--no-ext-diff', '--no-textconv', '-U0'] + (['--cached'] if cached else [])
     args += [base] if base else ['4b825dc642cb6eb9a060e54bf8d69288fbee4904']
-    out = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=60).stdout
+    out = _leak_git(cwd, *args, capture_output=True, timeout=60).stdout
     return _parse_added_lines(out.decode(errors='replace'))
 
 
@@ -338,11 +356,11 @@ def mask_private_terms(text, terms):
 
 def changed_paths(cwd, base, cached=False, env=None):
     """List changed paths independently of content hunks, including empty-file additions."""
-    args = ['git', '-C', str(cwd), 'diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--name-only', '-z']
+    args = ['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--name-only', '-z']
     args += ['--cached'] if cached else []
     args += [base, '--']
-    out = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, check=True,
-                         text=True, errors='replace', timeout=60, env=env).stdout
+    out = _leak_git(cwd, *args, capture_output=True, check=True,
+                    text=True, errors='replace', timeout=60, env=env).stdout
     return [name for name in out.split('\0') if name]
 
 
@@ -367,9 +385,8 @@ DEFAULT_SKIP_DIRS = ('node_modules', '.venv', 'venv', '__pycache__', '.git', 'di
 
 def untracked_files(cwd, skip_dirs=DEFAULT_SKIP_DIRS):
     """Untracked, NOT ignored files (git ls-files --others --exclude-standard), minus vendor/build dirs."""
-    out = subprocess.run(['git', '-C', str(cwd), 'ls-files', '-z', '--others', '--exclude-standard'],
-                         stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace',
-                         timeout=60).stdout
+    out = _leak_git(cwd, 'ls-files', '-z', '--others', '--exclude-standard',
+                    capture_output=True, text=True, errors='replace', timeout=60).stdout
     skip = set(skip_dirs or ())
     return [name for name in out.split('\0') if name and not (set(Path(name).parts[:-1]) & skip)]
 
@@ -451,8 +468,8 @@ def scan_tree(root, terms, allow=(), max_bytes=1_000_000, history=False):
     Used by `llm-router scan` before publishing a repository."""
     root = Path(root)
     findings = []
-    listed = subprocess.run(['git', '-C', str(root), 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
-                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+    listed = _leak_git(root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard',
+                       capture_output=True, text=True, timeout=60)
     if listed.returncode != 0:
         names = [str(p.relative_to(root)) for p in root.rglob('*') if p.is_file()
                  and not _skipped(str(p.relative_to(root)), DEFAULT_SKIP_DIRS)]
@@ -472,9 +489,9 @@ def scan_tree(root, terms, allow=(), max_bytes=1_000_000, history=False):
         if hits:
             findings += [{'file': f'{shown_name} (path)', 'kind': 'private_term', 'match': mask(t)} for t in hits]
     if history and listed.returncode == 0:
-        log = subprocess.run(['git', '-C', str(root), 'log', '--all', '-p', '--no-color', '--no-textconv',
-                              '--format=%H%n%an <%ae>%n%B'],
-                             stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace', timeout=300)
+        log = _leak_git(root, 'log', '--all', '-p', '--no-color', '--no-textconv',
+                        '--format=%H%n%an <%ae>%n%B',
+                        capture_output=True, text=True, errors='replace', timeout=300)
         for number, kind, masked in scan_text(log.stdout, terms, allow):
             findings.append({'file': f'git-history:{number}', 'kind': kind, 'match': masked})
     return {'status': 'blocked' if findings else 'clean', 'files_scanned': len(names), 'findings': findings,
