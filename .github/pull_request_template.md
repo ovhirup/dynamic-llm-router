@@ -5,6 +5,6 @@
 
 ## Checklist
 
-- [ ] Tests use fakes only and pass locally (`cd tests && python -m unittest discover -t . -s .`).
+- [ ] Tests use fakes only and pass locally (`cd tests && python -m unittest discover -t . -s . -v`).
 - [ ] `llm-router scan . --history` is clean.
 - [ ] I have read the CLA and agree. ([CLA.md](https://github.com/ovhirup/dynamic-llm-router/blob/main/CLA.md))
