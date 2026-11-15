@@ -13,9 +13,18 @@ Whichever coding tool or agent receives the prompt (`cursor`, `claude`, `codex`,
 
 ## How to run tests
 
-- Full suite: `python -m pytest -q` (every test must pass with **0 skipped**)
-- Unittest discovery: `PYTHONPATH=src python -m unittest discover -s tests`
+- Prerequisite: create and activate the repo venv and run `pip install -e .` there, so `python` imports this checkout's `src/` (no `PYTHONPATH` needed).
+- Full suite, the exact command CI runs: `cd tests && python -m unittest discover -t . -s . -v`
+  It must end with `OK` and **0 skipped**. A `FAILED tests/fixtures/gate/failing/test_bad.py` line is a fixture, not a failure.
+- Use Python 3.10 to 3.13 (CI's range). Unset every `GIT_CONFIG_*` variable first.
 - Leak scan: `llm-router scan .`
+
+## Backlog and pull requests
+
+- Priorities live in issue #34. If another issue disagrees with it, #34 wins.
+- One done-check per PR, written before the code. A different model reviews it against that done-check.
+- Write `Closes #N` only when the PR meets the issue's whole done-check. Otherwise write `Related: #N`.
+- Push a feature branch and open a draft PR only when your task brief (kept outside this repo) says so. The owner merges.
 
 ## Hard guardrails
 

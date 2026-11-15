@@ -59,8 +59,8 @@ def build_packet(batch_id, unit_id, policy=None):
         missing.append('passing test evidence')
     if missing:
         raise Refused(f'unit {unit_id!r} review blocked: missing {", ".join(missing)}')
-    diff = _git(repo, 'diff', '--no-renames', '--no-color', f"{record['base_sha']}..{record['head']}",
-                check=True).stdout
+    diff = _git(repo, 'diff', '--no-renames', '--no-color', '--no-ext-diff', '--no-textconv',
+                f"{record['base_sha']}..{record['head']}", check=True).stdout
     if not diff.strip():
         raise Refused(f'unit {unit_id!r} review blocked: empty diff')
     log_tail = tests.get('tail', '')

@@ -97,6 +97,13 @@ def build_parser():
     dispatch_keep.add_argument('--keep', action='store_true', help='keep the worktree even on failure')
     dispatch_keep.add_argument('--prune', action='store_true', help='remove the worktree even on success')
 
+    watch = commands.add_parser('watch', help='Live terminal view of every running job side by side, with its '
+                                'gates (read-only; never starts, stops or approves anything)')
+    watch.add_argument('--once', action='store_true', help='print one frame and exit')
+    watch.add_argument('--interval', type=float, default=2.0, help='seconds between frames (default 2)')
+    watch.add_argument('--job', dest='job_id', help='show only this job')
+    watch.add_argument('--json', action='store_true', help='print the feed v2 JSON once and exit')
+
     jobs = commands.add_parser('jobs', help='List recent run-job jobs and worktrees, or record an out-of-band '
                                 'verdict on one job')
     jobs.add_argument('--limit', type=int, default=20)
@@ -777,6 +784,10 @@ def main(argv=None, *, policy=None):
         if result['action'] == 'refused':
             return 3
         return 0 if result['action'] in ('dispatched', 'handoff_to_orchestrator') else 1
+    if args.command == 'watch':
+        from . import watch as watch_view
+        return watch_view.run(policy=policy, once=args.once, interval=args.interval, job_id=args.job_id,
+                              as_json=args.json)
     if args.command in ('run-job', 'jobs', 'cleanup'):
         from . import job_dispatch
         try:

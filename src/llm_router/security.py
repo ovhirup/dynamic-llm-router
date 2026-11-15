@@ -305,7 +305,7 @@ def _diff_path_name(header):
 
 def _added_lines(cwd, base, cached=False):
     """Map file -> [(new_line_number, text)] for lines added relative to base (or empty tree)."""
-    args = ['git', '-C', str(cwd), 'diff', '--no-color', '--no-ext-diff', '-U0'] + (['--cached'] if cached else [])
+    args = ['git', '-C', str(cwd), 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '-U0'] + (['--cached'] if cached else [])
     args += [base] if base else ['4b825dc642cb6eb9a060e54bf8d69288fbee4904']
     out = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=60).stdout
     return _parse_added_lines(out.decode(errors='replace'))
@@ -338,7 +338,7 @@ def mask_private_terms(text, terms):
 
 def changed_paths(cwd, base, cached=False, env=None):
     """List changed paths independently of content hunks, including empty-file additions."""
-    args = ['git', '-C', str(cwd), 'diff', '--no-ext-diff', '--no-renames', '--name-only', '-z']
+    args = ['git', '-C', str(cwd), 'diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--name-only', '-z']
     args += ['--cached'] if cached else []
     args += [base, '--']
     out = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, check=True,
@@ -405,9 +405,10 @@ def leak_check(cwd, base, untracked, terms, max_bytes=1_000_000, cached=False, a
         if untracked is None:
             untracked = untracked_files(cwd, skip_dirs)
         for name, lines in _added_lines(cwd, base, cached).items():
+            shown = mask_private_terms(name, terms)
             for number, text in lines:
                 for _, kind, masked in scan_text(text, terms, allow):
-                    findings.append({'file': f'{name}:{number}', 'kind': kind, 'match': masked})
+                    findings.append({'file': f'{shown}:{number}', 'kind': kind, 'match': masked})
         for name in untracked:
             if _skipped(name, skip_dirs) or Path(name).name in (skip_dirs or ()):
                 continue
@@ -432,9 +433,9 @@ def leak_check(cwd, base, untracked, terms, max_bytes=1_000_000, cached=False, a
                 data = file.read_bytes()
                 if b'\0' in data[:8192] and not scan_binary_untracked:
                     continue
-                rel = file.relative_to(cwd)
+                shown = mask_private_terms(f'{file.relative_to(cwd)}', terms)
                 for number, kind, masked in scan_text(data.decode('utf-8', 'replace'), terms, allow):
-                    findings.append({'file': f'{rel}:{number}', 'kind': kind, 'match': masked})
+                    findings.append({'file': f'{shown}:{number}', 'kind': kind, 'match': masked})
     except Exception as error:  # report, don't guess clean
         return {'status': 'error', 'error': type(error).__name__, 'findings': findings}
     status = 'blocked' if findings else 'clean'
@@ -471,7 +472,8 @@ def scan_tree(root, terms, allow=(), max_bytes=1_000_000, history=False):
         if hits:
             findings += [{'file': f'{shown_name} (path)', 'kind': 'private_term', 'match': mask(t)} for t in hits]
     if history and listed.returncode == 0:
-        log = subprocess.run(['git', '-C', str(root), 'log', '--all', '-p', '--no-color', '--format=%H%n%an <%ae>%n%B'],
+        log = subprocess.run(['git', '-C', str(root), 'log', '--all', '-p', '--no-color', '--no-textconv',
+                              '--format=%H%n%an <%ae>%n%B'],
                              stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace', timeout=300)
         for number, kind, masked in scan_text(log.stdout, terms, allow):
             findings.append({'file': f'git-history:{number}', 'kind': kind, 'match': masked})
