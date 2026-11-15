@@ -1237,6 +1237,30 @@ class JobGitTests(unittest.TestCase):
         (path / 'a.txt').write_bytes(b'm' * (17 * 1024 * 1024))
         self.refuse(instance, path, 'file byte cap exceeded')
 
+    def test_snapshot_refuses_inflated_base_path_without_bounded_read(self):
+        instance, path = self.make()
+        for name in ('executable', 'link'):
+            (path / name).unlink()
+        huge = 100 * 1024 * 1024
+        fd = os.open(path / 'a.txt', os.O_RDWR)
+        try:
+            os.ftruncate(fd, huge)
+        finally:
+            os.close(fd)
+        self.assertGreater(huge, instance.policy_caps['file_bytes'])
+        self.assertGreater(huge, len(b'hello\n'))
+        read_bytes = []
+        real = job_git._read_capped
+
+        def capped(fd, limit):
+            data = real(fd, limit)
+            read_bytes.append(len(data))
+            return data
+
+        with patch.object(job_git, '_read_capped', capped):
+            self.refuse(instance, path, 'file byte cap exceeded')
+        self.assertEqual(sum(read_bytes), 0)
+
     def test_publish_alternate_refs_command_does_not_run(self):
         self._publish_config_row('alternate-refs')
 

@@ -436,12 +436,32 @@ class JobGit:
             listed.append((mode, oid, path))
         return listed
 
+    def _blob_sizes(self, oids):
+        sizes = {}
+        if not oids:
+            return sizes
+
+        def reader(stdout):
+            for oid in oids:
+                parts = _read_line(stdout).split(b' ')
+                if (len(parts) != 3 or parts[0] != oid or parts[1] != b'blob' or
+                        not parts[2].isdigit()):
+                    raise JobGitRefused('cat-file framing mismatch')
+                sizes[oid] = int(parts[2])
+            if stdout.read(1):
+                raise JobGitRefused('cat-file framing mismatch')
+
+        self._git('cat-file', '--batch-check', data=b''.join(oid + b'\n' for oid in oids),
+                  reader=reader)
+        return sizes
+
     def _base_blobs(self):
         try:
             return self._base_blob_paths
         except AttributeError:
-            self._base_blob_paths = {path: oid for mode, oid, path in self._entries()
-                                     if mode != b'160000'}
+            blobs = [(path, oid) for mode, oid, path in self._entries() if mode != b'160000']
+            sizes = self._blob_sizes([oid for _path, oid in blobs])
+            self._base_blob_paths = {path: (oid, sizes[oid]) for path, oid in blobs}
             return self._base_blob_paths
 
     def _root(self, job_dir):
@@ -574,10 +594,12 @@ class JobGit:
         walk(root, b'', 1)
         return entries
 
-    def _read_entry(self, directory, name, info, total, base_oid=None):
+    def _read_entry(self, directory, name, info, total, base_oid=None, base_size=None):
         file_cap = self.policy_caps['file_bytes']
         if stat.S_ISLNK(info.st_mode):
             content = os.readlink(os.fsencode(name), dir_fd=directory)
+            if total[0] + len(content) > self.policy_caps['total_bytes']:
+                raise JobGitRefused('total byte cap exceeded')
             mode = b'120000'
             if base_oid is not None:
                 if _blob_id(content, len(self.base_sha)) != base_oid and len(content) > file_cap:
@@ -589,6 +611,8 @@ class JobGit:
             if info.st_nlink != 1:
                 raise JobGitRefused('hard-linked file')
             # endguard:rule5-nlink
+            if total[0] + info.st_size > self.policy_caps['total_bytes']:
+                raise JobGitRefused('total byte cap exceeded')
             fd = _open_file(directory, name)
             try:
                 actual = os.fstat(fd)
@@ -598,15 +622,21 @@ class JobGit:
                         (info.st_dev, info.st_ino, info.st_size, info.st_nlink)):
                     raise JobGitRefused('file changed before open')
                 # endguard:rule3-fstat
-                read_cap = actual.st_size if base_oid is not None else file_cap
-                if base_oid is None and actual.st_size > file_cap:
-                    raise JobGitRefused('file byte cap exceeded')
+                if base_oid is not None:
+                    if actual.st_size > file_cap and actual.st_size != base_size:
+                        raise JobGitRefused('file byte cap exceeded')
+                    read_cap = base_size
+                else:
+                    if actual.st_size > file_cap:
+                        raise JobGitRefused('file byte cap exceeded')
+                    read_cap = file_cap
                 content = _read_capped(fd, read_cap)
             finally:
                 os.close(fd)
             mode = b'100755' if info.st_mode & stat.S_IXUSR else b'100644'
             if base_oid is not None:
-                if _blob_id(content, len(self.base_sha)) != base_oid and len(content) > file_cap:
+                if (_blob_id(content, len(self.base_sha)) != base_oid and
+                        (len(content) > file_cap or actual.st_size != base_size)):
                     raise JobGitRefused('file byte cap exceeded')
             elif len(content) > file_cap:
                 raise JobGitRefused('file byte cap exceeded')
@@ -732,8 +762,11 @@ class JobGit:
             base_blobs = self._base_blobs()
 
             def visit(directory, name, path, expected):
+                base = base_blobs.get(path)
+                base_oid = base[0] if base else None
+                base_size = base[1] if base else None
                 mode, content = self._read_entry(directory, name, expected, total,
-                                                 base_blobs.get(path))
+                                                 base_oid, base_size)
                 oid = _blob_id(content, len(self.base_sha))
                 path_oids[path] = oid
                 records.append(mode + b' ' + oid + b'\t' + path + b'\0')
