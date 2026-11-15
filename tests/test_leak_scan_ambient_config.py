@@ -251,12 +251,11 @@ class AmbientDriverTests(unittest.TestCase):
         self.assertNotIn(TERM, self.git(self.repo, 'cat-file', 'blob', 'HEAD:secret.txt'))
         self.assertNotIn(TERM, self._added_blob())
 
-    def test_clean_filter_staged_leak_check_agrees_with_blob(self):
+    def test_clean_filter_staged_leak_check_blocks_raw_worktree_line(self):
         self._plant_clean('staged')
         result = security.leak_check(self.repo, self.base, [], [TERM], cached=True)
-        self.assertEqual(result['status'], 'clean', result)
+        self.assertEqual(result['status'], 'blocked', result)
         self.assertFalse(self.marker.exists())
-        self.assertNotIn(TERM, self._added_blob())
 
     def test_clean_filter_working_tree_leak_check_blocks_without_ambient_filter(self):
         self._plant_clean('working')
@@ -275,38 +274,24 @@ class AmbientDriverTests(unittest.TestCase):
         self.assertFalse(self.marker.exists())
         self.assertNotIn(TERM, self._added_blob())
 
-    def test_clean_filter_committed_check_agrees_with_blob(self):
+    def test_clean_filter_committed_check_blocks(self):
         self._plant_clean('committed')
-        code, result, stdout = self.check_json()
-        self.assertEqual(code, 0, result)
-        self.assertEqual(result['leak_check']['status'], 'clean')
-        self.assertNotIn(TERM, stdout)
+        self._expect_check_blocked(*self.check_json())
         self.assertNotIn(TERM, self._added_blob())
 
-    def test_clean_filter_staged_check_agrees_with_blob(self):
+    def test_clean_filter_staged_check_blocks(self):
         self._plant_clean('staged')
-        code, result, stdout = self.check_json()
-        self.assertEqual(code, 0, result)
-        self.assertEqual(result['leak_check']['status'], 'clean')
-        self.assertNotIn(TERM, stdout)
-        self.assertNotIn(TERM, self._added_blob())
+        self._expect_check_blocked(*self.check_json())
 
-    def test_clean_filter_working_tree_check_agrees_with_blob(self):
+    def test_clean_filter_working_tree_check_blocks(self):
         self._plant_clean('working')
-        code, result, stdout = self.check_json()
-        self.assertEqual(code, 0, result)
-        self.assertEqual(result['leak_check']['status'], 'clean')
-        self.assertNotIn(TERM, stdout)
+        self._expect_check_blocked(*self.check_json())
         self.assertNotIn(TERM, self._added_blob())
 
-    def test_clean_filter_untracked_check_agrees_with_blob(self):
+    def test_clean_filter_untracked_check_blocks(self):
         self._plant_clean('untracked')
-        code, result, stdout = self.check_json()
-        self.assertEqual(code, 0, result)
-        self.assertEqual(result['leak_check']['status'], 'clean')
-        self.assertNotIn(TERM, stdout)
-        self.assertTrue(self.marker.exists())
-        self.assertNotIn(TERM, self._added_blob())
+        self._expect_check_blocked(*self.check_json())
+        self.assertFalse(self.marker.exists())
 
     def test_clean_filter_retroactive_uncached_diff_reads_raw_worktree(self):
         """A blob committed before the clean filter applied still holds the term.
@@ -336,10 +321,7 @@ class AmbientDriverTests(unittest.TestCase):
         self.assertNotIn(TERM, json.dumps(cached))
         self.assertFalse(self.marker.exists())
         code, result, stdout = self.check_json()
-        self.assertEqual(code, 1, result)
-        self.assertEqual(result['leak_check']['status'], 'blocked')
-        self.assertNotIn(TERM, stdout)
-        self.assertTrue(self.marker.exists())
+        self._expect_check_blocked(code, result, stdout)
         self.assertNotIn(TERM, self._added_blob())
 
     def test_external_diff_leak_check_keeps_raw_bytes(self):
@@ -612,6 +594,22 @@ class AmbientDriverTests(unittest.TestCase):
         select = lambda _chars, **_kw: {'eligible': ['codex'], 'meters': {'codex': 10}, 'reason': 'test'}
         result = job_dispatch.run_job(self.repo, task, policy=self.policy, test_cmd='true', select=select)
         self.assertEqual(result['status'], 'blocked_by_leak_check', result)
+        self.assertFalse(self.marker.exists())
+
+    def test_clean_filter_run_job_final_leak_check_blocks_staged_secret(self):
+        """Router final cached scan reads worktree bytes and blocks before commit."""
+        self._prepare_run_job()
+        self._install_clean()
+        self._clear_marker()
+        task = self.root / 'task.md'
+        task.write_text('# Stage and commit\n')
+        code = ("open('.gitattributes','w').write('*.txt filter=hide\\n'); "
+                f"open('secret.txt','w').write('{TERM}\\n')")
+        self.policy['run_task']['commands']['codex'] = [sys.executable, '-c', code, '-']
+        select = lambda _chars, **_kw: {'eligible': ['codex'], 'meters': {'codex': 10}, 'reason': 'test'}
+        result = job_dispatch.run_job(self.repo, task, policy=self.policy, test_cmd='true', select=select)
+        self.assertEqual(result['status'], 'blocked_by_leak_check', result)
+        self.assertIsNone(result['commit'])
         self.assertFalse(self.marker.exists())
 
     def test_clean_filter_run_job_post_worker_leak_check_blocks_untracked_worktree(self):

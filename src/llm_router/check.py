@@ -314,29 +314,30 @@ def check(policy, repo, base=None, review=False):
             raise jobs.Refused('clear repository-local Git environment variables before using --review')
         env = {key: value for key, value in os.environ.items() if key not in git_vars}
         env.update(GIT_OPTIONAL_LOCKS='0', GIT_NO_LAZY_FETCH='1', GIT_ALLOW_PROTOCOL='file')
-        repo = Path(jobs._git(repo, 'rev-parse', '--show-toplevel', check=True, env=env).stdout.strip())
-        head = jobs.resolve_base(repo, 'HEAD', env=env)
+        leak_env = jobs._isolated_git_env(env)
+        repo = Path(jobs._git(repo, 'rev-parse', '--show-toplevel', check=True, env=leak_env).stdout.strip())
+        head = jobs.resolve_base(repo, 'HEAD', env=leak_env)
         if not head:
             raise jobs.Refused('checkout has no HEAD commit')
-        base_sha = _base(repo, head, base, env)
+        base_sha = _base(repo, head, base, leak_env)
         result.update(repo=str(repo), head=head, base=base_sha)
-        settings, source = _test_settings(policy, repo, env)
-        command = settings.get('test_cmd') or jobs.detect_test_cmd(repo, source, base=base_sha, env=env)
+        settings, source = _test_settings(policy, repo, leak_env)
+        command = settings.get('test_cmd') or jobs.detect_test_cmd(repo, source, base=base_sha, env=leak_env)
         if not command and settings.get('allow_no_tests') is not True:
             result['tests'] = {'status': 'no_tests'}
             raise jobs.Refused(jobs.NO_TESTS_REASON)
         timeout = settings.get('test_timeout_seconds', policy['run_job']['test_timeout_seconds'])
         # Refuse on submodule evidence before tests or review. Roots are computed once.
-        sub_roots = _submodule_roots_for_evidence(repo, base_sha, head, env)
+        sub_roots = _submodule_roots_for_evidence(repo, base_sha, head, leak_env)
         terms, allow = tasks.private_terms(policy), tasks.leak_options(policy)['allow']
         sub_findings = set()
         for root in sub_roots:
-            sub_findings.update(_submodule_leak_findings(repo, root, base_sha, terms, allow, env))
+            sub_findings.update(_submodule_leak_findings(repo, root, base_sha, terms, allow, leak_env))
         with tempfile.TemporaryDirectory(prefix='llm-router-check-', dir=_temp_root(repo)) as directory:
             temp = Path(directory).resolve()
             scratch = temp / 'checkout'
             populated = []
-            patches, review_patch = _snapshot(repo, scratch, base_sha, head, env, review, populated, sub_roots)
+            patches, review_patch = _snapshot(repo, scratch, base_sha, head, leak_env, review, populated, sub_roots)
             done_check_path = scratch / DONE_CHECK
             done_check = (done_check_path.read_text() if review and done_check_path.is_file() else '')
             local_policy = deepcopy(policy)
@@ -360,6 +361,14 @@ def check(policy, repo, base=None, review=False):
             findings = {(finding['file'], finding['kind'])
                         for patch, paths in patches
                         for finding in security.scan_diff(patch, terms, allow, paths=paths)}
+            _staged_patch, staged_paths = patches[1]
+            for name in staged_paths:
+                path = repo / name
+                if not path.is_file():
+                    continue
+                shown = security.mask_private_terms(name, terms)
+                for number, kind, _masked in security.scan_text(path.read_text(), terms, allow):
+                    findings.add((f'{shown}:{number}', kind))
             findings.update(sub_findings)
             findings.update((f'{DONE_CHECK}:{line}', kind)
                             for line, kind, _ in security.scan_text(done_check, terms, allow))
@@ -376,10 +385,10 @@ def check(policy, repo, base=None, review=False):
                                                 ledger=str(temp / 'review-ledger.csv'), extra_ledgers=[])
                 claude_env = local_policy['run_task'].setdefault('env', {}).setdefault('claude', {})
                 claude_env.setdefault('set', {}).update(TMPDIR=str(temp), TMP=str(temp), TEMP=str(temp))
-                if (jobs.resolve_base(scratch, 'HEAD', env=env) != head
+                if (jobs.resolve_base(scratch, 'HEAD', env=leak_env) != head
                         or tasks.tree_fingerprint(scratch) != evidence):
                     raise jobs.Refused('review evidence changed during testing')
-                code, result['review'] = _review(local_policy, scratch, env, result, review_patch,
+                code, result['review'] = _review(local_policy, scratch, leak_env, result, review_patch,
                                                   done_check, tests, evidence)
                 if code:
                     return code, result

@@ -181,7 +181,7 @@ def _isolated_git_env(env=None):
     isolated.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_SYSTEM='/dev/null', GIT_CONFIG_GLOBAL='/dev/null',
                     GIT_NO_REPLACE_OBJECTS='1', GIT_NO_LAZY_FETCH='1', GIT_TERMINAL_PROMPT='0')
     if env:
-        isolated.update(env)
+        isolated.update({key: value for key, value in env.items() if not key.startswith('GIT_')})
     return isolated
 
 
@@ -1127,11 +1127,13 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
     if _git(worktree, 'rev-parse', 'HEAD').stdout.strip() != summary['base_sha']:
         summary['status'] = 'blocked_by_stackwich' if required else 'failed'
         return
-    _git(worktree, 'add', '-A', '--', *sorted(worker_paths), check=True)
+    stage_env = _isolated_git_env()
+    _git(worktree, 'add', '-A', '--', *sorted(worker_paths), check=True, env=stage_env)
     if required:
-        staged = set(filter(None, _git(worktree, 'diff', '--cached', '--name-only', '--no-renames', '-z').stdout.split('\0')))
+        staged = set(filter(None, _git(worktree, 'diff', '--cached', '--name-only', '--no-renames', '-z',
+                                      env=stage_env).stdout.split('\0')))
         if staged != worker_paths:
-            _git(worktree, 'reset', '-q')
+            _git(worktree, 'reset', '-q', env=stage_env)
             summary['status'] = 'blocked_by_stackwich'
             summary['stackwich']['errors'].append('staged paths differ from validated scope')
             summary['stackwich']['status'] = 'blocked'

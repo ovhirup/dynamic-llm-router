@@ -426,6 +426,17 @@ def leak_check(cwd, base, untracked, terms, max_bytes=1_000_000, cached=False, a
             for number, text in lines:
                 for _, kind, masked in scan_text(text, terms, allow):
                     findings.append({'file': f'{shown}:{number}', 'kind': kind, 'match': masked})
+        if cached:
+            for name in changed_paths(cwd, base, cached=True):
+                path = Path(cwd) / name
+                if not path.is_file() or path.stat().st_size > max_bytes:
+                    continue
+                shown = mask_private_terms(name, terms)
+                data = path.read_bytes()
+                if b'\0' in data[:8192]:
+                    continue
+                for number, kind, masked in scan_text(data.decode('utf-8', 'replace'), terms, allow):
+                    findings.append({'file': f'{shown}:{number}', 'kind': kind, 'match': masked})
         for name in untracked:
             if _skipped(name, skip_dirs) or Path(name).name in (skip_dirs or ()):
                 continue
