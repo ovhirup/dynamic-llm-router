@@ -49,4 +49,4 @@ Packaged reference manifests live under `src/llm_router/examples/plugins/`. A pl
 1. Add a preset JSON manifest under `src/llm_router/examples/plugins/<name>.json` with `"enabled": false`.
 2. Ensure `command` uses a bare executable name and declares only the minimum `capabilities` and `permissions` needed.
 3. Add unit tests under `tests/` using a fake runner (no live network or external binaries in tests).
-4. Run `python -m pytest -q` (0 skipped required) and `llm-router scan .` before opening a draft PR.
+4. Run the full suite (`cd tests && python -m unittest discover -t . -s .`, 0 skipped required) and `llm-router scan .` before opening a draft PR.
