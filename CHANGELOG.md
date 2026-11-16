@@ -5,6 +5,7 @@ versions follow [SemVer](https://semver.org/) (0.x: minor versions may break con
 
 ## [Unreleased]
 
+- Live feed small items (Related: #296): `pr_gate` reads of the gate and approvals files are size-capped and refuse symlinks, FIFOs and directories (treated as absent); the feed never follows a symlinked output directory or parent; private terms match through fullwidth forms and common Cyrillic/Greek look-alikes.
 - JobGit: router-side publish fsck, bounded stderr drain in streaming git I/O, and per-file byte caps only on paths changed from base (Related: #303).
 - Draft the demo rehearsal: a public sample repository, the command sequence, and an offline end-to-end test. The recording itself is still to be made.
 - Leak scans pass `--no-textconv` on the `git diff` and `git log -p` output they read, so a global textconv driver cannot hide committed bytes (#294).
