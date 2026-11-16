@@ -6,6 +6,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import resource
 import shlex
 import shutil
 import stat
@@ -1237,6 +1238,68 @@ class JobGitTests(unittest.TestCase):
         (path / 'a.txt').write_bytes(b'm' * (17 * 1024 * 1024))
         self.refuse(instance, path, 'file byte cap exceeded')
 
+    def test_snapshot_refuses_same_size_modified_large_without_read(self):
+        over = 17 * 1024 * 1024
+        (self.source / 'large.bin').write_bytes(b'l' * over)
+        git(self.source, 'add', 'large.bin')
+        git(self.source, 'commit', '-qm', 'large base')
+        self.base = git(self.source, 'rev-parse', 'HEAD').stdout.decode().strip()
+        instance, path = self.make()
+        modified = b'm' * over
+        self.assertEqual(len(modified), over)
+        (path / 'large.bin').write_bytes(modified)
+        file_cap = instance.policy_caps['file_bytes']
+        oversize_reads = []
+        real_cap = job_git._read_capped
+        real_open = job_git._open_file
+
+        def track_open(directory, name):
+            if name == 'large.bin':
+                raise AssertionError('large.bin opened before refusal')
+            return real_open(directory, name)
+
+        def track_read(fd, limit):
+            data = real_cap(fd, limit)
+            if limit > file_cap:
+                oversize_reads.append(len(data))
+            return data
+
+        rss_before = _rss_mib()
+        with patch.object(job_git, '_open_file', track_open), patch.object(job_git, '_read_capped', track_read):
+            self.refuse(instance, path, 'file byte cap exceeded')
+        rss_after = _rss_mib()
+        sys.__stdout__.write('same-size large refuse rss before=%.2f after=%.2f MiB\n'
+                             % (rss_before, rss_after))
+        self.assertEqual(sum(oversize_reads), 0)
+        self.assertLess(rss_after - rss_before, 2)
+
+    def test_publish_fetch_forces_fsck_during_transfer(self):
+        folder, instance, path, base = self._isolated()
+        (path / 'a.txt').write_bytes(b'fetch-fsck\n')
+        commit = self.commit(instance, path)
+        git(folder, 'config', 'fetch.fsckObjects', 'false')
+        git(folder, 'config', 'transfer.fsckObjects', 'false')
+        git(folder, 'config', 'fetch.fsck.hasDotgit', 'ignore')
+        fetch_calls = []
+        real = instance._git
+
+        def wrap(*args, **kwargs):
+            if args and 'fetch' in args:
+                fetch_calls.append(list(args))
+            return real(*args, **kwargs)
+
+        with patch.object(instance, '_git', wrap):
+            instance.publish(folder, commit, 'fetch-fsck-published')
+        self.assertEqual(len(fetch_calls), 1)
+        argv = ' '.join(fetch_calls[0])
+        self.assertIn('fetch.fsckObjects=true', argv)
+        self.assertIn('transfer.fsckObjects=true', argv)
+        self.assertIn('fetch.fsck.hasDotgit=error', argv)
+        if os.environ.get('JOBGIT_MUTATION_CHILD'):
+            return
+        code, output = _run_mutant('publish-fsck', 'test_publish_fetch_forces_fsck_during_transfer')
+        self.assertNotEqual(code, 0, output[-2000:])
+
     def test_snapshot_refuses_inflated_base_path_without_bounded_read(self):
         instance, path = self.make()
         for name in ('executable', 'link'):
@@ -1539,12 +1602,20 @@ class JobGitTests(unittest.TestCase):
             ('publish-zero', 'test_publish_zero_oid_does_not_move_a_branch_created_during_fetch'),
             ('publish-altrefs', 'test_publish_alternate_refs_command_does_not_run'),
             ('publish-tip', 'test_publish_requires_router_tip'),
+            ('publish-fsck', 'test_publish_fetch_forces_fsck_during_transfer'),
         )
         for guard, test in cases:
             with self.subTest(guard=guard):
                 code, output = _run_mutant(guard, test)
                 self.assertNotEqual(code, 0, output[-1500:])
                 self.assertTrue('FAIL' in output or 'ERROR' in output, output[-1500:])
+
+
+def _rss_mib():
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == 'darwin':
+        return rss / (1024 * 1024)
+    return rss / 1024
 
 
 def _line(listing, name):

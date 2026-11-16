@@ -192,6 +192,7 @@ class JobGit:
             raise JobGitRefused('policy caps must be positive integers')
         self._root_identity = None
         self._gitlinks = {}
+        self._base_fill_mtime = {}
 
     def _cwd(self):
         if self.git_dir.is_dir() and not self.git_dir.is_symlink():
@@ -501,6 +502,8 @@ class JobGit:
                     os.fchmod(fd, 0o755 if mode == b'100755' else 0o644)
                 finally:
                     os.close(fd)
+                placed = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+                self._base_fill_mtime[path] = placed.st_mtime_ns
         finally:
             for fd in reversed(opened):
                 os.close(fd)
@@ -509,6 +512,7 @@ class JobGit:
         """Write the base tree into an existing empty directory. No filters, no checkout."""
         self._root_identity = None
         self._gitlinks = {}
+        self._base_fill_mtime = {}
         root = None
         try:
             root = self._root(job_dir)
@@ -537,10 +541,12 @@ class JobGit:
         except JobGitRefused:
             self._root_identity = None
             self._gitlinks = {}
+            self._base_fill_mtime = {}
             raise
         except (OSError, ValueError) as exc:
             self._root_identity = None
             self._gitlinks = {}
+            self._base_fill_mtime = {}
             raise JobGitRefused('fill refused unsafe path or filesystem collision') from exc
         finally:
             if root is not None:
@@ -591,7 +597,7 @@ class JobGit:
         walk(root, b'', 1)
         return entries
 
-    def _read_entry(self, directory, name, info, total, base_oid=None, base_size=None):
+    def _read_entry(self, directory, name, info, total, base_oid=None, base_size=None, path=None):
         file_cap = self.policy_caps['file_bytes']
         if stat.S_ISLNK(info.st_mode):
             content = os.readlink(os.fsencode(name), dir_fd=directory)
@@ -610,6 +616,11 @@ class JobGit:
             # endguard:rule5-nlink
             if total[0] + info.st_size > self.policy_caps['total_bytes']:
                 raise JobGitRefused('total byte cap exceeded')
+            if (base_oid is not None and path is not None and info.st_size > file_cap and
+                    info.st_size == base_size):
+                fill_mtime = self._base_fill_mtime.get(path)
+                if fill_mtime is not None and info.st_mtime_ns != fill_mtime:
+                    raise JobGitRefused('file byte cap exceeded')
             fd = _open_file(directory, name)
             try:
                 actual = os.fstat(fd)
@@ -766,7 +777,7 @@ class JobGit:
                 base_oid = base[0] if base else None
                 base_size = base[1] if base else None
                 mode, content = self._read_entry(directory, name, expected, total,
-                                                 base_oid, base_size)
+                                                 base_oid, base_size, path)
                 oid = _blob_id(content, len(self.base_sha))
                 path_oids[path] = oid
                 records.append(mode + b' ' + oid + b'\t' + path + b'\0')
