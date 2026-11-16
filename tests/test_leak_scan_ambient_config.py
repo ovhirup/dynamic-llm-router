@@ -152,10 +152,11 @@ class AmbientDriverTests(unittest.TestCase):
             raise AssertionError(state)
         self._clear_marker()
 
-    def _added_blob(self):
+    def _added_blob(self, cwd=None):
         """Bytes `git add` would commit, which is when a clean filter runs."""
-        self.git(self.repo, 'add', '--', 'secret.txt')
-        return self.git(self.repo, 'cat-file', 'blob', ':secret.txt')
+        cwd = self.repo if cwd is None else cwd
+        self.git(cwd, 'add', '--', 'secret.txt')
+        return self.git(cwd, 'cat-file', 'blob', ':secret.txt')
 
     def check_json(self, repo=None, base=None):
         repo = self.repo if repo is None else repo
@@ -468,6 +469,34 @@ class AmbientDriverTests(unittest.TestCase):
         for name in ('codex', 'grok-build', 'cursor'):
             FakeWorkerHarness('fail').install(self.policy, name)
 
+    def _run_job_final_leak_check(self, worker_code):
+        """Reach run-job's final cached leak scan without the post-worker scan blocking first."""
+        real_leak = security.leak_check
+        final_stages = []
+
+        def leak_check(*args, **kwargs):
+            if kwargs.get('cached'):
+                return real_leak(*args, **kwargs)
+            return {'status': 'clean', 'findings': []}
+
+        real_git = job_dispatch._git
+
+        def spy_git(worktree, *args, **kwargs):
+            if args and args[0] == 'add' and '-A' in args and kwargs.get('check'):
+                env = kwargs.get('env') or {}
+                final_stages.append(env.get('GIT_CONFIG_GLOBAL'))
+            return real_git(worktree, *args, **kwargs)
+
+        self.policy['run_task']['commands']['codex'] = [sys.executable, '-c', worker_code, '-']
+        select = lambda _chars, **_kw: {'eligible': ['codex'], 'meters': {'codex': 10}, 'reason': 'test'}
+        with (mock.patch.object(security, 'leak_check', side_effect=leak_check),
+              mock.patch.object(job_dispatch, '_git', side_effect=spy_git)):
+            result = job_dispatch.run_job(self.repo, self.root / 'task.md', policy=self.policy,
+                                          test_cmd='true', select=select)
+        self.assertTrue(final_stages, 'final isolated git add -A never ran')
+        self.assertEqual(final_stages[0], os.devnull)
+        return result
+
     def _isolate_gate(self):
         run_job = self.policy['run_job']
         run_job['jobs_dir'] = str(self.root / 'jobs')
@@ -587,15 +616,14 @@ class AmbientDriverTests(unittest.TestCase):
         self._prepare_run_job()
         self._install_textconv()
         self._clear_marker()
-        task = self.root / 'task.md'
-        task.write_text('# Stage secret\n')
+        (self.root / 'task.md').write_text('# Stage secret\n')
         code = ("open('.gitattributes','w').write('*.txt diff=hide\\n'); "
-                f"open('secret.txt','w').write('{TERM}\\n'); "
-                "import subprocess; subprocess.run(['git','add','-A'], check=True)")
-        self.policy['run_task']['commands']['codex'] = [sys.executable, '-c', code, '-']
-        select = lambda _chars, **_kw: {'eligible': ['codex'], 'meters': {'codex': 10}, 'reason': 'test'}
-        result = job_dispatch.run_job(self.repo, task, policy=self.policy, test_cmd='true', select=select)
+                f"open('secret.txt','w').write('{TERM}\\n')")
+        result = self._run_job_final_leak_check(code)
         self.assertEqual(result['status'], 'blocked_by_leak_check', result)
+        self.assertIsNone(result['commit'])
+        self.assertIn('private_term', {item['kind'] for item in (result.get('leak_check') or {}).get('findings', [])})
+        self.assertNotIn(TERM, json.dumps(result))
         self.assertFalse(self.marker.exists())
 
     def test_clean_filter_run_job_post_worker_leak_check_blocks_untracked_worktree(self):
@@ -618,18 +646,16 @@ class AmbientDriverTests(unittest.TestCase):
         self._prepare_run_job()
         self._install_clean()
         self._clear_marker()
-        task = self.root / 'task.md'
-        task.write_text('# Stage filtered blob\n')
+        (self.root / 'task.md').write_text('# Stage filtered blob\n')
         code = ("open('.gitattributes','w').write('*.txt filter=hide\\n'); "
-                f"open('secret.txt','w').write('{TERM}\\n'); "
-                "import subprocess; subprocess.run(['git','add','-A'], check=True)")
-        self.policy['run_task']['commands']['codex'] = [sys.executable, '-c', code, '-']
-        select = lambda _chars, **_kw: {'eligible': ['codex'], 'meters': {'codex': 10}, 'reason': 'test'}
-        result = job_dispatch.run_job(self.repo, task, policy=self.policy, test_cmd='true', select=select)
+                f"open('secret.txt','w').write('{TERM}\\n')")
+        result = self._run_job_final_leak_check(code)
         self.assertEqual(result['status'], 'blocked_by_leak_check', result)
         self.assertIsNone(result['commit'])
         self.assertIn('private_term', {item['kind'] for item in (result.get('leak_check') or {}).get('findings', [])})
         self.assertNotIn(TERM, json.dumps(result))
+        self.assertFalse(self.marker.exists())
+        self.assertNotIn(TERM, self._added_blob(Path(result['worktree'])))
 
     def test_clean_filter_range_leak_check_reads_stored_blob(self):
         """A commit-to-commit range never runs a clean filter. The stored blob is what the gate sees."""

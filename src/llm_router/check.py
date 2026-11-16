@@ -334,7 +334,9 @@ def check(policy, repo, base=None, review=False):
         timeout = settings.get('test_timeout_seconds', policy['run_job']['test_timeout_seconds'])
         # Refuse on submodule evidence before tests or review. Roots are computed once.
         sub_roots = _submodule_roots_for_evidence(repo, base_sha, head, leak_env)
-        terms, allow = tasks.private_terms(policy), tasks.leak_options(policy)['allow']
+        leak_opts = tasks.leak_options(policy)
+        terms, allow = tasks.private_terms(policy), leak_opts['allow']
+        max_bytes = leak_opts['max_bytes']
         sub_findings = set()
         for root in sub_roots:
             sub_findings.update(_submodule_leak_findings(repo, root, base_sha, terms, allow, leak_env))
@@ -369,10 +371,14 @@ def check(policy, repo, base=None, review=False):
             _staged_patch, staged_paths = patches[1]
             for name in staged_paths:
                 path = repo / name
-                if not path.is_file():
+                if not path.is_file() or path.stat().st_size > max_bytes:
                     continue
                 shown = security.mask_private_terms(name, terms)
-                for number, kind, _masked in security.scan_text(path.read_text(), terms, allow):
+                data = path.read_bytes()
+                if b'\0' in data[:8192]:
+                    continue
+                for number, kind, _masked in security.scan_text(
+                        data.decode('utf-8', 'replace'), terms, allow):
                     findings.add((f'{shown}:{number}', kind))
             findings.update(sub_findings)
             findings.update((f'{DONE_CHECK}:{line}', kind)
