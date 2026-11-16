@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import time
 
@@ -137,11 +138,43 @@ def _gate_path(policy, job_id):
     return _path(policy, 'gate_dir', 'state/gate') / f'{job_id}.json'
 
 
-def load_gate(policy, job_id):
+GATE_BYTES = 1 << 20
+APPROVALS_BYTES = 8 << 20
+
+
+def _read_capped(path, limit):
+    """Text of a regular file of at most `limit` bytes, or None.
+
+    A missing, oversize, non-regular (FIFO, directory, device) or symlinked file is None, and opening never
+    blocks, so a bad state file is treated like an absent one."""
     try:
-        return json.loads(_gate_path(policy, job_id).read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {'job_id': job_id}
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            return None
+        data = b''
+        while len(data) <= limit:
+            chunk = os.read(fd, limit + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data.decode('utf-8', 'replace') if len(data) <= limit else None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def load_gate(policy, job_id):
+    text = _read_capped(_gate_path(policy, job_id), GATE_BYTES)
+    try:
+        gate = json.loads(text) if text is not None else None
+    except (ValueError, RecursionError):
+        gate = None
+    return gate if isinstance(gate, dict) else {'job_id': job_id}
 
 
 def save_gate(policy, job_id, gate):
@@ -303,15 +336,14 @@ def _approvals_file(policy):
 
 
 def approval_records(policy):
-    try:
-        lines = _approvals_file(policy).read_text().splitlines()
-    except FileNotFoundError:
+    text = _read_capped(_approvals_file(policy), APPROVALS_BYTES)
+    if text is None:
         return []
     records = []
-    for line in lines:
+    for line in text.splitlines():
         try:
             records.append(json.loads(line))
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             continue
     return records
 

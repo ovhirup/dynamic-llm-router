@@ -20,12 +20,12 @@ account unless the CLA changes. DLR is licensed under AGPL-3.0-only, see [LICENS
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -e .
+.venv/bin/pip install -e . pytest
 source .venv/bin/activate
 cd tests && python -m unittest discover -t . -s . -v
 ```
 
-The last line is the exact command CI runs. Activate the venv first so `python` is the one with the editable install.
+The last line is the exact command CI runs. Activate the venv first so `python` is the one with the editable install. `pytest` is installed alongside because the gate tests import it; without it the full suite fails with "No module named pytest" (CI installs `. pytest` too).
 
 No third-party runtime dependencies, please. Anything new should work with the Python 3.10 standard library.
 
