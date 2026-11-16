@@ -13,7 +13,7 @@ Whichever coding tool or agent receives the prompt (`cursor`, `claude`, `codex`,
 
 ## How to run tests
 
-- Prerequisite: create and activate the repo venv and run `pip install -e .` there, so `python` imports this checkout's `src/` (no `PYTHONPATH` needed).
+- Prerequisite: create and activate the repo venv and run `pip install -e . pytest` there, so `python` imports this checkout's `src/` (no `PYTHONPATH` needed). pytest is required because the gate tests import it; without it the full suite fails with "No module named pytest". CI installs `. pytest` too.
 - Full suite, the exact command CI runs: `cd tests && python -m unittest discover -t . -s . -v`
   It must end with `OK` and **0 skipped**. A `FAILED tests/fixtures/gate/failing/test_bad.py` line is a fixture, not a failure.
 - Use Python 3.10 to 3.13 (CI's range). Unset every `GIT_CONFIG_*` variable first.

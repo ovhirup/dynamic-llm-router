@@ -303,8 +303,9 @@ Draft until a real run is recorded: [docs/demo.md](docs/demo.md).
 ## Development
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -e .
-cd tests && ../.venv/bin/python -m unittest discover -t . -s .
+python -m venv .venv && .venv/bin/pip install -e . pytest
+source .venv/bin/activate
+cd tests && python -m unittest discover -t . -s . -v
 ```
 
 Tests use fake workers, fake `gh`, fixture screens and temp git repos only; they never call a real agent CLI
