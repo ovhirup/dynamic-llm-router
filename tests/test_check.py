@@ -202,6 +202,44 @@ class CheckTests(unittest.TestCase):
                       result['leak_check']['findings'])
         self.assertNotIn(TERM, stdout)
 
+    def test_staged_binary_without_term_is_clean(self):
+        path = self.target / 'blob.bin'
+        path.write_bytes(b'\x00hello\xff\n')
+        self.git(self.target, 'add', 'blob.bin')
+        result, stdout = self.check_json(0)
+        self.assertEqual(result['leak_check']['status'], 'clean')
+        self.assertEqual(result['leak_check']['findings'], [])
+        self.assertNotIn(TERM, stdout)
+
+    def test_staged_latin1_without_term_is_clean(self):
+        path = self.target / 'latin.txt'
+        path.write_bytes(b'\xe9\xfe\xfd\n')
+        self.git(self.target, 'add', 'latin.txt')
+        result, stdout = self.check_json(0)
+        self.assertEqual(result['leak_check']['status'], 'clean')
+        self.assertEqual(result['leak_check']['findings'], [])
+        self.assertNotIn(TERM, stdout)
+
+    def test_staged_latin1_with_term_blocks(self):
+        path = self.target / 'latin.txt'
+        path.write_bytes(b'\xe9' + TERM.encode() + b'\xfe\xfd\n')
+        self.git(self.target, 'add', 'latin.txt')
+        result, stdout = self.check_json(1)
+        self.assertEqual(result['leak_check']['status'], 'blocked')
+        self.assertIn({'file': 'latin.txt:1', 'kind': 'private_term'},
+                      result['leak_check']['findings'])
+        self.assertNotIn(TERM, stdout)
+
+    def test_staged_over_max_bytes_is_skipped(self):
+        self.policy['leak_check'] = {'max_file_bytes': 64}
+        path = self.target / 'huge.bin'
+        path.write_bytes(b'x' * 256)
+        self.git(self.target, 'add', 'huge.bin')
+        result, stdout = self.check_json(0)
+        self.assertEqual(result['leak_check']['status'], 'clean')
+        self.assertEqual(result['leak_check']['findings'], [])
+        self.assertNotIn(TERM, stdout)
+
     def test_working_binary_private_term_requires_text_diff(self):
         # A tracked file keeps the term out of any untracked-file scan.
         (self.target / 'README.md').write_bytes(b'\x00' + TERM.encode() + b'\n')
