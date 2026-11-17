@@ -121,6 +121,35 @@ class BatchTests(unittest.TestCase):
         return next(j for j in summary['jobs'] if j['job'] == key)
 
     # ---- staging merges ----
+    def _assert_verifier_uses_raw_diff(self, *, textconv):
+        marker = self.base / 'diff-driver-ran'
+        driver = self.base / 'diff-driver.sh'
+        driver.write_text('#!/bin/sh\n'
+                          f'echo ran >> "{marker}"\n'
+                          'echo converted-evidence\n')
+        driver.chmod(0o755)
+        setting = 'diff.hide.textconv' if textconv else 'diff.external'
+        git(self.repo, 'config', setting, str(driver))
+        self.writes['alpha'] = {'alpha.txt': 'original-evidence\n'}
+        if textconv:
+            self.writes['alpha']['.gitattributes'] = '*.txt diff=hide\n'
+
+        summary = self.batch()
+
+        self.assertTrue(summary['ok'], summary)
+        self.assertEqual(summary['merged'], 3)
+        self.assertEqual(len(self.verifier_calls), 3)
+        prompt = next(prompt for key, prompt in self.verifier_calls if key == 'alpha')
+        self.assertIn('+original-evidence', prompt)
+        self.assertNotIn('converted-evidence', prompt)
+        self.assertFalse(marker.exists(), 'verifier diff executed a Git driver')
+
+    def test_verifier_prompt_uses_committed_bytes_without_textconv(self):
+        self._assert_verifier_uses_raw_diff(textconv=True)
+
+    def test_verifier_prompt_ignores_external_diff(self):
+        self._assert_verifier_uses_raw_diff(textconv=False)
+
     def test_all_verified_jobs_merge_into_nightly_staging(self):
         before = jd.main_state(self.repo)
         main_sha = git(self.repo, 'rev-parse', 'main')
