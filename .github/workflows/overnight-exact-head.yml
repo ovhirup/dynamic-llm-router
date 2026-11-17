@@ -1,0 +1,93 @@
+name: Overnight exact-head validation
+
+on:
+  push:
+    branches: [codex/overnight-exact-head-validation]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  exact-head:
+    name: PR ${{ matrix.pr }} literal head
+    runs-on: macos-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - pr: 315
+            sha: bee50545deed17027e4b70b47d563071605dfcab
+            tests: 1406
+          - pr: 316
+            sha: ee32811b28d524deb52772b541638aa6c80d26a2
+            tests: 1415
+          - pr: 317
+            sha: b0d48ae1603557b3aa017f2ca5f2c63957e0b017
+            tests: 1417
+          - pr: 318
+            sha: c30b41a25a196f4cf5f294447a774afc883ce74c
+            tests: 1411
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Verify literal checkout
+        env:
+          EXPECTED_HEAD: ${{ matrix.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git diff --exit-code
+          git diff --cached --exit-code
+          git log -1 --format='EXACT_HEAD=%H'
+          git rev-parse 'HEAD^{tree}'
+      - name: Install test prerequisites
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -e . pytest
+      - name: Full suite on literal author head
+        env:
+          EXPECTED_HEAD: ${{ matrix.sha }}
+          EXPECTED_TESTS: ${{ matrix.tests }}
+        run: |
+          source .venv/bin/activate
+          python - <<'PY' 2>&1 | tee "$RUNNER_TEMP/exact-head-tests.log"
+          import os, sys
+          for name in list(os.environ):
+              if name.startswith('GIT_CONFIG_'):
+                  del os.environ[name]
+          os.chdir('tests')
+          os.execv(sys.executable, [sys.executable, '-m', 'unittest', 'discover', '-t', '.', '-s', '.', '-v'])
+          PY
+          python - <<'PY'
+          import os, re
+          from pathlib import Path
+          output = (Path(os.environ['RUNNER_TEMP']) / 'exact-head-tests.log').read_text()
+          summaries = re.findall(r'^Ran (\d+) tests in [^\n]+\n\n([^\n]+)', output, re.M)
+          assert summaries, 'full-suite summary missing'
+          count, result = summaries[-1]
+          assert int(count) == int(os.environ['EXPECTED_TESTS']), (count, result)
+          assert result == 'OK', result
+          print('EXACT_HEAD_SUITE: tests=' + count + ' result=OK skipped=0')
+          PY
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git diff --exit-code
+          git diff --cached --exit-code
+      - name: Tree and history secret scan
+        env:
+          LLM_ROUTER_CONFIG_DIR: ${{ runner.temp }}/exact-head-config
+          LLM_ROUTER_STATE_DIR: ${{ runner.temp }}/exact-head-state
+        run: |
+          mkdir -p "$LLM_ROUTER_CONFIG_DIR" "$LLM_ROUTER_STATE_DIR"
+          : > "$RUNNER_TEMP/empty-terms.txt"
+          .venv/bin/llm-router scan . --history --terms "$RUNNER_TEMP/empty-terms.txt"
