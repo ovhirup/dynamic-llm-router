@@ -9,6 +9,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
@@ -17,7 +18,7 @@ from pathlib import Path
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from helpers import TERM, load_policy
+from helpers import FakeWorkerHarness, TERM, load_policy
 from llm_router import check as check_mod
 from llm_router import cli, job_dispatch, pr_gate, security, unit_review
 
@@ -469,6 +470,60 @@ class AmbientDriverTests(unittest.TestCase):
         self.assertNotIn(TERM, stdout)
         self.assertNotIn(TERM, json.dumps(result))
         self.assertFalse(self.marker.exists())
+
+    def _run_job_diff_probe(self, *, retry):
+        run, job = self.policy['run_task'], self.policy['run_job']
+        run.update(ledger=str(self.root / 'ledger.csv'), output_dir=str(self.root / 'worker-out'),
+                   block_log=str(self.root / 'block.log'), shim_dir=str(self.root / 'shims'))
+        job.update(worktree_root=str(self.root / 'wt'), lock_dir=str(self.root / 'locks'),
+                   jobs_dir=str(self.root / 'jobs'), repo_config=str(self.root / 'repos.json'),
+                   caffeinate=False)
+        self.policy['alerts'] = {'file': str(self.root / 'alerts.jsonl'), 'macos_notification': False}
+        for name in ('codex', 'grok-build', 'cursor'):
+            FakeWorkerHarness('fail').install(self.policy, name)
+        self._install_textconv()
+        # The term is benign here: allow the job to reach the diff consumer.
+        self.terms.write_text('')
+        task = self.root / 'task.md'
+        task.write_text('# Exercise the job diff\n')
+        code = ("open('.gitattributes','w').write('*.md diff=hide\\n'); "
+                f"open('README.md','w').write('{TERM}\\n'); "
+                f"import sys; sys.exit({1 if retry else 0})")
+        run['commands']['codex'] = [sys.executable, '-c', code, '-']
+        observed = []
+        real_git = job_dispatch._git
+
+        def git_at_site(worktree, *args, **kwargs):
+            # Select by revision arguments so removing the flag still exercises
+            # this consumer. Other Git sites may run textconv independently.
+            target = (args and args[0] == 'diff' and '--no-color' in args and
+                      (args[-1] == self.base if retry else args[-2] == self.base))
+            if target:
+                self._clear_marker()
+            result = real_git(worktree, *args, **kwargs)
+            if target:
+                observed.append((result.stdout, self.marker.exists()))
+            return result
+
+        select = lambda _chars, **_kw: {'eligible': ['codex'], 'meters': {'codex': 10}, 'reason': 'test'}
+        with mock.patch.object(job_dispatch, '_git', side_effect=git_at_site):
+            result = job_dispatch.run_job(self.repo, task, policy=self.policy,
+                                          test_cmd='true', select=select)
+        self.assertTrue(observed, 'the requested diff consumer never ran')
+        if retry:
+            self.assertIsNone(result['commit'])
+        else:
+            self.assertEqual(result['status'], 'committed', result)
+        for diff, driver_ran in observed:
+            self.assertIn('+' + TERM, diff)
+            self.assertNotIn('harmless', diff)
+            self.assertFalse(driver_ran, 'this diff consumer executed textconv')
+
+    def test_run_job_retry_diff_keeps_raw_bytes_without_textconv(self):
+        self._run_job_diff_probe(retry=True)
+
+    def test_run_job_summary_diff_keeps_raw_bytes_without_textconv(self):
+        self._run_job_diff_probe(retry=False)
 
     def _head(self):
         return self.git(self.repo, 'rev-parse', 'HEAD').strip()
