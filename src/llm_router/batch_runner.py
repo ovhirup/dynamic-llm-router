@@ -404,7 +404,8 @@ class Batch:
     def verify(self, job, *, repair=False):
         self.update(job, 'verifying', round=len(job['fix_rounds']))
         worktree = Path(job['worktree'])
-        diff = _git(worktree, 'diff', '--no-renames', '--no-color', f"{job['base_sha']}..HEAD").stdout
+        diff = _git(worktree, 'diff', '--no-renames', '--no-color', '--no-textconv', '--no-ext-diff',
+                    f"{job['base_sha']}..HEAD").stdout
         prompt = (f"Verify batch job `{job['key']}` (branch {job['branch']}) against base {job['base_sha']}.\n\n"
                   f"{VERIFIER_RULES}\n## Task\n{job['task_text']}\n\n## Test command\n{self.test_cmd}\n\n"
                   f"## Diff{' (truncated)' if len(diff) > MAX_DIFF_CHARS else ''}\n"
