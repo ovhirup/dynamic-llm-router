@@ -191,9 +191,8 @@ class _RoutingStdout(io.TextIOBase):
 
 
 class DemoRehearsalTests(unittest.TestCase):
-    invoked = []
-
     def setUp(self):
+        self.invoked = []
         for key in list(os.environ):
             if key.startswith('GIT_CONFIG_'):
                 os.environ.pop(key)
@@ -306,7 +305,7 @@ class DemoRehearsalTests(unittest.TestCase):
         self.assertEqual(parse_allowed_paths((sample / 'tasks' / 'docs.md').read_text()), ['README.md'])
         self.assertIn('subtract(5, 2)', (sample / 'tasks' / 'subtract.md').read_text())
 
-    def test_status_and_select_use_fixture_meters(self):
+    def _rehearse_status_and_select(self):
         now = datetime.now(timezone.utc)
         policy = copy.deepcopy(self.policy)
         policy['quota']['grok-build']['enabled'] = True
@@ -346,7 +345,7 @@ class DemoRehearsalTests(unittest.TestCase):
             'sample': {'remote': 'origin', 'base': 'main', 'visibility': 'public', 'test_cmd': TEST_CMD},
         }))
 
-    def test_gate_walkthrough_steps_3_to_7(self):
+    def _rehearse_gate_walkthrough(self):
         self.prepare_demo()
         self.bind_sample_remote()
         self.seed_codex_cache()
@@ -432,7 +431,7 @@ class DemoRehearsalTests(unittest.TestCase):
         self.assertEqual(saved['review']['reviewer'], 'grok-bot')
         self.assertNotEqual(saved['review']['reviewer'], 'codex')
 
-    def test_parallel_watch_shows_three_lanes_then_sha_approvals(self):
+    def _rehearse_parallel_watch(self):
         self.prepare_demo()
         self.seed_codex_cache()
         holds = {}
@@ -521,6 +520,18 @@ class DemoRehearsalTests(unittest.TestCase):
             self.assertIn('approval ?', finished)
 
     def test_zz_documented_commands_were_rehearsed(self):
+        # Collect evidence in this test, even when it is selected on its own.
+        # Each scenario gets fresh repositories, policy, fake workers and gate state.
+        root = self.base
+        for name, scenario in (
+                ('status', self._rehearse_status_and_select),
+                ('walkthrough', self._rehearse_gate_walkthrough),
+                ('parallel', self._rehearse_parallel_watch)):
+            with self.subTest(scenario=name):
+                self.base = root / name
+                self.base.mkdir()
+                self.policy = self.make_policy(self.base)
+                scenario()
         text = DOC.read_text()
         lines = sh_router_lines(text)
         self.assertGreaterEqual(len(lines), 8, lines)
