@@ -14,7 +14,7 @@ defaults:
 jobs:
   exact-head:
     name: PR ${{ matrix.pr }} literal head
-    runs-on: macos-latest
+    runs-on: macos-26-intel
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -46,6 +46,9 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ matrix.sha }}
         run: |
+          printf 'RUNNER_OS=%s RUNNER_ARCH=%s\n' "$RUNNER_OS" "$RUNNER_ARCH"
+          uname -sm
+          sw_vers
           test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
           git diff --exit-code
           git diff --cached --exit-code
