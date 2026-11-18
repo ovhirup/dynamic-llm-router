@@ -480,6 +480,10 @@ def leak_check(cwd, base, untracked, terms, max_bytes=1_000_000, cached=False, a
                     findings.append({'file': f'{shown}:{number}', 'kind': kind, 'match': masked})
     except Exception as error:  # report, don't guess clean
         return {'status': 'error', 'error': type(error).__name__, 'findings': findings}
+    unique = {}
+    for finding in findings:
+        unique.setdefault((finding['file'], finding['kind']), finding)
+    findings = list(unique.values())
     status = 'blocked' if findings else 'clean'
     result = {'status': status, 'findings': findings}
     if terms is None:
