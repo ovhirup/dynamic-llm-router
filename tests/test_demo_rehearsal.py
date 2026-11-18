@@ -518,7 +518,7 @@ class DemoRehearsalTests(unittest.TestCase):
             sha = job['commit']
             self.assertIn(sha, finished)
             self.assertIn(f'llm-router approve {job["job_id"]} --action push --sha {sha}', finished)
-            self.assertIn('approval ?', finished)
+            self.assertIn('approval waiting', finished)
 
     def test_zz_documented_commands_were_rehearsed(self):
         text = DOC.read_text()

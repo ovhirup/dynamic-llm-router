@@ -386,16 +386,18 @@ class WatchTests(FeedFixture):
         self.assertNotIn('│', watch.render(demo_feed(), 99))
 
     def test_only_the_approval_lines_may_exceed_the_width(self):
-        for width in (80, 100, 160):
+        for width in (40, 80, 100, 160):
             frame = watch.render(demo_feed(), width)
             long = [line for line in frame.splitlines() if len(line) > width]
             self.assertTrue(all(PUSH_SHA in line for line in long), long)
             self.assertIn(f'push approval needed for {PUSH_SHA}', frame)
             self.assertIn(f'--sha {PUSH_SHA}', frame)
+            self.assertIn('approval waiting:', frame)
 
     def test_color_only_on_a_terminal(self):
         self.assertNotIn('\x1b', watch.render(demo_feed(), 160))
         self.assertIn('\x1b[32m✓\x1b[0m', watch.render(demo_feed(), 160, color=True))
+        self.assertIn('approval \x1b[33mwaiting\x1b[0m', watch.render(demo_feed(), 160, color=True))
         stream = io.StringIO()
         self.assertEqual(watch.run(policy=self.policy, once=True, stream=stream, width=120), 0)
         self.assertNotIn('\x1b', stream.getvalue())

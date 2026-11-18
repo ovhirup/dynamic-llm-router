@@ -197,7 +197,8 @@ COLUMNS=160 llm-router watch --once
 TO RECORD: one watch frame with three lanes, one per clone, while the jobs are running
 ```
 
-After they finish, each job waits for an approval of its own full 40-character SHA. Expected exit: 0.
+After they finish, each job shows `approval waiting`, its full 40-character SHA,
+and the command a person can run to approve that SHA. Expected exit: 0.
 
 ```sh
 COLUMNS=160 llm-router watch --once

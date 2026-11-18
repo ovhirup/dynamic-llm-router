@@ -9,8 +9,8 @@ demo · codex · 1m05s                                │ demo · cursor · 1m45
 tests ·  leak ·  review ·  approval ·               │ tests ·  leak ·  review ·  approval ·               │ tests ·  leak ·  review ·  approval ·
 
 Recent
-✓ demo add-hello.md · codex · committed · tests ✓  leak ✓  review -  approval ?
-  push approval needed for 5659e86f2fdbe4dcb82ee716be3c1ad909f0a552
+✓ demo add-hello.md · codex · committed · tests ✓  leak ✓  review -  approval waiting
+  approval waiting: push approval needed for 5659e86f2fdbe4dcb82ee716be3c1ad909f0a552
   llm-router approve demo-20261112-174000 --action push --sha 5659e86f2fdbe4dcb82ee716be3c1ad909f0a552
 
 Ctrl-C to quit. Read-only: watch never starts, stops or approves anything.
