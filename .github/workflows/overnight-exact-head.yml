@@ -21,9 +21,9 @@ jobs:
       max-parallel: 4
       matrix:
         include:
-          - pr: 318
-            sha: 325f3588a352c5bad3cf28a63f9a35d43b62910a
-            tests: 1411
+          - pr: 320
+            sha: 9dc08179ce25af1afcfd5038d951463d3baf825d
+            tests: 1420
     steps:
       - uses: actions/checkout@v7
         with:
