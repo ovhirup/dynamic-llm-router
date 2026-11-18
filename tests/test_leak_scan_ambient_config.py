@@ -18,7 +18,8 @@ from pathlib import Path
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from helpers import FakeWorkerHarness, TERM, load_policy
+from fake_worker import FakeWorkerHarness
+from helpers import TERM, load_policy
 from llm_router import check as check_mod
 from llm_router import cli, job_dispatch, pr_gate, security, unit_review
 
