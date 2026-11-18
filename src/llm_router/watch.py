@@ -14,7 +14,7 @@ WIDE = 100          # below this many columns, lanes stack vertically
 LANE_MIN = 34       # narrowest side-by-side lane
 LANE_EVENTS = 4     # timeline rows per lane
 SEPARATOR = ' │ '
-SYMBOLS = {'passed': '✓', 'failed': '✗', 'blocked': '✗', 'running': '…', 'pending': '·', 'waiting': '?',
+SYMBOLS = {'passed': '✓', 'failed': '✗', 'blocked': '✗', 'running': '…', 'pending': '·', 'waiting': 'waiting',
            'n/a': '-'}
 COLORS = {'passed': '32', 'failed': '31', 'blocked': '31', 'running': '33', 'waiting': '33'}
 GATES = (('tests', 'tests'), ('leak_check', 'leak'), ('review', 'review'), ('approval', 'approval'))
@@ -42,7 +42,7 @@ def _elapsed(seconds):
 
 
 def gate_strip(gates):
-    """`tests ✓  leak ✓  review -  approval ?` for a job's gates."""
+    """`tests ✓  leak ✓  review -  approval waiting` for a job's gates."""
     return '  '.join(f'{label} {SYMBOLS.get(str(((gates or {}).get(key) or {}).get("state")), "?")}'
                      for key, label in GATES)
 
@@ -81,7 +81,7 @@ def _finished_lines(job, width, terms=()):
         f'{gate_strip(gates)}', terms), width)]
     approval = gates.get('approval') or {}
     if approval.get('state') == 'waiting':  # never cut: the owner approves this exact SHA
-        lines.append(live_jobs_feed.mask_text(f'  {_clean(approval.get("detail"))}', terms))
+        lines.append(live_jobs_feed.mask_text(f'  approval waiting: {_clean(approval.get("detail"))}', terms))
         if approval.get('command'):
             lines.append(live_jobs_feed.mask_text(f'  {_clean(approval["command"])}', terms))
     return lines
