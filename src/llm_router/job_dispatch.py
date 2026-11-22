@@ -38,7 +38,7 @@ def _job_review_packet(summary, worktree, paths):
     """Evidence packet in the same shape `unit_review.review_prompt` already reviews."""
     from . import unit_review
     diff = _git(worktree, 'diff', '--no-renames', '--no-color', '--no-ext-diff', '--no-textconv',
-                f'{summary["base_sha"]}..{summary["commit"]}').stdout
+                f'{summary["base_sha"]}..{summary["commit"]}', env=_isolated_git_env()).stdout
     changed = sorted(paths)
     scope = list(summary.get('allowed_paths') or changed)
     tests = (summary.get('tests') or [{}])[-1] or {}
@@ -216,9 +216,10 @@ def slugify(text, limit=40):
 
 def main_state(repo):
     """Fingerprint of the user's checkout: HEAD sha, branch, index/worktree status."""
-    return {'head': _git(repo, 'rev-parse', '-q', '--verify', 'HEAD').stdout.strip(),
-            'branch': _git(repo, 'symbolic-ref', '-q', 'HEAD').stdout.strip(),
-            'status': _git(repo, 'status', '--porcelain', '--untracked-files=all').stdout}
+    env = _isolated_git_env()
+    return {'head': _git(repo, 'rev-parse', '-q', '--verify', 'HEAD', env=env).stdout.strip(),
+            'branch': _git(repo, 'symbolic-ref', '-q', 'HEAD', env=env).stdout.strip(),
+            'status': _git(repo, 'status', '--porcelain', '--untracked-files=all', env=env).stdout}
 
 
 class RepoLock:
@@ -280,6 +281,8 @@ def _pytest_configured(is_file, read):
 
 def detect_test_cmd(worktree, source_repo=None, *, base=None, env=None):
     """Infer a test command from a checkout or pinned base tree (Python, Node, Swift)."""
+    if base is not None and env is None:
+        env = _isolated_git_env()
     root = Path(worktree)
     venv = Path(source_repo or root) / '.venv' / 'bin' / 'python'
     python = shlex.quote(str(venv) if venv.is_file() else sys.executable)
@@ -346,7 +349,8 @@ def remove_bytecode_caches(cwd):
     bytecode. The walk holds directory descriptors and never follows links, and each deletion is relative to the
     descriptor, so a path swapped mid-walk (e.g. by a leftover worker process) cannot redirect it outside the tree.
     A link is removed itself, never its target."""
-    tracked = set(filter(None, _git(cwd, 'ls-tree', '-r', '--name-only', '-z', 'HEAD').stdout.split('\0')))
+    tracked = set(filter(None, _git(cwd, 'ls-tree', '-r', '--name-only', '-z', 'HEAD',
+                                   env=_isolated_git_env()).stdout.split('\0')))
     for folder, dirs, files, dir_fd in os.fwalk(str(cwd), follow_symlinks=False):
         rel_dir = os.path.relpath(folder, str(cwd))
         if rel_dir == '.' and '.git' in dirs:
@@ -390,7 +394,8 @@ def changed_paths(cwd):
 
 
 def _has_changes(cwd):
-    return bool(_git(cwd, 'status', '--porcelain', '--untracked-files=all').stdout.strip())
+    return bool(_git(cwd, 'status', '--porcelain', '--untracked-files=all',
+                     env=_isolated_git_env()).stdout.strip())
 
 
 def _report_leak_check(policy, worktree, base_sha):
@@ -1081,7 +1086,7 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
         retry_feedback.save_retry_state(
             _path(policy, 'handoffs_dir', 'handoffs'), summary['job_id'], fingerprints, dead_ends)
         diff_now = _git(worktree, 'diff', '--no-color', '--no-ext-diff', '--no-textconv',
-                        summary['base_sha']).stdout if changed else ''
+                        summary['base_sha'], env=_isolated_git_env()).stdout if changed else ''
         if tracker is not None:
             tracker.record(cycle, selected, diff_now, changed_paths=worker_paths, tests=tests)
         if retry_feedback.same_failure_twice(fingerprints) and not (tracker and tracker.should_forget(cycle)):
@@ -1143,14 +1148,15 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
                                 **td.leak_options(policy))
     summary['leak_check'] = final
     if final['status'] != 'clean':
-        _git(worktree, 'reset', '-q')
+        _git(worktree, 'reset', '-q', env=stage_env)
         summary['blocked_by_leak_check'] = True
         summary['status'] = 'blocked_by_leak_check'
         return
     identity = policy['run_job']['commit_identity']
     commit = _git(worktree, '-c', f'user.name={identity["name"]}', '-c', f'user.email={identity["email"]}',
                   'commit', '-q', '-m', _commit_message(task_text, summary['job_id'], summary['workers'],
-                                                       {'status': summary['tests_status']}, verified=required))
+                                                       {'status': summary['tests_status']}, verified=required),
+                  env=stage_env)
     if commit.returncode != 0:
         summary['status'] = 'commit_failed'
         summary['warnings'].append('git commit failed: ' + security.redact(commit.stderr.strip() or commit.stdout.strip())[:300])
@@ -1159,9 +1165,10 @@ def _job_body(policy, summary, task_path, task_text, worktree, size, worker, tes
     if _git(worktree, 'symbolic-ref', '-q', 'HEAD').stdout.strip() != f'refs/heads/{summary["branch"]}':
         raise RuntimeError('worktree is not on the router branch')
     summary['commit'] = sha
-    summary['diff_stat'] = _git(worktree, 'diff', '--stat', summary['base_sha'], sha).stdout.strip()
+    summary['diff_stat'] = _git(worktree, 'diff', '--stat', summary['base_sha'], sha,
+                                env=stage_env).stdout.strip()
     diff_text = _git(worktree, 'diff', '--no-color', '--no-ext-diff', '--no-textconv',
-                     summary['base_sha'], sha).stdout
+                     summary['base_sha'], sha, env=stage_env).stdout
     risk = risk_tiers.classify_diff(worker_paths, diff_text=diff_text, policy=policy)
     summary['risk_tier'] = risk['risk_tier']
     summary['approval_required'] = risk['approval_required']
