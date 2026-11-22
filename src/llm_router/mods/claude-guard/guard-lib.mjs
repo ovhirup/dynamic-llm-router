@@ -10,6 +10,8 @@ const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
 const WRAPPERS = new Set(["sudo", "command", "builtin", "exec", "nohup", "time", "nice", "env", "xargs", "doas"]);
 const SHELL_KEYWORDS = new Set(["if", "then", "else", "elif", "fi", "while", "until", "do", "done", "for", "in",
   "case", "esac", "{", "}", "!", "[[", "]]", "select", "coproc"]);
+const RM_AS_LITERAL_ARG = new Set(["echo", "printf", "test", "["]);
+const SAFE_RECURSIVE_RM_GLOBS = new Set(["*/__pycache__"]);
 const SUBSHELL = "\0(";  // a (...) group: its cd must not change the parent command's directory
 const GLOB_CHARS = /[*?[{]/;
 const GLOB_LIMIT = 20000;
@@ -446,6 +448,44 @@ function ansiC(body) {
   return out;
 }
 
+function foldHeredocBodies(script) {
+  const src = String(script ?? "");
+  let out = "";
+  let pos = 0;
+  const pattern = /<<-?\s*([^\s;<>&|]+)/g;
+  while (pos < src.length) {
+    pattern.lastIndex = pos;
+    const match = pattern.exec(src);
+    if (!match) {
+      out += src.slice(pos);
+      break;
+    }
+    out += src.slice(pos, match.index);
+    const delim = match[1].replace(/^['"]|['"]$/g, "");
+    const lineEnd = src.indexOf("\n", match.index);
+    if (lineEnd < 0) {
+      out += src.slice(match.index);
+      break;
+    }
+    out += src.slice(match.index, lineEnd + 1);
+    let body = lineEnd + 1;
+    while (body < src.length) {
+      const nextEnd = src.indexOf("\n", body);
+      const end = nextEnd < 0 ? src.length : nextEnd;
+      const line = src.slice(body, end);
+      if (line.trim() === delim) {
+        out += line;
+        if (nextEnd >= 0) out += "\n";
+        pos = nextEnd < 0 ? src.length : nextEnd + 1;
+        break;
+      }
+      body = nextEnd < 0 ? src.length : nextEnd + 1;
+    }
+    if (body >= src.length && !out.endsWith(delim)) pos = src.length;
+  }
+  return out;
+}
+
 // Splits a command line into simple commands (arrays of unquoted words). Separators: newline ; & | ( ).
 // A redirection (< > >> <> >& &> &>> >| and an fd prefix such as 2>) does not end the command and its target is
 // not an operand: targets come back in `redirects`, parallel to `commands`. Braces stay in the word (brace
@@ -670,7 +710,8 @@ function checkRm(args, root, cwd, moved) {
     if (moved && !path.isAbsolute(expandHome(target))) return `blocked recursive rm of a relative target after cd: ${target}`;
     const segments = target.split("/");
     const globbed = GLOB_CHARS.test(target);
-    if (globbed && (segments.includes("..") || segments.slice(0, -1).some((s) => GLOB_CHARS.test(s)))) {
+    if (globbed && !SAFE_RECURSIVE_RM_GLOBS.has(target) &&
+        (segments.includes("..") || segments.slice(0, -1).some((s) => GLOB_CHARS.test(s)))) {
       return `blocked recursive rm of a glob that can leave its directory: ${target} (list explicit paths)`;
     }
     const fixed = globbed ? segments.slice(0, -1).join("/") || (target.startsWith("/") ? "/" : ".") : target;
@@ -940,14 +981,23 @@ function checkCommand(raw, bodies, redirs, wasPiped, here, moved, root, depth) {
     const args = raw.slice(k + 1);
     let why = null;
     if (SHELLS.has(name)) {
+      const hasC = args.some((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
+      if (wasPiped && !hasC) return "blocked shell executing piped command text";
       const flag = args.findIndex((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
       if (flag >= 0 && args[flag + 1] !== undefined) why = checkScript(args[flag + 1], root, here, depth + 1);
     } else if (name === "eval") why = checkScript(args.join(" "), root, here, depth + 1);
-    else if (name === "rm") why = checkRm(args, root, here, moved);
+    else if (name === "rm") {
+      if (k > 0 && RM_AS_LITERAL_ARG.has(path.basename(raw[k - 1]))) continue;
+      why = checkRm(args, root, here, moved);
+    }
     else if (name in READERS || name === "find") {
       why = checkReader(name, args, here, wasPiped || raw.slice(0, k).some((w) => FEEDERS.has(path.basename(w))));
     }
     if (why) return why;
+  }
+  if (raw[0] === "$") {
+    const why = checkRm(["rm", ...raw.slice(1)], root, here, moved);
+    if (why) return why.replace("blocked rm", "blocked command built at runtime as rm");
   }
   const words = stripPrefix(raw);
   if (!words.length) return null;
@@ -957,6 +1007,7 @@ function checkCommand(raw, bodies, redirs, wasPiped, here, moved, root, depth) {
 
 function checkScript(script, root, cwd, depth = 0) {
   if (depth > 8) return "blocked deeply nested shell command";
+  script = foldHeredocBodies(script);
   if (FORBIDDEN_GIT.test(String(script).replace(/\\\r?\n/g, " ").replace(/\s+/g, " "))) {
     return "blocked destructive git/gh command in headless Claude job";
   }

@@ -70,6 +70,10 @@ SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh'}
 WRAPPERS = {'sudo', 'command', 'builtin', 'exec', 'nohup', 'time', 'nice', 'env', 'xargs', 'doas'}
 SHELL_KEYWORDS = {'if', 'then', 'else', 'elif', 'fi', 'while', 'until', 'do', 'done', 'for', 'in', 'case', 'esac',
                   '{', '}', '!', '[[', ']]', 'select', 'coproc'}
+# rm tokens that are only printed or tested, not executed (echo rm -rf is text).
+RM_AS_LITERAL_ARG = frozenset({'echo', 'printf', 'test', '['})
+# Globs that only remove interpreter caches one directory level below cwd.
+SAFE_RECURSIVE_RM_GLOBS = frozenset({'*/__pycache__'})
 _SUBSHELL = '\0('  # a (...) group: its cd must not change the parent command's directory
 FEEDERS = {'xargs', 'parallel', 'rush'}
 # Recursive-capable readers and every option the guard understands, fully spelled (mirrors READERS in
@@ -516,6 +520,41 @@ def _ansi_c(body):
     return out
 
 
+def _fold_heredoc_bodies(script):
+    """Heredoc body lines are inert data for cat/tee until a shell reads them; omit them from command parsing."""
+    src = str(script if script is not None else '')
+    out, pos = [], 0
+    pattern = re.compile(r'<<-?\s*([^\s;<>&|]+)')
+    while pos < len(src):
+        match = pattern.search(src, pos)
+        if not match:
+            out.append(src[pos:])
+            break
+        out.append(src[pos:match.start()])
+        delim = match.group(1).strip("'\"")
+        line_end = src.find('\n', match.start())
+        if line_end < 0:
+            out.append(src[match.start():])
+            break
+        out.append(src[match.start():line_end + 1])
+        body = line_end + 1
+        while body < len(src):
+            next_end = src.find('\n', body)
+            if next_end < 0:
+                next_end = len(src)
+            line = src[body:next_end]
+            if line.strip() == delim:
+                out.append(line)
+                if next_end < len(src):
+                    out.append('\n')
+                pos = next_end + 1
+                break
+            body = next_end + 1 if next_end < len(src) else next_end
+        else:
+            pos = len(src)
+    return ''.join(out)
+
+
 def parse_shell(script):
     """(commands, nested, piped, redirects, separators): simple commands as lists of unquoted words, split on
     newline ; & | ( ), with line continuations joined. `separators[i]` is the operator that ended `commands[i]`
@@ -748,7 +787,8 @@ def _check_rm(args, root, cwd, moved):
             return f'blocked recursive rm of a relative target after cd: {target}'
         segments = target.split('/')
         glob = bool(GLOB_CHARS.search(target))
-        if glob and ('..' in segments or any(GLOB_CHARS.search(s) for s in segments[:-1])):
+        if glob and target not in SAFE_RECURSIVE_RM_GLOBS and (
+                '..' in segments or any(GLOB_CHARS.search(s) for s in segments[:-1])):
             return f'blocked recursive rm of a glob that can leave its directory: {target} (list explicit paths)'
         fixed = ('/'.join(segments[:-1]) or ('/' if target.startswith('/') else '.')) if glob else target
         real = resolve_real(fixed, cwd)
@@ -1022,17 +1062,26 @@ def _check_command(raw, bodies, redirs, was_piped, here, moved, root, depth):
         name, args = os.path.basename(word), raw[k + 1:]
         why = None
         if name in SHELLS:
+            has_c = any(re.fullmatch(r'-[A-Za-z]*c[A-Za-z]*', a) for a in args)
+            if was_piped and not has_c:
+                return 'blocked shell executing piped command text'
             flag = next((j for j, a in enumerate(args) if re.fullmatch(r'-[A-Za-z]*c[A-Za-z]*', a)), None)
             if flag is not None and flag + 1 < len(args):
                 why = _check_script(args[flag + 1], root, here, depth + 1)
         elif name == 'eval':
             why = _check_script(' '.join(args), root, here, depth + 1)
         elif name == 'rm':
+            if k > 0 and os.path.basename(raw[k - 1]) in RM_AS_LITERAL_ARG:
+                continue
             why = _check_rm(args, root, here, moved)
         elif name in READERS or name == 'find':
             why = _check_reader(name, args, here, was_piped or any(os.path.basename(w) in FEEDERS for w in raw[:k]))
         if why:
             return why
+    if raw and raw[0] == '$':
+        why = _check_rm(['rm', *raw[1:]], root, here, moved)
+        if why:
+            return why.replace('blocked rm', 'blocked command built at runtime as rm', 1)
     words = _strip_prefix(raw)
     if not words:
         return None
@@ -1043,6 +1092,7 @@ def _check_command(raw, bodies, redirs, was_piped, here, moved, root, depth):
 def _check_script(script, root, cwd, depth=0):
     if depth > 8:
         return 'blocked deeply nested shell command'
+    script = _fold_heredoc_bodies(script)
     if FORBIDDEN_GIT_RE.search(re.sub(r'\s+', ' ', re.sub(r'\\\r?\n', ' ', str(script)))):
         return 'blocked destructive git/gh command in headless Claude job'
     commands, nested, piped, redirects, separators = parse_shell(script)
