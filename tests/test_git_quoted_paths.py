@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest import mock
 
 from helpers import TERM
 from llm_router import security
@@ -73,6 +74,18 @@ class ScanDiffTests(unittest.TestCase):
 
 
 class CheckQuotedPathIntegration(unittest.TestCase):
+    def check_decoded_path(self, case, name, header, term):
+        with mock.patch.object(security, 'decode_git_path', wraps=security.decode_git_path) as decode:
+            result, stdout = case.check_json(1)
+        # Only the check ran under the spy, so a direct pin cannot satisfy this.
+        decode.assert_any_call(header)
+        self.assertEqual(security.decode_git_path(header), f'b/{name}')
+        self.assertTrue((case.target / name).is_file())
+        shown = name.replace(term, security.mask(term))
+        self.assertIn({'file': f'{shown} (path)', 'kind': 'private_term'},
+                      result['leak_check']['findings'])
+        return result, stdout
+
     def test_unicode_private_term_blocks_check_json(self):
         case = test_check.CheckTests('test_path_diagnostic_masks_private_term')
         case.setUp()
@@ -82,7 +95,8 @@ class CheckQuotedPathIntegration(unittest.TestCase):
         terms.write_text(term + '\n')
         case.policy['run_task']['private_terms_file'] = str(terms)
         (case.target / f'notes-{term}.txt').write_text('clean\n')
-        result, stdout = case.check_json(1)
+        result, stdout = self.check_decoded_path(
+            case, f'notes-{term}.txt', '"b/notes-caf\\303\\251.txt"', term)
         self.assertEqual(result['leak_check']['status'], 'blocked')
         blob = json.dumps(result['leak_check']['findings'], ensure_ascii=False)
         self.assertNotIn(term, stdout)
@@ -91,18 +105,20 @@ class CheckQuotedPathIntegration(unittest.TestCase):
         self.assertIn('private_term', blob)
 
     def test_quote_newline_and_backslash_names_block_check_json(self):
-        names = (
-            f'{TERM}"x.txt',
-            f'{TERM}\nx.txt',
-            f'{TERM}\\x.txt',
+        paths = (
+            (f'{TERM}"x.txt', f'"b/{TERM}\\"x.txt"'),
+            (f'{TERM}\nx.txt', f'"b/{TERM}\\nx.txt"'),
+            (f'{TERM}\\x.txt', f'"b/{TERM}\\\\x.txt"'),
+            # Git leaves spaces unquoted in +++ headers.
+            (f'{TERM} x.txt', f'b/{TERM} x.txt'),
         )
-        for name in names:
+        for name, header in paths:
             with self.subTest(name=name):
                 case = test_check.CheckTests('test_path_diagnostic_masks_private_term')
                 case.setUp()
                 self.addCleanup(case.doCleanups)
                 (case.target / name).write_text('clean\n')
-                result, stdout = case.check_json(1)
+                result, stdout = self.check_decoded_path(case, name, header, TERM)
                 self.assertEqual(result['leak_check']['status'], 'blocked')
                 blob = json.dumps(result['leak_check']['findings'], ensure_ascii=False)
                 self.assertNotIn(TERM, stdout)
@@ -116,7 +132,7 @@ class CheckQuotedPathIntegration(unittest.TestCase):
         self.addCleanup(case.doCleanups)
         name = f'{TERM}\there.txt'
         (case.target / name).write_text('clean\n')
-        result, stdout = case.check_json(1)
+        result, stdout = self.check_decoded_path(case, name, f'"b/{TERM}\\there.txt"', TERM)
         self.assertEqual(result['leak_check']['status'], 'blocked')
         self.assertIn('private_term', {f['kind'] for f in result['leak_check']['findings']})
         self.assertNotIn(TERM, stdout)

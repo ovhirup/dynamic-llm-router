@@ -26,6 +26,9 @@ recorded at HEAD and missing from the checkout refuses the check before tests
 or review. A populated submodule whose commit recorded at the base is not in
 that repository refuses the same way. Reported finding locations mask private
 terms, including a submodule path and a file name inside it.
+Re-adding a different repository at the same submodule path is accepted when
+its history contains the recorded base commit. The check refuses such a re-add
+only when that commit is missing from the repository.
 
 Tests and leak scanning are the default gates. DLR makes no model or network
 calls in this mode. Configured test commands run with their own normal
